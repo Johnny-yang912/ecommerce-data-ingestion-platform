@@ -5,7 +5,6 @@ from datetime import datetime
 class UserIN(BaseModel):
     name: Optional[Any] = None
     value: Optional[Any] = None
-    age: int | None = None
 
 class RawOut(BaseModel):
     id: int

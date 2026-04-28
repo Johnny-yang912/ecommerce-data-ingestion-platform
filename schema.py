@@ -2,10 +2,6 @@ from pydantic import BaseModel
 from typing import Optional, Any
 from datetime import datetime, date
 
-class UserIN(BaseModel):
-    name: Optional[Any] = None
-    value: Optional[Any] = None
-
 # --- 子群組 ---
 
 class CustomerInfo(BaseModel):

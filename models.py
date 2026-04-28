@@ -65,13 +65,3 @@ class ODS(Base):
 
     # items 整包（SQLite 用 Text）
     items = Column(Text, nullable=True)
-
-
-
-class Measurement(Base):
-    __tablename__ = "measurements"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(50), nullable=False)
-    value = Column(Float, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.now(UTC))

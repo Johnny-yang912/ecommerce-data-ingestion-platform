@@ -65,3 +65,7 @@ class ODS(Base):
 
     # items 整包（SQLite 用 Text）
     items = Column(Text, nullable=True)
+
+    # 清洗錯誤標籤
+    has_clean_error = Column(Boolean, nullable=False, default=False)
+    clean_error_message = Column(Text, nullable=True)

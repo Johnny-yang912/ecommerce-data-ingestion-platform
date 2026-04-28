@@ -5,7 +5,7 @@ from sqlalchemy import update, and_, select
 import json
 from datetime import datetime
 from pytz import UTC
-from clean import clean_and_validate
+from clean import clean_order
 
 def try_claim_raw(db,raw_id: int) -> bool:
         claim = (update(Raw).where(and_(Raw.id == raw_id, Raw.status == "pending")).values(status="processing"))
@@ -31,6 +31,9 @@ def process_raw_event(raw_id: int) -> None:
 
             # 2. 攤平 + 驗證
             ods_order = ODSOrder.from_nested(payload)
+
+            # 步驟 2.5：清洗
+            ods_order, has_clean_error, clean_error_message = clean_order(ods_order)
 
             # 3. 寫入 ODS
             ods = ODS(
@@ -67,6 +70,9 @@ def process_raw_event(raw_id: int) -> None:
                 is_repeat_customer=ods_order.is_repeat_customer,
 
                 items=json.dumps(ods_order.items, ensure_ascii=False),
+
+                has_clean_error=has_clean_error,
+                clean_error_message=clean_error_message,
             )
             db.add(ods)
 

@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException,BackgroundTasks
-from schema import UserIN, RawOut
+from schema import OrderIN, RawOut
 import io
 import pandas as pd
 import json
@@ -13,22 +13,26 @@ app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
 
-@app.post("/users")
-async def create_user(user: UserIN , background_tasks: BackgroundTasks):
+@app.post("/orders")
+async def create_order(order: OrderIN, background_tasks: BackgroundTasks):
     db = SessionLocal()
     try:
-        payload_dict =user.model_dump()
-        payload_text = json.dumps(payload_dict, ensure_ascii=False)
+        payload_dict = order.model_dump()
+        payload_text = json.dumps(payload_dict, ensure_ascii=False, default=str)
 
-        raw = Raw(payload_text=payload_text)
+        raw = Raw(
+            raw_payload=payload_text,
+            order_id=order.order_id,
+        )
         db.add(raw)
         db.commit()
         db.refresh(raw)
 
         background_tasks.add_task(process_raw_event, raw.id)
-        return {"raw_id": raw.id , "status": "pending"}
+        return {"raw_id": raw.id, "status": "pending"}
     finally:
         db.close()
+
 
 @app.post("/process_raw/{raw_id}")
 async def process_raw(raw_id: int, force: bool = False):

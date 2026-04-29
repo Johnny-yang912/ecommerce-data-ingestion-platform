@@ -3,6 +3,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 from pytz import UTC
 from database import Base
+from sqlalchemy.dialects.postgresql import JSONB
 
 class Raw(Base):
     __tablename__ = "raw"
@@ -17,7 +18,7 @@ class Raw(Base):
     order_id = Column(String(50), nullable=True, index=True)
 
     # 整包原始資料
-    raw_payload = Column(Text, nullable=False)  # SQLite 用 Text 存 JSON 字串
+    raw_payload = Column(Text, nullable=False)  # 用Text保留完整JSON字串訊息，用以追蹤和除錯
 
 
 class ODS(Base):
@@ -63,8 +64,8 @@ class ODS(Base):
     customer_rating = Column(Float, nullable=True)
     is_repeat_customer = Column(Boolean, nullable=True)
 
-    # items 整包（SQLite 用 Text）
-    items = Column(Text, nullable=True)
+    # items 整包 (清理與攤平後使用JSONB存儲，方便後續分析和查詢)
+    items = Column(JSONB, nullable=True)
 
     # 清洗錯誤標籤
     has_clean_error = Column(Boolean, nullable=False, default=False)

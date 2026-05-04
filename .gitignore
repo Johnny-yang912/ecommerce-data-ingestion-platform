@@ -8,3 +8,6 @@ CLAUDE.md
 load_test.py
 restart_test.sh
 *:Zone.Identifier
+test_process_retry.py
+test_retry.py
+test_scan_retry.py

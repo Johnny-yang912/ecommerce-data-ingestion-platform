@@ -97,6 +97,45 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 ---
 
+## Retry 與 Recovery 機制
+
+### Retry 機制
+
+四層 Retry 策略，應對暫時性故障。所有 retry 採 exponential backoff（0.5s → 1s → 放棄），最多重試 3 次。
+
+**Point 1 — Raw 寫入（`main.py`）**
+攔截 `db.commit()` 的 `OperationalError`，使用 `asyncio.sleep` 避免 block event loop。
+
+**Point 2 — 背景任務處理（`process.py`）**
+對完整 processing pipeline（JSON 解析 → 攤平 → 清洗 → ODS 寫入）在 `Exception` 時重試。`JSONDecodeError` 與 `ValueError` 屬資料本身的問題，不重試，直接 mark error。
+
+**Point 3 — Claim（`process.py`）**
+在 `OperationalError` 時重試 `try_claim_raw`。明確區分 DB 例外（重試）與 `rowcount=0`（另一個 worker 搶走，正常行為，不重試）。
+
+**Point 4 — Status 更新（`process.py`）**
+所有 Raw status 更新統一走 `_commit_raw_status()`，任何例外均 retry。Success path 的 ODS + status commit 在 rollback 後重新 `db.add(ods)` 再重試。耗盡所有重試機會時記 `CRITICAL` log。
+
+### 掃描 Recovery
+
+**Startup scan**（`lifespan`）：Server 啟動時立即執行一次，掃描所有 `pending` 記錄並透過 `asyncio.to_thread` 重新排程。
+
+**Periodic scan**（每 5 分鐘）：兩步驟邏輯：
+1. 將卡住超過 10 分鐘的 `processing` 記錄重設為 `pending`，記 `WARNING`（存在 ODS 重複寫入風險，尚未實作 idempotency）
+2. 收集所有 `pending` 記錄重新排程
+
+### 能應對 vs. 不能應對
+
+| 情況 | 能應對？ |
+|---|---|
+| 任何階段的 DB 連線短暫中斷 | ✅ |
+| Crash 後遺留的 `pending` / `processing` 記錄 | ✅（掃描 Recovery）|
+| Connection pool 打爆（`TimeoutError`）| ❌ 例外型別不同，Point 1 catch 不到 |
+| SIGKILL 正在執行時 | ❌ 程序已死，任何 retry 都無法觸發 |
+| 同一 `order_id` 重複送入 | ❌ `order_id` 無 UNIQUE 約束 |
+| Scan retry 對已寫入 ODS 的記錄重新處理 | ❌ 無 idempotency 保護，ODS 會重複寫入 |
+
+---
+
 ## API 端點
 
 | Method | Path | 說明 |
@@ -204,8 +243,9 @@ BI
 ## 開發藍圖
 
 **Phase 1 — 系統可靠性**
-- [ ] Worker 失敗重試 / timeout 機制
-- [ ] Idempotency 完整實作與測試
+- [v] Retry 機制 — 四層 retry（Raw 寫入、Claim、Processing、Status 更新），exponential backoff，耗盡後記 `CRITICAL` log
+- [v] 掃描 Recovery — 啟動時掃描一次 + 每 5 分鐘 periodic scan；stale `processing`（>10分鐘）重設為 pending；potential duplicate ODS 記 `WARNING`
+- [ ] Idempotency — `Raw.order_id` 加 UNIQUE 約束 + `create_order` 的 `IntegrityError` handling；ODS 加 `raw_id` 欄位防止 scan retry 重複寫入
 - [ ] 接收層 Rate Limiting
 
 **Phase 2 — 可驗證性**

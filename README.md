@@ -97,6 +97,45 @@ Mitigation options: startup recovery scan (`SELECT * FROM raw WHERE status IN ('
 
 ---
 
+## Retry & Recovery
+
+### Retry Mechanism
+
+Four-layer retry strategy to handle transient failures. All retries use exponential backoff (0.5s → 1s → give up) capped at 3 attempts.
+
+**Point 1 — Raw write (`main.py`)**
+Catches `OperationalError` on `db.commit()`. Uses `asyncio.sleep` to avoid blocking the event loop.
+
+**Point 2 — Processing (`process.py`)**
+Retries the full pipeline (JSON parse → flatten → clean → ODS write) on generic `Exception`. `JSONDecodeError` and `ValueError` are not retried — these are data errors that will always fail regardless of retry count.
+
+**Point 3 — Claim (`process.py`)**
+Retries `try_claim_raw` on `OperationalError`. Distinguishes between a DB exception (retry) and `rowcount=0` (another worker claimed the record — expected behaviour, no retry).
+
+**Point 4 — Status update (`process.py`)**
+All Raw status updates go through `_commit_raw_status()`, which retries on any exception. The success-path commit (ODS + status together) re-adds the ODS object after rollback before retrying. Exhausting all retries logs `CRITICAL`.
+
+### Crash Recovery Scan
+
+**Startup scan** (`lifespan`): Runs once on server start. Queries all `pending` records and re-queues them via `asyncio.to_thread`.
+
+**Periodic scan** (every 5 minutes): Two-step logic:
+1. Reset stale `processing` records (stuck > 10 minutes) to `pending` — logs `WARNING` due to potential duplicate ODS writes (no idempotency guard yet)
+2. Collect and re-queue all `pending` records
+
+### What retry handles vs. what it does not
+
+| Scenario | Handled |
+|---|---|
+| Transient DB connection drop at any stage | ✅ |
+| `pending` / `processing` records after a crash | ✅ (scan recovery) |
+| Connection pool exhaustion (`TimeoutError`) | ❌ Different exception type — not caught by Point 1 |
+| SIGKILL mid-execution | ❌ Process is dead before any retry logic runs |
+| Duplicate `order_id` submitted twice | ❌ No `UNIQUE` constraint on `order_id` |
+| ODS duplicate when scan retries a `processing` record | ❌ No idempotency guard |
+
+---
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -204,8 +243,9 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 ## Roadmap
 
 **Phase 1 — Reliability**
-- [ ] Retry / timeout for background task workers
-- [ ] Idempotency — complete implementation and test coverage
+- [v] Retry mechanism — 4-point retry (Raw write, Claim, Processing, Status update), exponential backoff, `CRITICAL` log when all retries exhausted
+- [v] Crash recovery scan — startup scan on restart + periodic scan every 5 minutes; stale `processing` (> 10 min) reset to `pending`; `WARNING` logged for potential duplicate ODS writes
+- [ ] Idempotency — `UNIQUE` constraint on `Raw.order_id` + `IntegrityError` handling in `create_order`; `raw_id` column in ODS to prevent duplicate writes from scan retry
 - [ ] Rate limiting on the ingestion layer
 
 **Phase 2 — Testability**

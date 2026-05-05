@@ -58,6 +58,12 @@ Separates `JSONDecodeError`, `ValueError` (validation), and generic `Exception` 
 **Data cleaning pipeline**
 `format_clean()` normalises string casing and strips whitespace. `business_clean()` validates business rules (quantity > 0, rating 1–5, delivery_date ≥ order_date, etc.) and flags records with `has_clean_error` rather than rejecting them outright.
 
+**No business deduplication at the Raw layer**
+`Raw.order_id` intentionally has no UNIQUE constraint. The Raw table's responsibility is to record every inbound request as-is — including duplicate submissions — because different submissions may carry complementary fields, and abnormal submission frequency is itself a signal (attack detection, client-side bugs). Deduplication responsibility is delegated to the ODS layer.
+
+**ODS-layer first-write-wins idempotency**
+Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
+
 ---
 
 ## Load Test Results
@@ -76,7 +82,7 @@ Mitigation options: increase pool size, switch to async SQLAlchemy (asyncpg), or
 
 **Test 3 — 100 duplicate order_ids, concurrency=100**
 Result: 100 Raw records written, 100 ODS records written — all succeeded.
-`order_id` on the Raw table has an index but no UNIQUE constraint. Each duplicate is treated as a new ingestion event with its own `raw_id`. CAS lock protects against the same `raw_id` being processed twice, not against business-level deduplication — a known and intentional boundary.
+`order_id` on the Raw table has an index but no UNIQUE constraint. Each duplicate is treated as a new ingestion event with its own `raw_id`. CAS lock protects against the same `raw_id` being processed twice, not against business-level deduplication — a known and intentional boundary (business-level deduplication is now handled by ODS idempotency).
 
 **Test 4 — 100 workers competing for the same raw_id (CAS lock)**
 Result: `raw.status = processed`, ODS COUNT = 1.
@@ -93,7 +99,12 @@ Two stuck-state scenarios:
 | `pending` | Crash before background task runs, or `try_claim_raw` DB exception (transaction rollback) |
 | `processing` | Crash after claim commit, before final status update |
 
-Mitigation options: startup recovery scan (`SELECT * FROM raw WHERE status IN ('pending','processing')`), replace BackgroundTasks with Redis/Celery/Kafka, periodic sweep to reset stale `processing` records.
+Mitigation options: ~~startup recovery scan (`SELECT * FROM raw WHERE status IN ('pending','processing')`)~~, replace BackgroundTasks with Redis/Celery/Kafka, ~~periodic sweep to reset stale `processing` records~~ (Recovery mechanism implemented).
+
+**Test 6 — Duplicate order_id submissions (ODS idempotency)**
+Scenario A (sequential): the same `order_id` is submitted twice. The first write succeeds normally. When the second is processed, a pre-check finds the `order_id` already in ODS and marks the Raw record `duplicate` — ODS is not written again.
+Scenario B (TOCTOU race): two workers both pass the pre-check simultaneously; the first commits ODS, the second hits an `IntegrityError` on commit — caught without retry, marked `duplicate`.
+Result: ODS always contains exactly one record per `order_id`; all subsequent duplicate Raw records reach a `duplicate` terminal status, giving monitoring a clear signal distinct from normal processing.
 
 ---
 
@@ -120,7 +131,7 @@ All Raw status updates go through `_commit_raw_status()`, which retries on any e
 **Startup scan** (`lifespan`): Runs once on server start. Queries all `pending` records and re-queues them via `asyncio.to_thread`.
 
 **Periodic scan** (every 5 minutes): Two-step logic:
-1. Reset stale `processing` records (stuck > 10 minutes) to `pending` — logs `WARNING` due to potential duplicate ODS writes (no idempotency guard yet)
+1. Reset stale `processing` records (stuck > 10 minutes) to `pending` — logs `WARNING` (duplicate ODS write risk is now covered by idempotency protection)
 2. Collect and re-queue all `pending` records
 
 ### What retry handles vs. what it does not
@@ -131,8 +142,8 @@ All Raw status updates go through `_commit_raw_status()`, which retries on any e
 | `pending` / `processing` records after a crash | ✅ (scan recovery) |
 | Connection pool exhaustion (`TimeoutError`) | ❌ Different exception type — not caught by Point 1 |
 | SIGKILL mid-execution | ❌ Process is dead before any retry logic runs |
-| Duplicate `order_id` submitted twice | ❌ No `UNIQUE` constraint on `order_id` |
-| ODS duplicate when scan retries a `processing` record | ❌ No idempotency guard |
+| ~~Duplicate `order_id` submitted twice~~ | ~~❌ No `UNIQUE` constraint on `order_id`~~ → ✅ Resolved by ODS idempotency |
+| ~~ODS duplicate when scan retries a `processing` record~~ | ~~❌ No idempotency guard~~ → ✅ Resolved by ODS idempotency |
 
 ---
 
@@ -245,7 +256,8 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 **Phase 1 — Reliability**
 - [v] Retry mechanism — 4-point retry (Raw write, Claim, Processing, Status update), exponential backoff, `CRITICAL` log when all retries exhausted
 - [v] Crash recovery scan — startup scan on restart + periodic scan every 5 minutes; stale `processing` (> 10 min) reset to `pending`; `WARNING` logged for potential duplicate ODS writes
-- [ ] Idempotency — `UNIQUE` constraint on `Raw.order_id` + `IntegrityError` handling in `create_order`; `raw_id` column in ODS to prevent duplicate writes from scan retry
+- ~~[ ] Idempotency — `UNIQUE` constraint on `Raw.order_id` + `IntegrityError` handling in `create_order`; `raw_id` column in ODS to prevent duplicate writes from scan retry~~
+- [v] Idempotency — `raw_id` column in ODS + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`; first-write-wins: pre-check before commit + `IntegrityError` backstop for TOCTOU races; duplicate Raw records written to `duplicate` terminal status
 - [ ] Rate limiting on the ingestion layer
 
 **Phase 2 — Testability**

@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta
 from pytz import UTC
 from clean import clean_order
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ def process_raw_event(raw_id: int) -> None:
                     logger.warning("raw_id=%s order_id=%s 資料品質問題: %s", raw_id, ods_order.order_id, clean_error_message)
 
                 ods = ODS(
+                    raw_id=raw_id,
                     order_id=ods_order.order_id,
                     order_date=ods_order.order_date,
                     ship_mode=ods_order.ship_mode,
@@ -151,6 +152,17 @@ def process_raw_event(raw_id: int) -> None:
                     _commit_raw_status(db, raw_id, "error", f"Max retries exceeded: {type(e).__name__}: {e}")
                     return
 
+        # first-write-wins: 確認 order_id 尚未寫入 ODS
+        existing_ods = db.execute(
+            select(ODS).where(ODS.order_id == ods_order.order_id)
+        ).scalar_one_or_none()
+        if existing_ods:
+            logger.warning("raw_id=%s order_id=%s 重複，已由 raw_id=%s 處理，標記 duplicate",
+                           raw_id, ods_order.order_id, existing_ods.raw_id)
+            _commit_raw_status(db, raw_id, "duplicate",
+                               f"order_id {ods_order.order_id} 已由 raw_id={existing_ods.raw_id} 寫入 ODS")
+            return
+
         # Point 4 (success path): ODS + status 一起 commit，含 retry
         db.add(ods)
         for status_attempt in range(MAX_STATUS_RETRIES):
@@ -165,6 +177,16 @@ def process_raw_event(raw_id: int) -> None:
                 db.commit()
                 logger.info("raw_id=%s order_id=%s 處理完成", raw_id, raw.order_id)
                 break
+            except IntegrityError:
+                db.rollback()
+                # TOCTOU：pre-check 後另一個 worker 搶先寫入
+                existing_ods = db.execute(
+                    select(ODS).where(ODS.order_id == ods_order.order_id)
+                ).scalar_one_or_none()
+                logger.warning("raw_id=%s IntegrityError，race condition，標記 duplicate", raw_id)
+                _commit_raw_status(db, raw_id, "duplicate",
+                                   f"race condition: order_id {ods_order.order_id} 已由 raw_id={existing_ods.raw_id if existing_ods else '?'} 寫入 ODS")
+                return
             except Exception as e:
                 db.rollback()
                 if status_attempt < MAX_STATUS_RETRIES - 1:
@@ -186,7 +208,7 @@ def scan_and_recover() -> list[int]:
     掃描 stuck records 並回傳需要重新處理的 raw_id list。
 
     Step 1: stale processing（> STALE_PROCESSING_MINUTES）→ 重設為 pending
-            ⚠️ 若 ODS 已寫入，重跑會產生 duplicate，目前無 idempotency 保護
+            ⚠️ 若 ODS 已寫入，重跑時 idempotency 保護會攔截重複寫入，標為 duplicate
     Step 2: 收集所有 pending（含剛重設的）回傳給 caller 排程
     """
     db = SessionLocal()
@@ -207,7 +229,7 @@ def scan_and_recover() -> list[int]:
             )
             db.commit()
             logger.warning(
-                "scan: %d 筆 stale processing 重設為 pending（duplicate ODS 風險）ids=%s",
+                "scan: %d 筆 stale processing 重設為 pending，重新排程（ODS 重複寫入已由 idempotency 保護）ids=%s",
                 len(stale_ids), list(stale_ids)
             )
 

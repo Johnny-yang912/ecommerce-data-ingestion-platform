@@ -26,9 +26,10 @@ class ODS(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     received_at = Column(DateTime, nullable=False, default=datetime.now(UTC))
+    raw_id = Column(Integer, nullable=True, unique=True)
 
     # 訂單主體
-    order_id = Column(String(50), nullable=False, index=True)
+    order_id = Column(String(50), nullable=False, index=True, unique=True)
     order_date = Column(Date, nullable=True)
     ship_mode = Column(String(50), nullable=True)
     order_status = Column(String(20), nullable=True)

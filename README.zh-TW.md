@@ -58,6 +58,12 @@ Raw table 保留原始 JSON，方便除錯和 replay。ODS 存的是攤平、清
 **資料清洗 pipeline**
 `format_clean()` 處理格式問題（統一小寫、去空白）。`business_clean()` 驗證業務規則（數量不能為負、評分要在 1–5 之間、出貨日不能早於訂單日等）。有問題的資料不直接拒絕，而是用 `has_clean_error` 標記，讓下游自己決定怎麼處理。
 
+**Raw 層不做業務去重**
+`Raw.order_id` 刻意不加 UNIQUE 約束。Raw 的職責是完整記錄所有進來的請求，包含重複提交——不同提交之間可能欄位互補，異常的提交頻率本身也是訊號（攻擊偵測、用戶端 bug）。去重的責任下放到 ODS 層。
+
+**ODS 層 first-write-wins idempotency**
+同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
+
 ---
 
 ## 壓測結果
@@ -76,7 +82,7 @@ SQLAlchemy 預設 pool_size=5、max_overflow=10，最多 15 條連線。500 個�
 
 **測試三：100 筆相同 order_id，concurrency=100**
 結果：raw 寫入 100 筆，ODS 寫入 100 筆，全部成功。
-raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複訂單全被當作合法資料處理，各自拿到不同 raw_id，ODS 出現 100 筆相同訂單。CAS lock 保護的是「同一個 raw_id 不被重複消費」，業務層去重是另一層的問題，這是設計上已知的邊界。
+raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複訂單全被當作合法資料處理，各自拿到不同 raw_id，ODS 出現 100 筆相同訂單。CAS lock 保護的是「同一個 raw_id 不被重複消費」，業務層去重是另一層的問題，這是設計上已知的邊界（業務去重已透過 ODS idempotency 解決）。
 
 **測試四：100 個 worker 同時搶同一個 raw_id（CAS lock）**
 結果：raw.status = processed，ODS COUNT = 1。
@@ -93,7 +99,12 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 | `pending` | server crash 在背景任務執行前，或 try_claim_raw 的 DB 例外（transaction rollback） |
 | `processing` | server crash 在 claim commit 之後、狀態更新之前 |
 
-應對方向：啟動時掃描 recovery（`SELECT * FROM raw WHERE status IN ('pending','processing')`）、改用 Redis/Celery/Kafka 取代 BackgroundTasks、定期掃描超過 N 分鐘仍是 processing 的記錄並重設為 pending。
+應對方向：~~啟動時掃描 recovery（`SELECT * FROM raw WHERE status IN ('pending','processing')`）~~、改用 Redis/Celery/Kafka 取代 BackgroundTasks、~~定期掃描超過 N 分鐘仍是 processing 的記錄並重設為 pending~~（已補上 Recovery 機制）。
+
+**測試六：同一 order_id 重複提交（ODS idempotency）**
+情境一（sequential）：同一 order_id 先後送入兩次。第一筆正常寫入 ODS；第二筆處理時，pre-check 查到 ODS 已有此 order_id，直接將 Raw 標為 `duplicate`，ODS 不重複寫入。
+情境二（TOCTOU race）：兩個 worker 同時通過 pre-check，第一個搶先 commit ODS，第二個 commit 時觸發 `IntegrityError`，catch 後不 retry，直接標為 `duplicate`。
+結果：ODS 始終只有一筆，後進的重複 Raw 均為 `duplicate` 終態，下游與監控能明確區分正常處理與重複攔截。
 
 ---
 
@@ -120,7 +131,7 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 **Startup scan**（`lifespan`）：Server 啟動時立即執行一次，掃描所有 `pending` 記錄並透過 `asyncio.to_thread` 重新排程。
 
 **Periodic scan**（每 5 分鐘）：兩步驟邏輯：
-1. 將卡住超過 10 分鐘的 `processing` 記錄重設為 `pending`，記 `WARNING`（存在 ODS 重複寫入風險，尚未實作 idempotency）
+1. 將卡住超過 10 分鐘的 `processing` 記錄重設為 `pending`，記 `WARNING`（ODS 重複寫入風險已透過 idempotency 保護）
 2. 收集所有 `pending` 記錄重新排程
 
 ### 能應對 vs. 不能應對
@@ -131,8 +142,8 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 | Crash 後遺留的 `pending` / `processing` 記錄 | ✅（掃描 Recovery）|
 | Connection pool 打爆（`TimeoutError`）| ❌ 例外型別不同，Point 1 catch 不到 |
 | SIGKILL 正在執行時 | ❌ 程序已死，任何 retry 都無法觸發 |
-| 同一 `order_id` 重複送入 | ❌ `order_id` 無 UNIQUE 約束 |
-| Scan retry 對已寫入 ODS 的記錄重新處理 | ❌ 無 idempotency 保護，ODS 會重複寫入 |
+| ~~同一 `order_id` 重複送入~~ | ~~❌ `order_id` 無 UNIQUE 約束~~ → ✅ 已透過 ODS idempotency 解決 |
+| ~~Scan retry 對已寫入 ODS 的記錄重新處理~~ | ~~❌ 無 idempotency 保護，ODS 會重複寫入~~ → ✅ 已透過 ODS idempotency 解決 |
 
 ---
 
@@ -245,7 +256,8 @@ BI
 **Phase 1 — 系統可靠性**
 - [v] Retry 機制 — 四層 retry（Raw 寫入、Claim、Processing、Status 更新），exponential backoff，耗盡後記 `CRITICAL` log
 - [v] 掃描 Recovery — 啟動時掃描一次 + 每 5 分鐘 periodic scan；stale `processing`（>10分鐘）重設為 pending；potential duplicate ODS 記 `WARNING`
-- [ ] Idempotency — `Raw.order_id` 加 UNIQUE 約束 + `create_order` 的 `IntegrityError` handling；ODS 加 `raw_id` 欄位防止 scan retry 重複寫入
+- ~~[ ] Idempotency — `Raw.order_id` 加 UNIQUE 約束 + `create_order` 的 `IntegrityError` handling；ODS 加 `raw_id` 欄位防止 scan retry 重複寫入~~
+- [v] Idempotency — ODS 加 `raw_id` 欄位 + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`；first-write-wins 策略：pre-check + IntegrityError 兜底；重複記錄標為 `duplicate` 終態
 - [ ] 接收層 Rate Limiting
 
 **Phase 2 — 可驗證性**

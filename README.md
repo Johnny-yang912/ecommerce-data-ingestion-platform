@@ -102,7 +102,9 @@ Two stuck-state scenarios:
 Mitigation options: ~~startup recovery scan (`SELECT * FROM raw WHERE status IN ('pending','processing')`)~~, replace BackgroundTasks with Redis/Celery/Kafka, ~~periodic sweep to reset stale `processing` records~~ (Recovery mechanism implemented).
 
 **Test 6 — Duplicate order_id submissions (ODS idempotency)**
+
 Scenario A (sequential): the same `order_id` is submitted twice. The first write succeeds normally. When the second is processed, a pre-check finds the `order_id` already in ODS and marks the Raw record `duplicate` — ODS is not written again.
+
 Scenario B (TOCTOU race): two workers both pass the pre-check simultaneously; the first commits ODS, the second hits an `IntegrityError` on commit — caught without retry, marked `duplicate`.
 Result: ODS always contains exactly one record per `order_id`; all subsequent duplicate Raw records reach a `duplicate` terminal status, giving monitoring a clear signal distinct from normal processing.
 

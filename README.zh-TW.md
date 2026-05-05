@@ -102,7 +102,9 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 應對方向：~~啟動時掃描 recovery（`SELECT * FROM raw WHERE status IN ('pending','processing')`）~~、改用 Redis/Celery/Kafka 取代 BackgroundTasks、~~定期掃描超過 N 分鐘仍是 processing 的記錄並重設為 pending~~（已補上 Recovery 機制）。
 
 **測試六：同一 order_id 重複提交（ODS idempotency）**
+
 情境一（sequential）：同一 order_id 先後送入兩次。第一筆正常寫入 ODS；第二筆處理時，pre-check 查到 ODS 已有此 order_id，直接將 Raw 標為 `duplicate`，ODS 不重複寫入。
+
 情境二（TOCTOU race）：兩個 worker 同時通過 pre-check，第一個搶先 commit ODS，第二個 commit 時觸發 `IntegrityError`，catch 後不 retry，直接標為 `duplicate`。
 結果：ODS 始終只有一筆，後進的重複 Raw 均為 `duplicate` 終態，下游與監控能明確區分正常處理與重複攔截。
 

@@ -78,6 +78,8 @@ Raw table 保留原始 JSON，方便除錯和 replay。ODS 存的是攤平、清
 結果：P99 延遲約 14 秒，5 筆 HTTP 500 錯誤。
 SQLAlchemy 預設 pool_size=5、max_overflow=10，最多 15 條連線。500 個請求同時湧入，485 個排隊等連線，超過 pool_timeout=30 秒的請求直接拋出 `QueuePool limit reached`。那 5 筆錯誤是在 INSERT 之前就 timeout，raw table 裡沒有對應記錄。
 
+（目前已 catch `SATimeoutError` 回傳 503，快速失敗，由 client 自行重試。）
+
 應對方向：調大 pool、改用 async SQLAlchemy（asyncpg）、或在 API 前端加 rate limiting。
 
 **測試三：100 筆相同 order_id，concurrency=100**
@@ -142,10 +144,26 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 |---|---|
 | 任何階段的 DB 連線短暫中斷 | ✅ |
 | Crash 後遺留的 `pending` / `processing` 記錄 | ✅（掃描 Recovery）|
-| Connection pool 打爆（`TimeoutError`）| ❌ 例外型別不同，Point 1 catch 不到 |
+| Connection pool 打爆（`TimeoutError`）| ~~❌ 例外型別不同，Point 1 catch 不到~~ → ✅ 目前已 catch `SATimeoutError` 回傳 503，快速失敗，由 client 自行重試 |
 | SIGKILL 正在執行時 | ❌ 程序已死，任何 retry 都無法觸發 |
 | ~~同一 `order_id` 重複送入~~ | ~~❌ `order_id` 無 UNIQUE 約束~~ → ✅ 已透過 ODS idempotency 解決 |
 | ~~Scan retry 對已寫入 ODS 的記錄重新處理~~ | ~~❌ 無 idempotency 保護，ODS 會重複寫入~~ → ✅ 已透過 ODS idempotency 解決 |
+
+---
+
+### Timeout 設定
+
+**DB statement timeout（`database.py`）**
+透過 `connect_args={"options": "-c statement_timeout=30000"}` 在每條連線上設定 PostgreSQL session-level timeout。確保任何 SQL 超過 30 秒（如 lock wait 導致的掛住）會拋 `OperationalError`，讓 retry 機制能正常接管，而不是讓 thread 永久掛住。
+
+**Connection pool 明確設定（`database.py`）**
+`pool_size=5, max_overflow=10, pool_timeout=30`，與 SQLAlchemy 預設值相同，但明確寫出來方便日後調整。
+
+**Pool 耗盡 → 503（`main.py`）**
+`POST /orders` 額外 catch `SATimeoutError`（pool 等不到連線），直接回傳 503 Service Unavailable，不走 retry loop。Pool 耗盡是資源競爭問題而非 DB 故障，retry 無法改善，應快速失敗讓 client 自行退讓。
+
+**`POST /process_raw/{raw_id}` 改為 background task（`main.py`）**
+從直接呼叫 `process_raw_event(raw_id)` 改為 `background_tasks.add_task`，與 `/orders` 設計一致，不再 block event loop。
 
 ---
 
@@ -258,6 +276,7 @@ BI
 **Phase 1 — 系統可靠性**
 - [v] Retry 機制 — 四層 retry（Raw 寫入、Claim、Processing、Status 更新），exponential backoff，耗盡後記 `CRITICAL` log
 - [v] 掃描 Recovery — 啟動時掃描一次 + 每 5 分鐘 periodic scan；stale `processing`（>10分鐘）重設為 pending；potential duplicate ODS 記 `WARNING`
+- [v] Timeout — DB statement timeout（30s）防 lock wait 掛住 thread；pool 設定明確化；`POST /orders` catch pool 耗盡回 503；`/process_raw` 改為 background task 不 block event loop
 - ~~[ ] Idempotency — `Raw.order_id` 加 UNIQUE 約束 + `create_order` 的 `IntegrityError` handling；ODS 加 `raw_id` 欄位防止 scan retry 重複寫入~~
 - [v] Idempotency — ODS 加 `raw_id` 欄位 + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`；first-write-wins 策略：pre-check + IntegrityError 兜底；重複記錄標為 `duplicate` 終態
 - [ ] 接收層 Rate Limiting

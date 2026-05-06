@@ -11,3 +11,4 @@ restart_test.sh
 test_process_retry.py
 test_retry.py
 test_scan_retry.py
+test_timeout_changes.py

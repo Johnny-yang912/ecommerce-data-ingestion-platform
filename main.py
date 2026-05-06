@@ -11,7 +11,7 @@ from database import SessionLocal, Base, engine
 from models import Raw
 from process import process_raw_event, scan_and_recover
 from sqlalchemy import select, update
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,12 +82,15 @@ async def create_order(order: OrderIN, background_tasks: BackgroundTasks):
         background_tasks.add_task(process_raw_event, raw.id)
         logger.info("raw_id=%s 已建立，背景任務已排程", raw.id)
         return {"raw_id": raw.id, "status": "pending"}
+    except SATimeoutError:
+        logger.warning("connection pool 耗盡，order_id=%s", order.order_id)
+        raise HTTPException(status_code=503, detail="Server busy, please retry later")
     finally:
         db.close()
 
 
 @app.post("/process_raw/{raw_id}")
-async def process_raw(raw_id: int, force: bool = False):
+async def process_raw(raw_id: int, background_tasks: BackgroundTasks, force: bool = False):
     logger.info("觸發 replay raw_id=%s，force=%s", raw_id, force)
     if force:
         db = SessionLocal()
@@ -101,7 +104,7 @@ async def process_raw(raw_id: int, force: bool = False):
         finally:
             db.close()
 
-    process_raw_event(raw_id)
+    background_tasks.add_task(process_raw_event, raw_id)
     return {"raw_id": raw_id, "triggered": True, "force": force}
 
 

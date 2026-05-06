@@ -78,6 +78,8 @@ Each `POST /orders` only performs a single fast INSERT and releases the connecti
 Result: P99 latency ~14s, 5 × HTTP 500 errors.
 SQLAlchemy's default pool (pool_size=5, max_overflow=10) supports at most 15 concurrent connections. With 500 simultaneous requests, 485 queue for a connection. Any request exceeding `pool_timeout=30s` throws `QueuePool limit reached`. The 5 failures timed out before INSERT — no Raw record was created.
 
+(Currently handled: `SATimeoutError` is caught and returns 503 Service Unavailable immediately, letting the client retry.)
+
 Mitigation options: increase pool size, switch to async SQLAlchemy (asyncpg), or add rate limiting at the API gateway.
 
 **Test 3 — 100 duplicate order_ids, concurrency=100**
@@ -142,10 +144,26 @@ All Raw status updates go through `_commit_raw_status()`, which retries on any e
 |---|---|
 | Transient DB connection drop at any stage | ✅ |
 | `pending` / `processing` records after a crash | ✅ (scan recovery) |
-| Connection pool exhaustion (`TimeoutError`) | ❌ Different exception type — not caught by Point 1 |
+| Connection pool exhaustion (`TimeoutError`) | ~~❌ Different exception type — not caught by Point 1~~ → ✅ `SATimeoutError` is now caught and returns 503, letting the client retry |
 | SIGKILL mid-execution | ❌ Process is dead before any retry logic runs |
 | ~~Duplicate `order_id` submitted twice~~ | ~~❌ No `UNIQUE` constraint on `order_id`~~ → ✅ Resolved by ODS idempotency |
 | ~~ODS duplicate when scan retries a `processing` record~~ | ~~❌ No idempotency guard~~ → ✅ Resolved by ODS idempotency |
+
+---
+
+### Timeout Settings
+
+**DB statement timeout (`database.py`)**
+Set via `connect_args={"options": "-c statement_timeout=30000"}` on each connection. Ensures any SQL that hangs beyond 30 seconds (e.g. a lock wait) raises `OperationalError`, allowing the retry mechanism to take over instead of leaving threads hanging indefinitely.
+
+**Explicit connection pool settings (`database.py`)**
+`pool_size=5, max_overflow=10, pool_timeout=30` — same as SQLAlchemy defaults, but now explicit for clarity and future tuning.
+
+**Pool exhaustion → 503 (`main.py`)**
+`POST /orders` separately catches `SATimeoutError` (pool failed to acquire a connection) and returns 503 Service Unavailable without entering the retry loop. Pool exhaustion is a resource contention issue, not a DB fault — retrying only makes it worse. Failing fast lets the client back off and retry.
+
+**`POST /process_raw/{raw_id}` converted to background task (`main.py`)**
+Changed from calling `process_raw_event(raw_id)` directly to `background_tasks.add_task`, consistent with `/orders` and no longer blocking the event loop.
 
 ---
 
@@ -258,6 +276,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 **Phase 1 — Reliability**
 - [v] Retry mechanism — 4-point retry (Raw write, Claim, Processing, Status update), exponential backoff, `CRITICAL` log when all retries exhausted
 - [v] Crash recovery scan — startup scan on restart + periodic scan every 5 minutes; stale `processing` (> 10 min) reset to `pending`; `WARNING` logged for potential duplicate ODS writes
+- [v] Timeout — DB statement timeout (30s) prevents lock-wait hangs; explicit pool settings; `POST /orders` catches pool exhaustion and returns 503; `/process_raw` converted to background task to avoid blocking the event loop
 - ~~[ ] Idempotency — `UNIQUE` constraint on `Raw.order_id` + `IntegrityError` handling in `create_order`; `raw_id` column in ODS to prevent duplicate writes from scan retry~~
 - [v] Idempotency — `raw_id` column in ODS + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`; first-write-wins: pre-check before commit + `IntegrityError` backstop for TOCTOU races; duplicate Raw records written to `duplicate` terminal status
 - [ ] Rate limiting on the ingestion layer

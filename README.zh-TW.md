@@ -61,6 +61,9 @@ Raw table 保留原始 JSON，方便除錯和 replay。ODS 存的是攤平、清
 **Raw 層不做業務去重**
 `Raw.order_id` 刻意不加 UNIQUE 約束。Raw 的職責是完整記錄所有進來的請求，包含重複提交——不同提交之間可能欄位互補，異常的提交頻率本身也是訊號（攻擊偵測、用戶端 bug）。去重的責任下放到 ODS 層。
 
+**只做 per-IP 限流，不加全域上限**
+全域上限的數字必須從「預期同時活躍 IP 數 × per-IP 上限」推導，但這個數字在沒有真實流量資料時無從決定——隨意填寫的全域數字反而會帶來語義不明確的限制。更根本的問題是：`/minute` 視窗的 rate limit 無法防止瞬間 burst（如 concurrency=500 同時打入），而 pool 耗盡已由 `SATimeoutError → 503` 妥善處理。因此 rate limiting 的職責只保留在「防單一 IP 持續性濫用」，全域保護交給既有的 503 機制。
+
 **ODS 層 first-write-wins idempotency**
 同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
 
@@ -151,7 +154,7 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 ---
 
-### Timeout 設定
+## Timeout 設定
 
 **DB statement timeout（`database.py`）**
 透過 `connect_args={"options": "-c statement_timeout=30000"}` 在每條連線上設定 PostgreSQL session-level timeout。確保任何 SQL 超過 30 秒（如 lock wait 導致的掛住）會拋 `OperationalError`，讓 retry 機制能正常接管，而不是讓 thread 永久掛住。
@@ -164,6 +167,28 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 **`POST /process_raw/{raw_id}` 改為 background task（`main.py`）**
 從直接呼叫 `process_raw_event(raw_id)` 改為 `background_tasks.add_task`，與 `/orders` 設計一致，不再 block event loop。
+
+---
+
+## Rate Limiting
+
+使用 `slowapi` 對三個 endpoint 實施 per-IP 限流，計數 key 為 `request.client.host`（TCP 直連 IP）。
+
+| Endpoint | per-IP 限制 | 理由 |
+|---|---|---|
+| `POST /orders` | 60/minute | 防單一 client 異常頻率，正常用戶下單行為遠不到此上限 |
+| `POST /process_raw/{raw_id}` | 20/minute | 人工 replay 操作，頻率天然低 |
+| `GET /raw/{raw_id}` | 120/minute | Read-only，較寬鬆 |
+
+超出限制時回傳 `429 Too Many Requests`。
+
+**為什麼不加全域上限**
+
+全域上限的數字必須從「預期同時活躍 IP 數 × per-IP 上限」推導，在沒有真實流量資料時無從決定。更根本的問題是 rate limit（`/minute` 視窗）無法防止瞬間 burst——500 個請求在同一秒同時打入，全部都在 600/minute 上限內，pool 照樣會被打爆。pool 耗盡已由 `SATimeoutError → 503` 處理，rate limiting 的職責只保留在「防單一 IP 持續性濫用」。
+
+**⚠️ 部署注意事項**
+
+目前直接跑 uvicorn，`request.client.host` 是真實的 client IP，限流行為正確。若未來在 Nginx / Load Balancer 後面部署，`request.client.host` 會變成 proxy 的 IP，所有請求共用同一個計數器，per-IP 限流將失效。屆時需將 key_func 改為讀取 `X-Forwarded-For` header，並搭配適當的 trusted proxy 設定。
 
 ---
 
@@ -217,7 +242,7 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # 3. 裝套件
-pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi
 
 # 4. 設定環境變數
 cp .env.example .env
@@ -279,7 +304,7 @@ BI
 - [v] Timeout — DB statement timeout（30s）防 lock wait 掛住 thread；pool 設定明確化；`POST /orders` catch pool 耗盡回 503；`/process_raw` 改為 background task 不 block event loop
 - ~~[ ] Idempotency — `Raw.order_id` 加 UNIQUE 約束 + `create_order` 的 `IntegrityError` handling；ODS 加 `raw_id` 欄位防止 scan retry 重複寫入~~
 - [v] Idempotency — ODS 加 `raw_id` 欄位 + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`；first-write-wins 策略：pre-check + IntegrityError 兜底；重複記錄標為 `duplicate` 終態
-- [ ] 接收層 Rate Limiting
+- [v] Rate Limiting — per-IP 限流（slowapi），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
 - [ ] Pytest — 覆蓋 `try_claim_raw`、狀態機流轉、邊界條件

@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from schema import OrderIN, RawOut
 import asyncio
-import io
-import pandas as pd
 import json
-import sqlite3
 import logging
 from database import SessionLocal, Base, engine
 from models import Raw
@@ -18,6 +18,13 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+_key_func = get_remote_address  # 間接層：測試可替換此變數模擬不同 IP
+
+def _limiter_key(request: Request) -> str:
+    return _key_func(request)
+
+limiter = Limiter(key_func=_limiter_key)
 
 MAX_RAW_WRITE_RETRIES = 3
 SCAN_INTERVAL_SECONDS = 300  # periodic scan 間隔（5 分鐘）
@@ -48,10 +55,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 @app.post("/orders")
-async def create_order(order: OrderIN, background_tasks: BackgroundTasks):
+@limiter.limit("60/minute")
+async def create_order(request: Request, order: OrderIN, background_tasks: BackgroundTasks):
     logger.info("收到訂單請求 order_id=%s", order.order_id)
     db = SessionLocal()
     try:
@@ -90,7 +100,8 @@ async def create_order(order: OrderIN, background_tasks: BackgroundTasks):
 
 
 @app.post("/process_raw/{raw_id}")
-async def process_raw(raw_id: int, background_tasks: BackgroundTasks, force: bool = False):
+@limiter.limit("20/minute")
+async def process_raw(request: Request, raw_id: int, background_tasks: BackgroundTasks, force: bool = False):
     logger.info("觸發 replay raw_id=%s，force=%s", raw_id, force)
     if force:
         db = SessionLocal()
@@ -109,7 +120,8 @@ async def process_raw(raw_id: int, background_tasks: BackgroundTasks, force: boo
 
 
 @app.get("/raw/{raw_id}", response_model=RawOut)
-async def get_raw(raw_id: int):
+@limiter.limit("120/minute")
+async def get_raw(request: Request, raw_id: int):
     db = SessionLocal()
     try:
         raw = db.execute(select(Raw).where(Raw.id == raw_id)).scalar_one_or_none()

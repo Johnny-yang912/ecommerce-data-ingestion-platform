@@ -61,6 +61,9 @@ Separates `JSONDecodeError`, `ValueError` (validation), and generic `Exception` 
 **No business deduplication at the Raw layer**
 `Raw.order_id` intentionally has no UNIQUE constraint. The Raw table's responsibility is to record every inbound request as-is — including duplicate submissions — because different submissions may carry complementary fields, and abnormal submission frequency is itself a signal (attack detection, client-side bugs). Deduplication responsibility is delegated to the ODS layer.
 
+**Per-IP rate limiting only — no global cap**
+A global limit must be derived from "expected concurrent active IPs × per-IP limit", which is impossible to determine without real traffic data — an arbitrary number would only introduce a limit with unclear semantics. More fundamentally, a `/minute` window rate limit cannot prevent instantaneous bursts: 500 requests arriving simultaneously all fall within a 600/minute cap, yet the pool would still be exhausted. Pool exhaustion is already handled by `SATimeoutError → 503`. Rate limiting's responsibility is narrowed to defending against sustained abuse from a single IP; global protection is delegated to the existing 503 mechanism.
+
 **ODS-layer first-write-wins idempotency**
 Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
 
@@ -151,7 +154,7 @@ All Raw status updates go through `_commit_raw_status()`, which retries on any e
 
 ---
 
-### Timeout Settings
+## Timeout Settings
 
 **DB statement timeout (`database.py`)**
 Set via `connect_args={"options": "-c statement_timeout=30000"}` on each connection. Ensures any SQL that hangs beyond 30 seconds (e.g. a lock wait) raises `OperationalError`, allowing the retry mechanism to take over instead of leaving threads hanging indefinitely.
@@ -164,6 +167,28 @@ Set via `connect_args={"options": "-c statement_timeout=30000"}` on each connect
 
 **`POST /process_raw/{raw_id}` converted to background task (`main.py`)**
 Changed from calling `process_raw_event(raw_id)` directly to `background_tasks.add_task`, consistent with `/orders` and no longer blocking the event loop.
+
+---
+
+## Rate Limiting
+
+Per-IP rate limiting via `slowapi`. The count key is `request.client.host` (direct TCP connection IP).
+
+| Endpoint | Per-IP limit | Reason |
+|---|---|---|
+| `POST /orders` | 60/minute | Guards against abnormal submission frequency from a single client; well above any legitimate order rate |
+| `POST /process_raw/{raw_id}` | 20/minute | Manual replay — inherently low frequency |
+| `GET /raw/{raw_id}` | 120/minute | Read-only, more lenient |
+
+Requests exceeding the limit receive `429 Too Many Requests`.
+
+**Why no global cap**
+
+A global limit must be derived from "expected concurrent active IPs × per-IP limit" — without real traffic data this number is arbitrary and carries unclear semantics. More fundamentally, a `/minute` window cannot prevent instantaneous bursts: 500 simultaneous requests all fall within a 600/minute cap, yet the pool exhausts regardless. Pool exhaustion is already handled by `SATimeoutError → 503`; rate limiting's responsibility is limited to sustained single-IP abuse.
+
+**⚠️ Deployment note**
+
+Running directly under uvicorn, `request.client.host` is the real client IP and limiting behaves correctly. If deployed behind Nginx or a load balancer, `request.client.host` becomes the proxy IP — all requests share one counter and per-IP limiting breaks down. In that case, the key function must be updated to read the `X-Forwarded-For` header with appropriate trusted-proxy configuration.
 
 ---
 
@@ -217,7 +242,7 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # 3. Install dependencies
-pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi
 
 # 4. Configure environment
 cp .env.example .env
@@ -279,7 +304,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Timeout — DB statement timeout (30s) prevents lock-wait hangs; explicit pool settings; `POST /orders` catches pool exhaustion and returns 503; `/process_raw` converted to background task to avoid blocking the event loop
 - ~~[ ] Idempotency — `UNIQUE` constraint on `Raw.order_id` + `IntegrityError` handling in `create_order`; `raw_id` column in ODS to prevent duplicate writes from scan retry~~
 - [v] Idempotency — `raw_id` column in ODS + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`; first-write-wins: pre-check before commit + `IntegrityError` backstop for TOCTOU races; duplicate Raw records written to `duplicate` terminal status
-- [ ] Rate limiting on the ingestion layer
+- [v] Rate limiting — per-IP limits via slowapi: `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
 - [ ] Pytest — unit tests for `try_claim_raw`, state transitions, edge cases

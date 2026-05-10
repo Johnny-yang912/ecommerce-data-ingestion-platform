@@ -58,6 +58,9 @@ Separates `JSONDecodeError`, `ValueError` (validation), and generic `Exception` 
 **Data cleaning pipeline**
 `format_clean()` normalises string casing and strips whitespace. `business_clean()` validates business rules (quantity > 0, rating 1–5, delivery_date ≥ order_date, etc.) and flags records with `has_clean_error` rather than rejecting them outright.
 
+**ODS items column uses JSONB; Raw payload uses TEXT** 
+The Raw layer's responsibility is to preserve every inbound request exactly as received, making no assumptions about structure — TEXT is the semantically correct choice since the database neither parses nor validates the content. The ODS items field, by contrast, has already passed Pydantic validation and cleaning, so its structure is guaranteed; JSONB adds a second layer of format enforcement at the database level and preserves the option to query into items fields directly in SQL if needed.
+
 **No business deduplication at the Raw layer**
 `Raw.order_id` intentionally has no UNIQUE constraint. The Raw table's responsibility is to record every inbound request as-is — including duplicate submissions — because different submissions may carry complementary fields, and abnormal submission frequency is itself a signal (attack detection, client-side bugs). Deduplication responsibility is delegated to the ODS layer.
 

@@ -103,17 +103,20 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
 @limiter.limit("20/minute")
 async def process_raw(request: Request, raw_id: int, background_tasks: BackgroundTasks, force: bool = False):
     logger.info("觸發 replay raw_id=%s，force=%s", raw_id, force)
-    if force:
-        db = SessionLocal()
-        try:
+    db = SessionLocal()
+    try:
+        raw = db.execute(select(Raw).where(Raw.id == raw_id)).scalar_one_or_none()
+        if not raw:
+            raise HTTPException(status_code=404, detail="Raw not found")
+        if force:
             db.execute(
                 update(Raw)
                 .where(Raw.id == raw_id)
                 .values(status="pending", error_message=None)
             )
             db.commit()
-        finally:
-            db.close()
+    finally:
+        db.close()
 
     background_tasks.add_task(process_raw_event, raw_id)
     return {"raw_id": raw_id, "triggered": True, "force": force}

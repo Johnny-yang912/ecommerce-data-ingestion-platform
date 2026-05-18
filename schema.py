@@ -169,7 +169,7 @@ class RawOut(BaseModel):
     status: str
     error_message: Optional[str] = None
     processed_at: Optional[datetime] = None
-    payload_preview: Optional[str] = None  # 只回傳截斷內容（避免整包太大）
+    raw_payload: str
 
     class Config:
         from_attributes = True

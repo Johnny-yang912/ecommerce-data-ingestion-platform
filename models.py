@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Date, Boolean
 from sqlalchemy.ext.declarative import declarative_base
-from datetime import datetime
-from pytz import UTC
+from sqlalchemy.sql import func
 from database import Base
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -9,7 +8,7 @@ class Raw(Base):
     __tablename__ = "raw"
 
     id = Column(Integer, primary_key=True, index=True)
-    received_at = Column(DateTime, nullable=False, default=datetime.now(UTC))
+    received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     status = Column(String(20), nullable=False, default="pending")
     error_message = Column(Text, nullable=True)
     processed_at = Column(DateTime, nullable=True)
@@ -25,7 +24,7 @@ class ODS(Base):
     __tablename__ = "ods"
 
     id = Column(Integer, primary_key=True, index=True)
-    received_at = Column(DateTime, nullable=False, default=datetime.now(UTC))
+    received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     raw_id = Column(Integer, nullable=True, unique=True)
 
     # 訂單主體

@@ -122,7 +122,7 @@ def process_raw_event(raw_id: int) -> None:
                     customer_rating=ods_order.customer_rating,
                     is_repeat_customer=ods_order.is_repeat_customer,
 
-                    items=json.dumps(ods_order.items, ensure_ascii=False),
+                    items=ods_order.items,
 
                     has_clean_error=has_clean_error,
                     clean_error_message=clean_error_message,

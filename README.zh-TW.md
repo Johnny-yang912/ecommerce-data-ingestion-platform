@@ -70,6 +70,9 @@ Raw 的職責是保留所有進來的原始資料，不對其結構做任何假�
 **ODS 層 first-write-wins idempotency**
 同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
 
+**`force=True` 的語意邊界：單筆重試，而非 Backfill**
+`POST /process_raw/{raw_id}?force=true` 只允許對 `error` 或 `duplicate` 狀態的記錄使用，語意是「重試這筆處理失敗的記錄」。對 `processed` 的記錄呼叫會直接回 400——因為若下游（Star Schema、聚合統計表）已消費過此筆 ODS，單獨刪除再重寫 ODS 無法 cascade 修正下游，反而製造不一致。若清洗邏輯改動後需要重新 derive 歷史資料，正確的工具是 Backfill batch job：從不可變的 Raw 層出發，全量重新產生 ODS 再逐層重跑下游——這是 Phase 4 引入 Airflow 時要解決的問題，不在 `force=True` 的責任範圍內。
+
 ---
 
 ## 壓測結果
@@ -323,3 +326,13 @@ BI
 - [ ] 升級成 Celery + Redis（取代目前的 BackgroundTasks）
 - [ ] Airflow 做分析層排程
 - [ ] ODS → Star Schema → 聚合 → 統計表
+
+---
+
+## 已知問題
+
+**Scan 可能對已排程的任務重複排程**
+Periodic scan 與 startup scan 會撈出所有 `status='pending'` 的 Raw 記錄並重新排程，但 DB 無法感知某筆記錄是否已經在 BackgroundTasks 佇列中等待執行。在高流量情境下，若大量請求寫入後尚未被消化，scan 就可能對這些「已排隊但還沒 claim 的記錄」再排一次，造成同一筆 raw_id 有多個 worker 同時嘗試處理。目前靠 CAS claim（`try_claim_raw`）在執行層兜底——後到的 worker 拿到 `rowcount=0` 會直接 return，不會重複寫入 ODS，正確性沒有問題，但會浪費 thread 資源，在高負載時會加重 pool 壓力。
+
+**未來換 Queue 時的修正方向**
+根本解法是讓「已排進 Queue」這件事對 DB 可見，具體做法是在狀態機中加入 `queued` 狀態（`pending → queued → processing → processed/error/duplicate`），並把入隊動作與狀態轉移綁在一起：寫入 Raw 後立刻以 CAS 原子性地將 `pending` 轉為 `queued`，成功才 push 進 Queue；scan 只撈 `pending`（即「從未成功入隊」的記錄），`queued` 的記錄一律跳過。Worker 的 CAS claim 對象也對應改為 `queued → processing`。唯一需要額外處理的邊界情況是：`pending → queued` 寫入 DB 成功、但 Queue push 失敗，此時記錄會卡在 `queued`——scan 需另外掃描超時的 stale `queued` 記錄並重設為 `pending`，讓它重新走一遍入隊流程。

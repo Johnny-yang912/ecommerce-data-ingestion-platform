@@ -109,6 +109,11 @@ async def process_raw(request: Request, raw_id: int, background_tasks: Backgroun
         if not raw:
             raise HTTPException(status_code=404, detail="Raw not found")
         if force:
+            if raw.status not in ("error", "duplicate"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"force=True only allowed for error or duplicate records (current status: {raw.status})"
+                )
             db.execute(
                 update(Raw)
                 .where(Raw.id == raw_id)

@@ -35,6 +35,9 @@ def format_clean(ods: ODSOrder) -> ODSOrder:
     if ods.customer_name:
         ods.customer_name = ods.customer_name.strip()
 
+    if ods.order_date and ods.delivery_date:
+        ods.delivery_days = (ods.delivery_date - ods.order_date).days
+
     return ods
 
 

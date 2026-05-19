@@ -70,6 +70,9 @@ A global limit must be derived from "expected concurrent active IPs × per-IP li
 **ODS-layer first-write-wins idempotency**
 Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
 
+**`force=True` semantic boundary: single-record retry, not backfill**
+`POST /process_raw/{raw_id}?force=true` is only permitted on `error` or `duplicate` records — its semantics are "retry this failed record". Calling it on a `processed` record returns 400. The reason: if downstream systems (Star Schema, aggregation tables) have already consumed that ODS record, deleting and rewriting it in isolation cannot cascade corrections downstream and would introduce inconsistencies instead. When a change to cleaning logic requires re-deriving historical data, the correct tool is a backfill batch job — starting from the immutable Raw layer, re-generating ODS in full, then re-running each downstream layer in sequence. That is a Phase 4 concern to be addressed when Airflow is introduced, and is outside the responsibility of `force=True`.
+
 ---
 
 ## Load Test Results
@@ -323,3 +326,13 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [ ] Celery + Redis (replace BackgroundTasks)
 - [ ] Airflow for batch scheduling
 - [ ] ODS → Star Schema → aggregation → stats tables
+
+---
+
+## Known Issues
+
+**Scan may re-schedule tasks that are already queued**
+The periodic scan and startup scan collect all Raw records with `status='pending'` and re-schedule them, but the database has no visibility into whether a given record is already sitting in the BackgroundTasks queue waiting to be picked up. Under high traffic, if a burst of requests lands before the queue drains, the scan can re-schedule records that are already queued — resulting in multiple workers racing to process the same raw_id. The CAS claim (`try_claim_raw`) acts as the safety net at execution time: the losing worker receives `rowcount=0` and returns immediately, so ODS is never written twice and correctness is preserved. The cost is wasted thread-pool slots and extra DB round-trips, which adds pressure to the connection pool under load.
+
+**Design direction when switching to a Queue**
+The proper fix is to make "already enqueued" visible in the database by introducing a `queued` status into the state machine (`pending → queued → processing → processed/error/duplicate`) and coupling the enqueue action to an atomic status transition: after writing the Raw record, immediately CAS `pending → queued`; only push to the Queue if `rowcount == 1`. The scan then only collects `pending` records (meaning records that never successfully entered the queue) and skips anything already `queued`. The worker's CAS claim shifts accordingly to `queued → processing`. The one edge case this introduces is a failed Queue push after the DB write succeeds, leaving a record stuck in `queued` — the scan must also sweep for stale `queued` records (older than N minutes) and reset them to `pending` so they re-enter the enqueue flow.

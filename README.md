@@ -281,24 +281,32 @@ try_claim_raw atomically claims the record (pending → processing)
   ↓
 Clean / Validate / Idempotency check
   ↓
-Write to ODS (clean, flat table)
+Write to ODS (PostgreSQL, clean flat table)
   ↓
 Update status (processing → processed / error)
 
 [Analytics Layer]  Batch, scheduled
-ODS
+Airflow DAG (local, scheduled)
   ↓
-Split into dim / fact tables (Star Schema)
+PostgreSQL ODS → BigQuery staging (incremental, watermarked by received_at)
   ↓
-Aggregation
+dbt Core transformations
+  ├── stg_*  (1:1 source mapping, rename / cast / dedup only)
+  ├── int_*  (cross-table joins, derived fields, business logic)
+  ├── dim_* / fct_*  (Star Schema, flexible ad-hoc queries)
+  └── rpt_*  (fixed-grain pre-aggregations, optimised for BI dashboards)
   ↓
-Write to stats / query tables
-  ↓
-BI
+Looker Studio (connected directly to BigQuery)
 ```
 
 **Why batch over streaming for the analytics layer?**
 The downstream consumer is BI — dashboards and reports where T+1 or hourly refresh is sufficient. Batch processing enables windowed data quality checks, supports re-runs on failure, and keeps the ingestion and analytics layers naturally decoupled. Streaming would only be motivated by a real-time prediction model downstream.
+
+**dbt layer responsibilities**
+- `stg_*`: Entry point for data from BigQuery staging; 1:1 source mapping, no business logic
+- `int_*`: Intermediate building blocks; handles joins and complex derivations consumed by dim/fct models
+- `dim_* / fct_*`: Star Schema dimension and fact tables for flexible analytical queries
+- `rpt_*`: Pre-aggregated reporting tables built on top of dim/fct; fixed grain, optimised for dashboard performance and BigQuery query cost
 
 ---
 
@@ -324,8 +332,9 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 
 **Phase 4 — Analytics Layer**
 - [ ] Celery + Redis (replace BackgroundTasks)
-- [ ] Airflow for batch scheduling
-- [ ] ODS → Star Schema → aggregation → stats tables
+- [ ] Airflow (local) scheduled extraction: PostgreSQL ODS → BigQuery (incremental by `received_at`)
+- [ ] dbt Core: stg_* → int_* → dim_*/fct_* (Star Schema in BigQuery) → rpt_* (fixed-grain pre-aggregations)
+- [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_* for dashboards and reports
 
 ---
 

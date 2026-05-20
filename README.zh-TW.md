@@ -281,24 +281,32 @@ try_claim_raw 搶狀態（pending → processing）
   ↓
 清理 / 驗證 / Idempotency 檢查
   ↓
-寫入 ODS（乾淨原始大表）
+寫入 ODS（PostgreSQL，乾淨原始大表）
   ↓
 狀態更新（processing → processed / error）
 
 【分析層】批次，排程觸發
-ODS
+Airflow DAG（本地，定期執行）
   ↓
-拆分寫入 dim / fact 表（Star Schema）
+PostgreSQL ODS → BigQuery staging（incremental，以 received_at 為 watermark）
   ↓
-聚合運算
+dbt Core 執行轉換
+  ├── stg_*（1:1 對應來源，只做 rename / cast / dedup）
+  ├── int_*（跨表 join、衍生欄位、業務邏輯）
+  ├── dim_* / fct_*（Star Schema，供彈性查詢）
+  └── rpt_*（固定粒度預聚合，BI Dashboard 直接使用）
   ↓
-寫入統計 / 查詢表
-  ↓
-BI
+Looker Studio（直連 BigQuery）
 ```
 
 **分析層為什麼用批次而不用 Streaming？**
 下游是 BI，消費模式是報表與 Dashboard，T+1 或小時級的更新頻率已足夠。批次可以用 window 做資料品質檢查、出錯可重跑，穩定性更高。接收層與分析層也因此天然解耦，批次排程不影響即時寫入路徑。若未來下游接即時預測模型，才有換 Streaming 的動機。
+
+**dbt 各層職責說明**
+- `stg_*`：資料清洗的入口，1:1 對應 BigQuery staging，不做業務邏輯
+- `int_*`：中間建材層，處理跨表 join 與複雜衍生邏輯，供 dim/fct 引用
+- `dim_* / fct_*`：Star Schema 的維度與事實表，適合彈性的 ad-hoc 查詢
+- `rpt_*`：在 dim/fct 之上進一步聚合，粒度固定，專為 Dashboard 效能與成本最佳化
 
 ---
 
@@ -324,8 +332,9 @@ BI
 
 **Phase 4 — 分析層完整實作**
 - [ ] 升級成 Celery + Redis（取代目前的 BackgroundTasks）
-- [ ] Airflow 做分析層排程
-- [ ] ODS → Star Schema → 聚合 → 統計表
+- [ ] Airflow（本地）定期抽取 ODS → BigQuery（incremental，以 `received_at` 為 watermark）
+- [ ] dbt Core：stg_* → int_* → dim_*/fct_*（Star Schema in BigQuery）→ rpt_*（固定粒度預聚合）
+- [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_* 做報表與 Dashboard
 
 ---
 

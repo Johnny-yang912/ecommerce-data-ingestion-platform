@@ -335,6 +335,11 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [ ] Airflow (local) scheduled extraction: PostgreSQL ODS → BigQuery (incremental by `received_at`)
 - [ ] dbt Core: stg_* → int_* → dim_*/fct_* (Star Schema in BigQuery) → rpt_* (fixed-grain pre-aggregations)
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_* for dashboards and reports
+- [ ] OpenTelemetry — extend the existing structlog foundation to cover all three observability pillars:
+  - **Logs**: route structlog output through the OTel Log Exporter; `trace_id` / `span_id` are injected into every log entry automatically, enabling cross-service log correlation
+  - **Metrics**: quantify business signals via the OTel Metrics API — order ingestion throughput, ODS processed / error / duplicate rates, processing latency distribution (P50/P95/P99), DB pool pressure, retry attempt counts
+  - **Traces**: once Celery and Airflow are in place, add distributed tracing across the full chain (API → Worker → Airflow → BigQuery) to identify cross-service latency and bottlenecks
+  - Exporter targets: Grafana Cloud (Loki + Prometheus + Tempo) or GCP Cloud Trace / Cloud Monitoring
 
 ---
 

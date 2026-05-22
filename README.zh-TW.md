@@ -335,6 +335,11 @@ Looker Studio（直連 BigQuery）
 - [ ] Airflow（本地）定期抽取 ODS → BigQuery（incremental，以 `received_at` 為 watermark）
 - [ ] dbt Core：stg_* → int_* → dim_*/fct_*（Star Schema in BigQuery）→ rpt_*（固定粒度預聚合）
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_* 做報表與 Dashboard
+- [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
+  - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）
+  - **Metrics**：透過 OTel Metrics API 量化業務指標——訂單寫入量、ODS 處理成功 / 失敗 / duplicate 比率、processing 延遲分佈（P50/P95/P99）、DB pool 壓力、Retry 次數分佈
+  - **Traces**：在 Celery + Airflow 引入後，對「API 接單 → Worker 處理 → Airflow 抽取 → BigQuery 寫入」全鏈路做分散式追蹤，定位跨服務延遲與瓶頸
+  - Exporter 目標：Grafana Cloud（Loki + Prometheus + Tempo）或 GCP Cloud Trace / Cloud Monitoring
 
 ---
 

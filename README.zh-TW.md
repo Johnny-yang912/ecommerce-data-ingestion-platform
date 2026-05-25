@@ -230,6 +230,17 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 ├── schema.py      # Pydantic schemas（OrderIN、ODSOrder、RawOut...）
 ├── models.py      # SQLAlchemy models（Raw、ODS）
 ├── database.py    # Engine、SessionLocal、Base
+├── pytest.ini     # 測試設定（asyncio_mode、coverage）
+├── tests/
+│   ├── conftest.py        # 共用 fixtures
+│   ├── helpers.py         # Mock 工廠函式與測試資料
+│   ├── test_clean.py      # format_clean、business_clean、clean_order
+│   ├── test_schema.py     # ODSOrder.from_nested
+│   ├── test_raw_write.py  # Point 1：Raw 寫入 retry
+│   ├── test_process.py    # Point 2–4：Claim / Processing / Status retry；Idempotency
+│   ├── test_scan.py       # scan_and_recover、lifespan startup、periodic scan
+│   ├── test_timeout.py    # Pool 耗盡、/process_raw、GET /raw、DB 設定
+│   └── test_rate_limit.py # per-IP 限流
 ├── .env           # DB_URL（不進版控）
 └── .gitignore
 ```
@@ -249,6 +260,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # 3. 裝套件
 pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi
+pip install pytest pytest-asyncio pytest-cov  # 測試依賴
 
 # 4. 設定環境變數
 cp .env.example .env
@@ -256,6 +268,9 @@ cp .env.example .env
 
 # 5. 啟動
 uvicorn main:app --reload
+
+# 6. 執行測試（需先設定 .env）
+pytest
 ```
 
 跑起來之後 API 文件在 `http://localhost:8000/docs`
@@ -321,7 +336,7 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-IP 限流（slowapi），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [ ] Pytest — 覆蓋 `try_claim_raw`、狀態機流轉、邊界條件
+- [v] Pytest — 78 個測試，7 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [ ] ODS 寫入前的資料品質驗證與 Profiling
 
 **Phase 3 — 工程化**

@@ -230,6 +230,17 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── schema.py      # Pydantic schemas (OrderIN, ODSOrder, RawOut...)
 ├── models.py      # SQLAlchemy models (Raw, ODS)
 ├── database.py    # Engine, SessionLocal, Base
+├── pytest.ini     # Test configuration (asyncio_mode, coverage)
+├── tests/
+│   ├── conftest.py        # Shared fixtures
+│   ├── helpers.py         # Mock factory functions and test data
+│   ├── test_clean.py      # format_clean, business_clean, clean_order
+│   ├── test_schema.py     # ODSOrder.from_nested
+│   ├── test_raw_write.py  # Point 1: Raw write retry
+│   ├── test_process.py    # Points 2–4: Claim / Processing / Status commit retry; Idempotency
+│   ├── test_scan.py       # scan_and_recover, lifespan startup, periodic scan
+│   ├── test_timeout.py    # Pool exhaustion, /process_raw, GET /raw, DB settings
+│   └── test_rate_limit.py # per-IP rate limiting
 ├── .env           # DB_URL (not committed)
 └── .gitignore
 ```
@@ -249,6 +260,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # 3. Install dependencies
 pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi
+pip install pytest pytest-asyncio pytest-cov  # test dependencies
 
 # 4. Configure environment
 cp .env.example .env
@@ -256,6 +268,9 @@ cp .env.example .env
 
 # 5. Run
 uvicorn main:app --reload
+
+# 6. Run tests (requires .env to be configured)
+pytest
 ```
 
 API docs available at `http://localhost:8000/docs`
@@ -321,7 +336,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Rate limiting — per-IP limits via slowapi: `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
-- [ ] Pytest — unit tests for `try_claim_raw`, state transitions, edge cases
+- [v] Pytest — 78 tests, 100% coverage across all 7 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`; `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
 - [ ] Data quality / profiling checks before ODS write
 
 **Phase 3 — Operability**

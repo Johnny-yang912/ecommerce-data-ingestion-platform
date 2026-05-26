@@ -29,6 +29,7 @@ from process import (
     MAX_PROCESS_RETRIES,
     MAX_STATUS_RETRIES,
 )
+from models import QualityEvent
 from helpers import (
     make_mock_db, claim_result, select_result,
     no_ods_result, existing_ods_result, make_mock_raw, VALID_PAYLOAD,
@@ -246,7 +247,7 @@ class TestProcessingRetry:
             process_raw_event(1)
 
         assert mock_warning.called             # 有記 warning
-        assert mock_db.add.call_count == 1     # ODS 仍被寫入（非阻塞）
+        assert mock_db.add.call_count == 2     # ODS + quality_event（非阻塞）
         assert mock_db.commit.call_count == 2  # claim + success commit
 
 
@@ -308,8 +309,8 @@ class TestStatusCommitRetry:
 
         assert mock_db.commit.call_count == 3
         assert mock_db.rollback.call_count == 1
-        # initial add + re-add after rollback
-        assert mock_db.add.call_count == 2
+        # (ods + quality_event) initial + (ods + quality_event) re-add after rollback
+        assert mock_db.add.call_count == 4
 
     def test_success_commit_exhausts_all_retries_logs_critical(self):
         """
@@ -340,8 +341,8 @@ class TestStatusCommitRetry:
             process_raw_event(1)
 
         assert mock_critical.called
-        # initial add(1) + re-add × (MAX-1) = MAX_STATUS_RETRIES
-        assert mock_db.add.call_count == MAX_STATUS_RETRIES
+        # (ods + quality_event) × initial(1) + re-add × (MAX-1) = MAX_STATUS_RETRIES * 2
+        assert mock_db.add.call_count == MAX_STATUS_RETRIES * 2
 
 
 # ─── Idempotency: first-write-wins ───────────────────────────────────────────
@@ -402,5 +403,178 @@ class TestIdempotency:
         # claim + IntegrityError rollback + duplicate status
         assert mock_db.commit.call_count == 3
         assert mock_db.rollback.call_count == 1
-        # ODS add 只有 1 次（不重試）
-        assert mock_db.add.call_count == 1
+        # ods + quality_event 各 1 次；IntegrityError 後不重試，不重新 add
+        assert mock_db.add.call_count == 2
+
+
+# ─── Quality Events ───────────────────────────────────────────────────────────
+
+def _quality_events_from_add(mock_db) -> list:
+    """從 db.add call list 中篩出 QualityEvent 物件。"""
+    return [
+        call[0][0]
+        for call in mock_db.add.call_args_list
+        if isinstance(call[0][0], QualityEvent)
+    ]
+
+
+class TestQualityEvents:
+
+    def test_clean_record_writes_quality_event_clean_state(self):
+        """
+        正常路徑（無 has_clean_error）→ quality_event to_state="clean" 與 ODS 同一 commit。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),  # UPDATE status
+            ],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"):
+            process_raw_event(1)
+
+        events = _quality_events_from_add(mock_db)
+        assert len(events) == 1
+        assert events[0].event_type == "initial_evaluation"
+        assert events[0].to_state == "clean"
+        assert events[0].from_state is None
+        assert events[0].raw_id == 1
+        assert events[0].rule_version == process.DQ_RULE_VERSION
+
+    def test_dirty_record_writes_quality_event_quarantined_state(self):
+        """
+        has_clean_error=True → quality_event to_state="quarantined"，reason 帶錯誤訊息。
+        """
+        dirty_payload = {
+            **VALID_PAYLOAD,
+            "behavior": {"customer_rating": 99.0},  # 超出 1~5 範圍
+        }
+        mock_raw = make_mock_raw(dirty_payload)
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),
+            ],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch.object(process.logger, "warning"):
+            process_raw_event(1)
+
+        events = _quality_events_from_add(mock_db)
+        assert len(events) == 1
+        assert events[0].to_state == "quarantined"
+        assert events[0].reason is not None
+
+    def test_commit_retry_readds_quality_event(self):
+        """
+        success commit 第 1 次失敗 → rollback 後 quality_event 與 ods 一起重新 add。
+        quality_event 在 add list 中應出現 2 次（initial + re-add）。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),  # UPDATE status attempt 1
+                MagicMock(),  # UPDATE status attempt 2
+            ],
+            commit_effects=[None, Exception("commit error"), None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"):
+            process_raw_event(1)
+
+        events = _quality_events_from_add(mock_db)
+        assert len(events) == 2  # initial add + re-add after rollback
+
+    def test_no_quality_event_on_pre_check_duplicate(self):
+        """
+        pre-check 攔截 duplicate → quality_event 不被寫入（ODS 未寫入）。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                existing_ods_result(42),  # pre-check 命中
+                MagicMock(),              # _commit_raw_status
+            ],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"):
+            process_raw_event(1)
+
+        assert len(_quality_events_from_add(mock_db)) == 0
+
+    def test_no_quality_event_committed_on_integrity_error(self):
+        """
+        TOCTOU IntegrityError → quality_event 雖已 add 到 session，
+        但 rollback 後不重新 add（ODS 未成功寫入，不記錄品質事件）。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),              # success commit attempt（將失敗）
+                existing_ods_result(42),  # IntegrityError handler SELECT
+                MagicMock(),              # _commit_raw_status
+            ],
+            commit_effects=[
+                None,
+                IntegrityError("duplicate key", None, None),
+                None,
+            ],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"):
+            process_raw_event(1)
+
+        # quality_event 只被 add 一次，但 rollback 後未重新 add（代表未寫入 DB）
+        events = _quality_events_from_add(mock_db)
+        assert len(events) == 1
+        assert mock_db.rollback.call_count == 1
+
+    def test_quality_metric_log_emitted_on_success(self):
+        """
+        成功 commit 後 logger.info("quality_metric", ...) 被呼叫，
+        且帶有 rule_version 與 has_clean_error 欄位。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),
+            ],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch.object(process.logger, "info") as mock_info:
+            process_raw_event(1)
+
+        log_events = [c for c in mock_info.call_args_list if c[0][0] == "quality_metric"]
+        assert len(log_events) == 1
+        kwargs = log_events[0][1]
+        assert "rule_version" in kwargs
+        assert "has_clean_error" in kwargs

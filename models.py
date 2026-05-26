@@ -70,3 +70,26 @@ class ODS(Base):
     # 清洗錯誤標籤
     has_clean_error = Column(Boolean, nullable=False, default=False)
     clean_error_message = Column(Text, nullable=True)
+
+    # 品質評估版本（攝入時使用的規則版本，之後永遠不動）
+    dq_rule_version = Column(String(10), nullable=True)
+
+
+class QualityEvent(Base):
+    __tablename__ = "quality_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    raw_id = Column(Integer, nullable=False, index=True)
+    order_id = Column(String(50), nullable=False, index=True)
+
+    # 事件類型：initial_evaluation | promotion | rejection
+    event_type = Column(String(30), nullable=False)
+
+    # 狀態機轉移
+    from_state = Column(String(30), nullable=True)
+    # to_state: clean | quarantined | promoted | permanently_rejected
+    to_state = Column(String(30), nullable=False)
+
+    rule_version = Column(String(10), nullable=False)
+    event_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    reason = Column(Text, nullable=True)

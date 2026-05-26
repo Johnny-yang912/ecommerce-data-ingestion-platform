@@ -2,6 +2,8 @@ from schema import ODSOrder
 from datetime import date
 from typing import Optional
 
+DQ_RULE_VERSION = "v1"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
+
 
 def format_clean(ods: ODSOrder) -> ODSOrder:
 

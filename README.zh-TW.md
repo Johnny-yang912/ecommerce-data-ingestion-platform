@@ -228,7 +228,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 ├── process.py     # 背景任務、狀態機、claim 邏輯
 ├── clean.py       # format_clean、business_clean、clean_order
 ├── schema.py      # Pydantic schemas（OrderIN、ODSOrder、RawOut...）
-├── models.py      # SQLAlchemy models（Raw、ODS）
+├── models.py      # SQLAlchemy models（Raw、ODS、QualityEvent）
 ├── database.py    # Engine、SessionLocal、Base
 ├── pytest.ini     # 測試設定（asyncio_mode、coverage）
 ├── tests/
@@ -237,13 +237,23 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 │   ├── test_clean.py      # format_clean、business_clean、clean_order
 │   ├── test_schema.py     # ODSOrder.from_nested
 │   ├── test_raw_write.py  # Point 1：Raw 寫入 retry
-│   ├── test_process.py    # Point 2–4：Claim / Processing / Status retry；Idempotency
+│   ├── test_process.py    # Point 2–4：Claim / Processing / Status retry；Idempotency；Quality Events
 │   ├── test_scan.py       # scan_and_recover、lifespan startup、periodic scan
 │   ├── test_timeout.py    # Pool 耗盡、/process_raw、GET /raw、DB 設定
 │   └── test_rate_limit.py # per-IP 限流
+├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
+├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture（English）
 ├── .env           # DB_URL（不進版控）
 └── .gitignore
 ```
+
+---
+
+## 📄 設計文件
+
+| 文件 | 說明 |
+|---|---|
+| [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
 
 ---
 
@@ -336,8 +346,8 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-IP 限流（slowapi），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 78 個測試，7 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
-- [ ] ODS 寫入前的資料品質驗證與 Profiling
+- [v] Pytest — 84 個測試，7 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）待 Phase 4 實作
 
 **Phase 3 — 工程化**
 - [ ] JWT 身份驗證
@@ -350,6 +360,7 @@ Looker Studio（直連 BigQuery）
 - [ ] Airflow（本地）定期抽取 ODS → BigQuery（incremental，以 `received_at` 為 watermark）
 - [ ] dbt Core：stg_* → int_* → dim_*/fct_*（Star Schema in BigQuery）→ rpt_*（固定粒度預聚合）
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_* 做報表與 Dashboard
+- [ ] 資料品質控管架構（BQ Analytics 層）— dbt stg_* Hard Gate tests；`int_orders` Row Filter（`WHERE has_clean_error = FALSE`）+ `int_orders_quarantine`；Airflow 重評估 task（Proposal B，寫回 `quality_events`）；`rpt_quality_*` 品質趨勢報表（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
   - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）
   - **Metrics**：透過 OTel Metrics API 量化業務指標——訂單寫入量、ODS 處理成功 / 失敗 / duplicate 比率、processing 延遲分佈（P50/P95/P99）、DB pool 壓力、Retry 次數分佈

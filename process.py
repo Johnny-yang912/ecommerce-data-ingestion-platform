@@ -1,14 +1,14 @@
 import structlog
 from structlog.contextvars import bind_contextvars, clear_contextvars
 from database import SessionLocal
-from models import Raw, ODS
+from models import Raw, ODS, QualityEvent
 from schema import ODSOrder
 from sqlalchemy import update, and_, select
 import json
 import time
 from datetime import datetime, timedelta
 from pytz import UTC
-from clean import clean_order
+from clean import clean_order, DQ_RULE_VERSION
 from sqlalchemy.exc import OperationalError, IntegrityError
 
 logger = structlog.get_logger()
@@ -126,6 +126,7 @@ def process_raw_event(raw_id: int) -> None:
 
                     has_clean_error=has_clean_error,
                     clean_error_message=clean_error_message,
+                    dq_rule_version=DQ_RULE_VERSION,
                 )
                 break  # 處理成功，跳出 retry loop
 
@@ -163,8 +164,18 @@ def process_raw_event(raw_id: int) -> None:
                                f"order_id {ods_order.order_id} 已由 raw_id={existing_ods.raw_id} 寫入 ODS")
             return
 
-        # Point 4 (success path): ODS + status 一起 commit，含 retry
+        # Point 4 (success path): ODS + quality_event + status 一起 commit，含 retry
+        quality_event = QualityEvent(
+            raw_id=raw_id,
+            order_id=ods_order.order_id,
+            event_type="initial_evaluation",
+            from_state=None,
+            to_state="quarantined" if has_clean_error else "clean",
+            rule_version=DQ_RULE_VERSION,
+            reason=clean_error_message,
+        )
         db.add(ods)
+        db.add(quality_event)
         for status_attempt in range(MAX_STATUS_RETRIES):
             try:
                 db.execute(
@@ -176,6 +187,12 @@ def process_raw_event(raw_id: int) -> None:
                 )
                 db.commit()
                 logger.info("處理完成", order_id=raw.order_id)
+                logger.info("quality_metric",
+                    rule_version=DQ_RULE_VERSION,
+                    has_clean_error=has_clean_error,
+                    order_id=ods_order.order_id,
+                    error_fields=clean_error_message,
+                )
                 break
             except IntegrityError:
                 db.rollback()
@@ -193,6 +210,7 @@ def process_raw_event(raw_id: int) -> None:
                     logger.warning("commit 失敗", attempt=status_attempt + 1)
                     time.sleep(0.5 * (2 ** status_attempt))
                     db.add(ods)
+                    db.add(quality_event)
                 else:
                     logger.critical("commit 失敗達上限，ODS 未寫入，record 卡在 processing", exc_info=True)
 

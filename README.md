@@ -228,7 +228,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── process.py     # Background task, state machine, claim logic
 ├── clean.py       # format_clean, business_clean, clean_order
 ├── schema.py      # Pydantic schemas (OrderIN, ODSOrder, RawOut...)
-├── models.py      # SQLAlchemy models (Raw, ODS)
+├── models.py      # SQLAlchemy models (Raw, ODS, QualityEvent)
 ├── database.py    # Engine, SessionLocal, Base
 ├── pytest.ini     # Test configuration (asyncio_mode, coverage)
 ├── tests/
@@ -237,13 +237,23 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 │   ├── test_clean.py      # format_clean, business_clean, clean_order
 │   ├── test_schema.py     # ODSOrder.from_nested
 │   ├── test_raw_write.py  # Point 1: Raw write retry
-│   ├── test_process.py    # Points 2–4: Claim / Processing / Status commit retry; Idempotency
+│   ├── test_process.py    # Points 2–4: Claim / Processing / Status commit retry; Idempotency; Quality Events
 │   ├── test_scan.py       # scan_and_recover, lifespan startup, periodic scan
 │   ├── test_timeout.py    # Pool exhaustion, /process_raw, GET /raw, DB settings
 │   └── test_rate_limit.py # per-IP rate limiting
+├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture (English)
+├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── .env           # DB_URL (not committed)
 └── .gitignore
 ```
+
+---
+
+## 📄 Design Documents
+
+| Document | Description |
+|---|---|
+| [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
 
 ---
 
@@ -336,8 +346,8 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Rate limiting — per-IP limits via slowapi: `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
-- [v] Pytest — 78 tests, 100% coverage across all 7 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`; `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
-- [ ] Data quality / profiling checks before ODS write
+- [v] Pytest — 84 tests, 100% coverage across all 7 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths; `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
+- [v] Data quality control architecture (ODS layer) — full design document (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md)); ODS layer implemented: `DQ_RULE_VERSION` rule version constant, `dq_rule_version` column (ODS), `quality_events` table (append-only quality event log, state machine anchor), structlog `quality_metric` event; BQ Analytics layer (Hard Gate, Row Filter, `int_orders_quarantine`, Airflow re-evaluation, `rpt_quality_*`) deferred to Phase 4
 
 **Phase 3 — Operability**
 - [ ] JWT authentication
@@ -350,6 +360,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [ ] Airflow (local) scheduled extraction: PostgreSQL ODS → BigQuery (incremental by `received_at`)
 - [ ] dbt Core: stg_* → int_* → dim_*/fct_* (Star Schema in BigQuery) → rpt_* (fixed-grain pre-aggregations)
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_* for dashboards and reports
+- [ ] Data quality control architecture (BQ Analytics layer) — dbt stg_* Hard Gate tests; `int_orders` Row Filter (`WHERE has_clean_error = FALSE`) + `int_orders_quarantine`; Airflow re-evaluation task (Proposal B, writes back to `quality_events`); `rpt_quality_*` quality trend models (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
 - [ ] OpenTelemetry — extend the existing structlog foundation to cover all three observability pillars:
   - **Logs**: route structlog output through the OTel Log Exporter; `trace_id` / `span_id` are injected into every log entry automatically, enabling cross-service log correlation
   - **Metrics**: quantify business signals via the OTel Metrics API — order ingestion throughput, ODS processed / error / duplicate rates, processing latency distribution (P50/P95/P99), DB pool pressure, retry attempt counts

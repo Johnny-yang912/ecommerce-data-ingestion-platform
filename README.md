@@ -408,7 +408,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — Automation + Queue Upgrade**
-- [ ] Airflow (local) scheduled ODS → BigQuery extraction; includes Proposal B re-evaluation task (writes back to `quality_events`)
+- [ ] Airflow (local) scheduled ODS → BigQuery extraction → dbt run/test（stg_* → int_* → dim_/fct_ → rpt_*）; includes Proposal B re-evaluation task (writes back to `quality_events`)
 - [ ] Celery + Redis (replace BackgroundTasks)
 - [ ] Docker extension: add Redis + Celery Worker and Airflow services
 - [ ] OpenTelemetry — extend the existing structlog foundation to cover all three observability pillars:

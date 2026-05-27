@@ -408,7 +408,7 @@ Looker Studio（直連 BigQuery）
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — 自動化 + Queue 升級**
-- [ ] Airflow（本地）定期排程 ODS → BigQuery 抽取；含 Proposal B 重評估 task（寫回 `quality_events`）
+- [ ] Airflow（本地）定期排程 ODS → BigQuery 抽取 → dbt run/test（stg_* → int_* → dim_/fct_ → rpt_*）；含 Proposal B 重評估 task（寫回 `quality_events`）
 - [ ] Celery + Redis（取代 BackgroundTasks）
 - [ ] Docker 擴展：補上 Redis + Celery Worker 與 Airflow 服務
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：

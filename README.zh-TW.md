@@ -39,7 +39,7 @@ POST /orders
     ├── first-write-wins idempotency check
     └── [ODS] + [quality_events]  ← 不可變錨點，含品質標記與事件日誌
 
-【Phase 4 目標】
+【Phase 4–5 目標】
 
 [ODS] → Airflow 增量抽取 → BigQuery staging
     ↓
@@ -400,16 +400,19 @@ Looker Studio（直連 BigQuery）
 - [ ] JWT 身份驗證
 - [ ] 環境變數集中管理
 - [ ] Alembic DB migration
-- [ ] Docker / docker-compose（Queue + Worker + DB 一鍵啟動）
+- [ ] Docker / docker-compose（API + PostgreSQL 容器化）
 
-**Phase 4 — 分析層完整實作**
-- [ ] 升級成 Celery + Redis（取代目前的 BackgroundTasks）
-- [ ] Airflow（本地）定期抽取 ODS → BigQuery（incremental，以 `received_at` 為 watermark）
-- [ ] dbt Core：stg_* → int_* → dim_*/fct_*（Star Schema in BigQuery）→ rpt_*（固定粒度預聚合）
-- [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_* 做報表與 Dashboard
-- [ ] 資料品質控管架構（BQ Analytics 層）— dbt stg_* Hard Gate tests；`int_orders` Row Filter（`WHERE has_clean_error = FALSE`）+ `int_orders_quarantine`；Airflow 重評估 task（Proposal B，寫回 `quality_events`）；`rpt_quality_*` 品質趨勢報表（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
+**Phase 4 — 分析層 Pipeline**
+- [ ] ODS → BigQuery 抽取腳本（Python script，以 `received_at` 為 watermark 做增量抽取）
+- [ ] dbt Core：stg_* → int_* → dim_*/fct_* → rpt_*；含 DQ BQ 層（Hard Gate tests、Row Filter、`int_orders_quarantine`、`rpt_quality_*`）（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
+- [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
+
+**Phase 5 — 自動化 + Queue 升級**
+- [ ] Airflow（本地）定期排程 ODS → BigQuery 抽取；含 Proposal B 重評估 task（寫回 `quality_events`）
+- [ ] Celery + Redis（取代 BackgroundTasks）
+- [ ] Docker 擴展：補上 Redis + Celery Worker 與 Airflow 服務
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
   - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）
   - **Metrics**：透過 OTel Metrics API 量化業務指標——訂單寫入量、ODS 處理成功 / 失敗 / duplicate 比率、processing 延遲分佈（P50/P95/P99）、DB pool 壓力、Retry 次數分佈
-  - **Traces**：在 Celery + Airflow 引入後，對「API 接單 → Worker 處理 → Airflow 抽取 → BigQuery 寫入」全鏈路做分散式追蹤，定位跨服務延遲與瓶頸
+  - **Traces**：對「API 接單 → Worker 處理 → Airflow 抽取 → BigQuery 寫入」全鏈路做分散式追蹤，定位跨服務延遲與瓶頸
   - Exporter 目標：Grafana Cloud（Loki + Prometheus + Tempo）或 GCP Cloud Trace / Cloud Monitoring

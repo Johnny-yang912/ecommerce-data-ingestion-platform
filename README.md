@@ -39,7 +39,7 @@ POST /orders
     ├── first-write-wins idempotency check
     └── [ODS] + [quality_events]  ← immutable anchor, with quality flag and event log
 
-[Phase 4 target]
+[Phase 4–5 target]
 
 [ODS] → Airflow incremental extraction → BigQuery staging
     ↓
@@ -400,16 +400,19 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [ ] JWT authentication
 - [ ] Centralised config management
 - [ ] Alembic migrations
-- [ ] Docker / docker-compose (Queue + Worker + DB)
+- [ ] Docker / docker-compose (API + PostgreSQL containerisation)
 
-**Phase 4 — Analytics Layer**
+**Phase 4 — Analytics Pipeline**
+- [ ] ODS → BigQuery extraction script (Python script, incremental by `received_at` watermark)
+- [ ] dbt Core: stg_* → int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Hard Gate tests, Row Filter, `int_orders_quarantine`, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
+- [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
+
+**Phase 5 — Automation + Queue Upgrade**
+- [ ] Airflow (local) scheduled ODS → BigQuery extraction; includes Proposal B re-evaluation task (writes back to `quality_events`)
 - [ ] Celery + Redis (replace BackgroundTasks)
-- [ ] Airflow (local) scheduled extraction: PostgreSQL ODS → BigQuery (incremental by `received_at`)
-- [ ] dbt Core: stg_* → int_* → dim_*/fct_* (Star Schema in BigQuery) → rpt_* (fixed-grain pre-aggregations)
-- [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_* for dashboards and reports
-- [ ] Data quality control architecture (BQ Analytics layer) — dbt stg_* Hard Gate tests; `int_orders` Row Filter (`WHERE has_clean_error = FALSE`) + `int_orders_quarantine`; Airflow re-evaluation task (Proposal B, writes back to `quality_events`); `rpt_quality_*` quality trend models (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
+- [ ] Docker extension: add Redis + Celery Worker and Airflow services
 - [ ] OpenTelemetry — extend the existing structlog foundation to cover all three observability pillars:
   - **Logs**: route structlog output through the OTel Log Exporter; `trace_id` / `span_id` are injected into every log entry automatically, enabling cross-service log correlation
   - **Metrics**: quantify business signals via the OTel Metrics API — order ingestion throughput, ODS processed / error / duplicate rates, processing latency distribution (P50/P95/P99), DB pool pressure, retry attempt counts
-  - **Traces**: once Celery and Airflow are in place, add distributed tracing across the full chain (API → Worker → Airflow → BigQuery) to identify cross-service latency and bottlenecks
+  - **Traces**: add distributed tracing across the full chain (API → Worker → Airflow → BigQuery) to identify cross-service latency and bottlenecks
   - Exporter targets: Grafana Cloud (Loki + Prometheus + Tempo) or GCP Cloud Trace / Cloud Monitoring

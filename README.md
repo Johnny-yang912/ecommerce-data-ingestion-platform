@@ -1,11 +1,11 @@
 # ecommerce-data-ingestion-platform
-### 電商資料平台寫入系統
+### E-Commerce Order Data Pipeline — Data Lifecycle Management in Practice
 
 **English** | [繁體中文](./README.zh-TW.md)
 
-A backend data ingestion service built with FastAPI, designed to simulate a real-world e-commerce order pipeline — from raw payload ingestion to ODS (Operational Data Store) write with data cleaning and state management.
+A data pipeline for e-commerce orders, built around data lifecycle management as its core — ensuring data enters the pipeline as reliably as possible under high concurrency with potential failures and duplicate submissions, progressively transforming untrusted inbound data into trustworthy analytical data through per-layer quality contracts, and achieving cross-pipeline data quality governance and complete lifecycle traceability through rule versioning and quality event tracking.
 
-The focus of this project is demonstrating practical backend and data engineering skills. Each design decision is grounded in real-world concerns: preventing duplicate processing under high concurrency, compensating for database write failures, and handling inconsistent or dirty data at ingestion time.
+This project is data engineering first, backend engineering second. The ingestion layer's fault-tolerant design (multi-point retry, crash recovery, CAS claim) ensures data gets in; the layered quality contracts (Raw → ODS → dbt stg/int/dim/fct) ensure data flows correctly; rule versioning and an append-only `quality_events` state machine ensure that the evolution of quality assessments is always auditable.
 
 ---
 
@@ -25,53 +25,168 @@ The focus of this project is demonstrating practical backend and data engineerin
 ## Architecture Overview
 
 ```
+[Currently implemented]
+
 POST /orders
-    │
-    ▼
-[Raw Table]  ←── stores original JSON payload
-    │  status: pending
-    ▼
+    ↓
+[Raw Table]  ←── persisted as-is, immutable                      status: pending
+    ↓
 [Background Task: process_raw_event]
-    │
-    ├── try_claim_raw()         ← atomic UPDATE pending → processing
+    ├── try_claim_raw()         ← atomic UPDATE, claim the record (CAS)
     ├── JSON parse
     ├── ODSOrder.from_nested()  ← flatten nested payload
-    ├── clean_order()           ← format clean + business validation
-    │
-    ├── success → write ODS, Raw status = processed
-    └── failure → Raw status = error, error_message logged
+    ├── clean_order()           ← format normalisation + business-rule validation
+    ├── first-write-wins idempotency check
+    └── [ODS] + [quality_events]  ← immutable anchor, with quality flag and event log
+
+[Phase 4 target]
+
+[ODS] → Airflow incremental extraction → BigQuery staging
+    ↓
+dbt stg_*   Hard Gate tests                 ← Silver entry, all records retained
+    ↓
+dbt int_*   Row Filter                      ← Gold entry, blocking happens here
+    ├── has_clean_error = FALSE → int_orders → dim_*/fct_*
+    └── has_clean_error = TRUE  → int_orders_quarantine
+    ↓
+Looker Studio (connected to BigQuery dim_*/fct_*/rpt_*)
 ```
+
+---
+
+## Quality Contract per Layer
+
+Quality control responsibility tightens progressively as data flows downstream. ODS is the immutable anchor that retains all data including dirty records; blocking happens at the `dbt int_*` layer.
+
+```
+Raw (PostgreSQL)
+  Responsibility : Persist every inbound request exactly as received, no quality assumptions
+  Quality requirement : None
+  Mutable : No
+
+ODS (PostgreSQL)                               ← Bronze / Anchor
+  Responsibility : Basic cleaning + business-rule validation, preserves all data including dirty records
+  Quality requirement : Format normalisation applied; business issues flagged, never rejected
+  Mutable : No
+
+dbt stg_*                                      ← Silver entry
+  Responsibility : 1:1 source mapping, type alignment, column renaming
+  Quality requirement : Same as ODS — all records retained including dirty ones
+
+─────────────────── Blocking happens here ───────────────────
+
+dbt int_*                                      ← Gold entry
+  Responsibility : Cross-table joins, derived fields, business logic
+  Quality requirement : Only clean records pass (has_clean_error = FALSE)
+  Destination for dirty records : int_orders_quarantine
+
+dbt dim_*/fct_*                                ← Gold
+  Quality requirement : Cleanest layer — no records with has_clean_error = TRUE
+
+dbt rpt_*
+  Responsibility : Fixed-grain pre-aggregations, optimised for BI dashboards
+  Quality requirement : Same as dim_*/fct_*
+```
+
+For the full DQ architecture design (blocking mechanism, quarantine handling, remediation paths, historical metrics) see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md).
 
 ---
 
 ## Key Design Decisions
 
-**Atomic claim logic (`try_claim_raw`)**
-Uses `UPDATE ... WHERE status = 'pending'` and checks `rowcount == 1` to prevent duplicate processing — safe under concurrent workers without pessimistic locking.
-
-**Two-layer data model (Raw → ODS)**
-Raw table preserves the original JSON payload for auditability and replay. ODS stores flattened, cleaned data ready for analytics.
-
-**Layered error handling**
-Separates `JSONDecodeError`, `ValueError` (validation), and generic `Exception` — each mapped to a distinct error message on the Raw record.
-
-**Data cleaning pipeline**
-`format_clean()` normalises string casing and strips whitespace. `business_clean()` validates business rules (quantity > 0, rating 1–5, delivery_date ≥ order_date, etc.) and flags records with `has_clean_error` rather than rejecting them outright.
-
-**ODS items column uses JSONB; Raw payload uses TEXT** 
-The Raw layer's responsibility is to preserve every inbound request exactly as received, making no assumptions about structure — TEXT is the semantically correct choice since the database neither parses nor validates the content. The ODS items field, by contrast, has already passed Pydantic validation and cleaning, so its structure is guaranteed; JSONB adds a second layer of format enforcement at the database level and preserves the option to query into items fields directly in SQL if needed.
+### Data Architecture Decisions
 
 **No business deduplication at the Raw layer**
 `Raw.order_id` intentionally has no UNIQUE constraint. The Raw table's responsibility is to record every inbound request as-is — including duplicate submissions — because different submissions may carry complementary fields, and abnormal submission frequency is itself a signal (attack detection, client-side bugs). Deduplication responsibility is delegated to the ODS layer.
 
-**Per-IP rate limiting only — no global cap**
-A global limit must be derived from "expected concurrent active IPs × per-IP limit", which is impossible to determine without real traffic data — an arbitrary number would only introduce a limit with unclear semantics. More fundamentally, a `/minute` window rate limit cannot prevent instantaneous bursts: 500 requests arriving simultaneously all fall within a 600/minute cap, yet the pool would still be exhausted. Pool exhaustion is already handled by `SATimeoutError → 503`. Rate limiting's responsibility is narrowed to defending against sustained abuse from a single IP; global protection is delegated to the existing 503 mechanism.
+**ODS items column uses JSONB; Raw payload uses TEXT**
+The Raw layer's responsibility is to preserve every inbound request exactly as received, making no assumptions about structure — TEXT is the semantically correct choice since the database neither parses nor validates the content. The ODS items field, by contrast, has already passed Pydantic validation and cleaning, so its structure is guaranteed; JSONB adds a second layer of format enforcement at the database level and preserves the option to query into items fields directly in SQL if needed.
+
+**Two-stage cleaning pipeline (`format_clean` + `business_clean`)**
+`format_clean()` handles format issues (lowercase normalisation, whitespace stripping). `business_clean()` validates business rules (quantity > 0, rating 1–5, delivery_date ≥ order_date, etc.). The two stages have distinct responsibilities — format standardisation versus business semantic validation — and are kept separate accordingly.
+
+**`has_clean_error` is non-blocking**
+Business-rule validation results are recorded in the `has_clean_error` flag rather than used to reject ODS writes. Blocking responsibility is delegated to `dbt int_*`, keeping ODS as a complete record of all data as it was received. Each downstream layer can then decide how to handle flagged records based on its own requirements.
 
 **ODS-layer first-write-wins idempotency**
 Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
 
 **`force=True` semantic boundary: single-record retry, not backfill**
-`POST /process_raw/{raw_id}?force=true` is only permitted on `error` or `duplicate` records — its semantics are "retry this failed record". Calling it on a `processed` record returns 400. The reason: if downstream systems (Star Schema, aggregation tables) have already consumed that ODS record, deleting and rewriting it in isolation cannot cascade corrections downstream and would introduce inconsistencies instead. When a change to cleaning logic requires re-deriving historical data, the correct tool is a backfill batch job — starting from the immutable Raw layer, re-generating ODS in full, then re-running each downstream layer in sequence. That is a Phase 4 concern to be addressed when Airflow is introduced, and is outside the responsibility of `force=True`.
+`POST /process_raw/{raw_id}?force=true` is only permitted on `error` or `duplicate` records — its semantics are "retry this failed record". Calling it on a `processed` record returns 400, because if downstream systems (Star Schema, aggregation tables) have already consumed that ODS record, deleting and rewriting it in isolation cannot cascade corrections downstream and would introduce inconsistencies instead. Quarantine records (`has_clean_error = TRUE`, `status = "processed"`) have a rule evaluation problem, not a pipeline failure — the correct remediation path is Airflow re-evaluation (Proposal B), not re-running the pipeline.
+
+### Ingestion Layer Reliability Decisions
+
+**Atomic claim logic (`try_claim_raw`)**
+Uses `UPDATE ... WHERE status = 'pending'` and checks `rowcount == 1` to prevent duplicate processing under concurrent workers without pessimistic locking.
+
+**Per-IP rate limiting only — no global cap**
+A global limit must be derived from "expected concurrent active IPs × per-IP limit" — without real traffic data this number is arbitrary and carries unclear semantics. More fundamentally, a `/minute` window cannot prevent instantaneous bursts, and pool exhaustion is already handled by `SATimeoutError → 503`. Rate limiting's responsibility is narrowed to defending against sustained single-IP abuse.
+
+**Pool exhaustion → fast fail (503)**
+`POST /orders` separately catches `SATimeoutError` (pool failed to acquire a connection) and returns 503 Service Unavailable without entering the retry loop. Pool exhaustion is a resource contention issue, not a DB fault — retrying only makes it worse. Failing fast lets the client back off and retry.
+
+---
+
+## Ingestion Layer Reliability
+
+Ingestion-layer reliability is provided by three mechanisms working together: multi-point retry for transient failures, scan recovery for records stuck after a crash, and timeout settings to prevent system resources from being exhausted indefinitely.
+
+### Multi-point Retry (exponential backoff, up to 3 attempts)
+
+**Point 1 — Raw write (`main.py`)**
+Catches `OperationalError` on `db.commit()`. Uses `asyncio.sleep` to avoid blocking the event loop.
+
+**Point 2 — Processing (`process.py`)**
+Retries the full pipeline (JSON parse → flatten → clean → ODS write) on generic `Exception`. `JSONDecodeError` and `ValueError` are not retried — these are data errors that will always fail regardless of retry count.
+
+**Point 3 — Claim (`process.py`)**
+Retries `try_claim_raw` on `OperationalError`. Distinguishes between a DB exception (retry) and `rowcount=0` (another worker claimed the record — expected behaviour, no retry).
+
+**Point 4 — Status update (`process.py`)**
+All Raw status updates go through `_commit_raw_status()`, which retries on any exception. The success-path commit (ODS + status together) re-adds the ODS object after rollback before retrying. Exhausting all retries logs `CRITICAL`.
+
+### Crash Recovery Scan
+
+**Startup scan** (`lifespan`): Runs once on server start. Queries all `pending` records and re-queues them via `asyncio.to_thread`.
+
+**Periodic scan** (every 5 minutes): Two-step logic:
+1. Reset stale `processing` records (stuck > 10 minutes) to `pending` — logs `WARNING` (duplicate ODS write risk is covered by idempotency protection)
+2. Collect and re-queue all `pending` records
+
+### Timeout and Rate Limiting
+
+**DB statement timeout (`database.py`)**
+Set via `connect_args={"options": "-c statement_timeout=30000"}` on each connection. Ensures any SQL that hangs beyond 30 seconds (e.g. a lock wait) raises `OperationalError`, allowing the retry mechanism to take over instead of leaving threads hanging indefinitely.
+
+**Explicit connection pool settings (`database.py`)**
+`pool_size=5, max_overflow=10, pool_timeout=30` — same as SQLAlchemy defaults, but now explicit for clarity and future tuning.
+
+**`POST /process_raw/{raw_id}` converted to background task (`main.py`)**
+Changed from calling `process_raw_event(raw_id)` directly to `background_tasks.add_task`, consistent with `/orders` and no longer blocking the event loop.
+
+**Per-IP rate limiting (`slowapi`)**
+
+| Endpoint | Per-IP limit | Reason |
+|---|---|---|
+| `POST /orders` | 60/minute | Guards against abnormal submission frequency from a single client; well above any legitimate order rate |
+| `POST /process_raw/{raw_id}` | 20/minute | Manual replay — inherently low frequency |
+| `GET /raw/{raw_id}` | 120/minute | Read-only, more lenient |
+
+Requests exceeding the limit receive `429 Too Many Requests`.
+
+**⚠️ Deployment note**
+Running directly under uvicorn, `request.client.host` is the real client IP and limiting behaves correctly. If deployed behind Nginx or a load balancer, `request.client.host` becomes the proxy IP — all requests share one counter and per-IP limiting breaks down. In that case, the key function must be updated to read the `X-Forwarded-For` header with appropriate trusted-proxy configuration.
+
+### What retry handles vs. what it does not
+
+| Scenario | Handled |
+|---|---|
+| Transient DB connection drop at any stage | ✅ |
+| `pending` / `processing` records after a crash | ✅ (scan recovery) |
+| Connection pool exhaustion (`TimeoutError`) | ✅ `SATimeoutError` caught, returns 503, client retries |
+| SIGKILL mid-execution | ❌ Process is dead before any retry logic runs |
+| Duplicate `order_id` submitted twice | ✅ Resolved by ODS idempotency |
+| ODS duplicate when scan retries a `processing` record | ✅ Resolved by ODS idempotency |
 
 ---
 
@@ -93,7 +208,7 @@ Mitigation options: increase pool size, switch to async SQLAlchemy (asyncpg), or
 
 **Test 3 — 100 duplicate order_ids, concurrency=100**
 Result: 100 Raw records written, 100 ODS records written — all succeeded.
-`order_id` on the Raw table has an index but no UNIQUE constraint. Each duplicate is treated as a new ingestion event with its own `raw_id`. CAS lock protects against the same `raw_id` being processed twice, not against business-level deduplication — a known and intentional boundary (business-level deduplication is now handled by ODS idempotency).
+`order_id` on the Raw table has an index but no UNIQUE constraint. Each duplicate is treated as a new ingestion event with its own `raw_id`. CAS lock protects against the same `raw_id` being processed twice, not against business-level deduplication — a known and intentional boundary (business-level deduplication is handled by ODS idempotency).
 
 **Test 4 — 100 workers competing for the same raw_id (CAS lock)**
 Result: `raw.status = processed`, ODS COUNT = 1.
@@ -110,7 +225,7 @@ Two stuck-state scenarios:
 | `pending` | Crash before background task runs, or `try_claim_raw` DB exception (transaction rollback) |
 | `processing` | Crash after claim commit, before final status update |
 
-Mitigation options: ~~startup recovery scan (`SELECT * FROM raw WHERE status IN ('pending','processing')`)~~, replace BackgroundTasks with Redis/Celery/Kafka, ~~periodic sweep to reset stale `processing` records~~ (Recovery mechanism implemented).
+Mitigation options: replace BackgroundTasks with Redis/Celery/Kafka (recovery scan is now in place, but a persistent queue remains the proper fix).
 
 **Test 6 — Duplicate order_id submissions (ODS idempotency)**
 
@@ -121,80 +236,13 @@ Result: ODS always contains exactly one record per `order_id`; all subsequent du
 
 ---
 
-## Retry & Recovery
+## Known Issues
 
-### Retry Mechanism
+**Scan may re-schedule tasks that are already queued**
+The periodic scan and startup scan collect all Raw records with `status='pending'` and re-schedule them, but the database has no visibility into whether a given record is already sitting in the BackgroundTasks queue waiting to be picked up. Under high traffic, if a burst of requests lands before the queue drains, the scan can re-schedule records that are already queued — resulting in multiple workers racing to process the same raw_id. The CAS claim (`try_claim_raw`) acts as the safety net at execution time: the losing worker receives `rowcount=0` and returns immediately, so ODS is never written twice and correctness is preserved. The cost is wasted thread-pool slots and extra DB round-trips, which adds pressure to the connection pool under load.
 
-Four-layer retry strategy to handle transient failures. All retries use exponential backoff (0.5s → 1s → give up) capped at 3 attempts.
-
-**Point 1 — Raw write (`main.py`)**
-Catches `OperationalError` on `db.commit()`. Uses `asyncio.sleep` to avoid blocking the event loop.
-
-**Point 2 — Processing (`process.py`)**
-Retries the full pipeline (JSON parse → flatten → clean → ODS write) on generic `Exception`. `JSONDecodeError` and `ValueError` are not retried — these are data errors that will always fail regardless of retry count.
-
-**Point 3 — Claim (`process.py`)**
-Retries `try_claim_raw` on `OperationalError`. Distinguishes between a DB exception (retry) and `rowcount=0` (another worker claimed the record — expected behaviour, no retry).
-
-**Point 4 — Status update (`process.py`)**
-All Raw status updates go through `_commit_raw_status()`, which retries on any exception. The success-path commit (ODS + status together) re-adds the ODS object after rollback before retrying. Exhausting all retries logs `CRITICAL`.
-
-### Crash Recovery Scan
-
-**Startup scan** (`lifespan`): Runs once on server start. Queries all `pending` records and re-queues them via `asyncio.to_thread`.
-
-**Periodic scan** (every 5 minutes): Two-step logic:
-1. Reset stale `processing` records (stuck > 10 minutes) to `pending` — logs `WARNING` (duplicate ODS write risk is now covered by idempotency protection)
-2. Collect and re-queue all `pending` records
-
-### What retry handles vs. what it does not
-
-| Scenario | Handled |
-|---|---|
-| Transient DB connection drop at any stage | ✅ |
-| `pending` / `processing` records after a crash | ✅ (scan recovery) |
-| Connection pool exhaustion (`TimeoutError`) | ~~❌ Different exception type — not caught by Point 1~~ → ✅ `SATimeoutError` is now caught and returns 503, letting the client retry |
-| SIGKILL mid-execution | ❌ Process is dead before any retry logic runs |
-| ~~Duplicate `order_id` submitted twice~~ | ~~❌ No `UNIQUE` constraint on `order_id`~~ → ✅ Resolved by ODS idempotency |
-| ~~ODS duplicate when scan retries a `processing` record~~ | ~~❌ No idempotency guard~~ → ✅ Resolved by ODS idempotency |
-
----
-
-## Timeout Settings
-
-**DB statement timeout (`database.py`)**
-Set via `connect_args={"options": "-c statement_timeout=30000"}` on each connection. Ensures any SQL that hangs beyond 30 seconds (e.g. a lock wait) raises `OperationalError`, allowing the retry mechanism to take over instead of leaving threads hanging indefinitely.
-
-**Explicit connection pool settings (`database.py`)**
-`pool_size=5, max_overflow=10, pool_timeout=30` — same as SQLAlchemy defaults, but now explicit for clarity and future tuning.
-
-**Pool exhaustion → 503 (`main.py`)**
-`POST /orders` separately catches `SATimeoutError` (pool failed to acquire a connection) and returns 503 Service Unavailable without entering the retry loop. Pool exhaustion is a resource contention issue, not a DB fault — retrying only makes it worse. Failing fast lets the client back off and retry.
-
-**`POST /process_raw/{raw_id}` converted to background task (`main.py`)**
-Changed from calling `process_raw_event(raw_id)` directly to `background_tasks.add_task`, consistent with `/orders` and no longer blocking the event loop.
-
----
-
-## Rate Limiting
-
-Per-IP rate limiting via `slowapi`. The count key is `request.client.host` (direct TCP connection IP).
-
-| Endpoint | Per-IP limit | Reason |
-|---|---|---|
-| `POST /orders` | 60/minute | Guards against abnormal submission frequency from a single client; well above any legitimate order rate |
-| `POST /process_raw/{raw_id}` | 20/minute | Manual replay — inherently low frequency |
-| `GET /raw/{raw_id}` | 120/minute | Read-only, more lenient |
-
-Requests exceeding the limit receive `429 Too Many Requests`.
-
-**Why no global cap**
-
-A global limit must be derived from "expected concurrent active IPs × per-IP limit" — without real traffic data this number is arbitrary and carries unclear semantics. More fundamentally, a `/minute` window cannot prevent instantaneous bursts: 500 simultaneous requests all fall within a 600/minute cap, yet the pool exhausts regardless. Pool exhaustion is already handled by `SATimeoutError → 503`; rate limiting's responsibility is limited to sustained single-IP abuse.
-
-**⚠️ Deployment note**
-
-Running directly under uvicorn, `request.client.host` is the real client IP and limiting behaves correctly. If deployed behind Nginx or a load balancer, `request.client.host` becomes the proxy IP — all requests share one counter and per-IP limiting breaks down. In that case, the key function must be updated to read the `X-Forwarded-For` header with appropriate trusted-proxy configuration.
+**Design direction when switching to a Queue**
+The proper fix is to make "already enqueued" visible in the database by introducing a `queued` status into the state machine (`pending → queued → processing → processed/error/duplicate`) and coupling the enqueue action to an atomic status transition: after writing the Raw record, immediately CAS `pending → queued`; only push to the Queue if `rowcount == 1`. The scan then only collects `pending` records (meaning records that never successfully entered the queue) and skips anything already `queued`. The worker's CAS claim shifts accordingly to `queued → processing`. The one edge case this introduces is a failed Queue push after the DB write succeeds, leaving a record stuck in `queued` — the scan must also sweep for stale `queued` records (older than N minutes) and reset them to `pending` so they re-enter the enqueue flow.
 
 ---
 
@@ -213,7 +261,7 @@ Running directly under uvicorn, `request.client.host` is the real client IP and 
 ```
 OrderIN (nested Pydantic)
     └── from_nested() → ODSOrder (flat Pydantic)
-            └── clean_order() → ODS (SQLAlchemy model)
+            └── clean_order() → ODS (SQLAlchemy model) + quality_events
 ```
 
 Pydantic handles input validation and schema flattening. SQLAlchemy handles persistence. The two layers are intentionally decoupled.
@@ -306,7 +354,7 @@ try_claim_raw atomically claims the record (pending → processing)
   ↓
 Clean / Validate / Idempotency check
   ↓
-Write to ODS (PostgreSQL, clean flat table)
+Write to ODS (PostgreSQL, clean flat table) + quality_events
   ↓
 Update status (processing → processed / error)
 
@@ -341,7 +389,6 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Retry mechanism — 4-point retry (Raw write, Claim, Processing, Status update), exponential backoff, `CRITICAL` log when all retries exhausted
 - [v] Crash recovery scan — startup scan on restart + periodic scan every 5 minutes; stale `processing` (> 10 min) reset to `pending`; `WARNING` logged for potential duplicate ODS writes
 - [v] Timeout — DB statement timeout (30s) prevents lock-wait hangs; explicit pool settings; `POST /orders` catches pool exhaustion and returns 503; `/process_raw` converted to background task to avoid blocking the event loop
-- ~~[ ] Idempotency — `UNIQUE` constraint on `Raw.order_id` + `IntegrityError` handling in `create_order`; `raw_id` column in ODS to prevent duplicate writes from scan retry~~
 - [v] Idempotency — `raw_id` column in ODS + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`; first-write-wins: pre-check before commit + `IntegrityError` backstop for TOCTOU races; duplicate Raw records written to `duplicate` terminal status
 - [v] Rate limiting — per-IP limits via slowapi: `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
@@ -366,13 +413,3 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
   - **Metrics**: quantify business signals via the OTel Metrics API — order ingestion throughput, ODS processed / error / duplicate rates, processing latency distribution (P50/P95/P99), DB pool pressure, retry attempt counts
   - **Traces**: once Celery and Airflow are in place, add distributed tracing across the full chain (API → Worker → Airflow → BigQuery) to identify cross-service latency and bottlenecks
   - Exporter targets: Grafana Cloud (Loki + Prometheus + Tempo) or GCP Cloud Trace / Cloud Monitoring
-
----
-
-## Known Issues
-
-**Scan may re-schedule tasks that are already queued**
-The periodic scan and startup scan collect all Raw records with `status='pending'` and re-schedule them, but the database has no visibility into whether a given record is already sitting in the BackgroundTasks queue waiting to be picked up. Under high traffic, if a burst of requests lands before the queue drains, the scan can re-schedule records that are already queued — resulting in multiple workers racing to process the same raw_id. The CAS claim (`try_claim_raw`) acts as the safety net at execution time: the losing worker receives `rowcount=0` and returns immediately, so ODS is never written twice and correctness is preserved. The cost is wasted thread-pool slots and extra DB round-trips, which adds pressure to the connection pool under load.
-
-**Design direction when switching to a Queue**
-The proper fix is to make "already enqueued" visible in the database by introducing a `queued` status into the state machine (`pending → queued → processing → processed/error/duplicate`) and coupling the enqueue action to an atomic status transition: after writing the Raw record, immediately CAS `pending → queued`; only push to the Queue if `rowcount == 1`. The scan then only collects `pending` records (meaning records that never successfully entered the queue) and skips anything already `queued`. The worker's CAS claim shifts accordingly to `queued → processing`. The one edge case this introduces is a failed Queue push after the DB write succeeds, leaving a record stuck in `queued` — the scan must also sweep for stale `queued` records (older than N minutes) and reset them to `pending` so they re-enter the enqueue flow.

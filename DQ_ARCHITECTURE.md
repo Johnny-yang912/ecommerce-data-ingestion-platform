@@ -93,6 +93,31 @@ FROM {{ ref('stg_orders') }}
 WHERE has_clean_error = TRUE
 ```
 
+### Mechanism 3: Scenario-Specific Analysis Models (int_* layer)
+
+Specific analytical scenarios can build dedicated models at the `int_*` layer. These models use `clean_error_message` JSONB conditions to accept records that are globally quarantined but whose errors are irrelevant to the scenario, and apply field-level imputation where needed:
+
+```sql
+-- int_orders_shipping_analysis.sql
+SELECT
+    *,
+    CASE
+        WHEN clean_error_message @> '["customer_rating should be between 1 and 5"]'
+        THEN NULL
+        ELSE customer_rating
+    END AS customer_rating_cleaned
+FROM {{ ref('stg_orders') }}
+WHERE
+    has_clean_error = FALSE
+    OR (
+        -- only error is rating, which is irrelevant to shipping analysis
+        ARRAY_LENGTH(clean_error_message) = 1
+        AND clean_error_message @> '["customer_rating should be between 1 and 5"]'
+    )
+```
+
+**Audit trail**: Repair logic co-exists with transformation logic in the SQL file. The dbt model description records which errors the scenario accepts and why. The SQL itself is the audit trail, versioned in git.
+
 ---
 
 ## Handling Quarantined Records (Q2)
@@ -168,13 +193,19 @@ quality_events
 - `process.py` after a successful ODS write → inserts one `initial_evaluation` event
 - Airflow re-evaluation promotes or rejects a record → inserts one `promotion` or `rejection` event
 
+**Semantic boundary:**
+This table is strictly a global state machine, recording only ingestion-layer events and cross-layer (PG → BQ) Proposal B evaluation events. Imputation decisions made inside scenario-specific BQ models are **not written back** to this table — scenario repair is an analytics-layer business logic decision, not a progression of data quality state.
+
 ---
 
 ## Data Consistency (Q2 Extension)
 
 ### Divergence between ODS and BQ
 
-Divergence **will exist** — but with rule versioning and `quality_events` it becomes documented and traceable:
+Divergence **will exist** — it has two distinct sources, each handled differently:
+
+**Case 1: Divergence from rule version evolution**
+Traceable via `dq_rule_version` + `quality_events`:
 
 ```
 Without versioning:
@@ -185,6 +216,11 @@ With versioning and quality_events:
   quality_events: promoted under "v2" at 2026-03-01      ← truth after evolution
   → divergence is explained and auditable
 ```
+
+**Case 2: Divergence from scenario-specific models**
+Globally quarantined records may appear in specific scenarios' `dim_*/fct_*` tables when a scenario model accepts errors irrelevant to that scenario. This divergence is explained by reading the scenario model's SQL and dbt description — no separate tracking table is maintained.
+
+This is an intentional design boundary: the explainability requirement for scenario repair is static (read the code), not a runtime auditing need. SQL documentation is sufficient.
 
 ### Bounded Writeback Principle
 
@@ -288,6 +324,7 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | dbt `stg_*` Hard Gate tests | BQ Analytics | ⬜ Phase 4 |
 | `int_orders` Row Filter (`WHERE has_clean_error = FALSE`) | BQ Analytics | ⬜ Phase 4 |
 | `int_orders_quarantine` dbt model | BQ Analytics | ⬜ Phase 4 |
+| Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Phase 4 |
 | Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 4 |
 | `rpt_quality_*` dbt models | BQ Analytics | ⬜ Phase 4 |
 
@@ -312,3 +349,9 @@ Actual thresholds should be calibrated once real traffic data is available. Init
 **`quality_events` does not yet cover BQ-layer promotion events**  
 Proposal B (Airflow re-evaluation) is not yet implemented. Currently `quality_events` only records `initial_evaluation` events written at ingestion time.  
 When Airflow is introduced in Phase 4, the write logic for `promotion` and `permanently_rejected` events must be added alongside it.
+
+**Scenario repair audit trail is SQL documentation**  
+Repair logic in scenario-specific `int_*` models is documented in the dbt model SQL and model description — no separate tracking table is maintained. This assumes no runtime cross-system auditing requirement exists; if that need arises, a BQ-layer lifecycle table can be introduced at that point.
+
+**`stg_*` boolean flags deferred**  
+Scenario models currently query `clean_error_message` JSONB strings directly. When error conditions need to be maintained across multiple scenario models, or when `clean_error_message` wording changes raise the maintenance cost noticeably, parse the JSONB into structured boolean columns (e.g. `has_rating_error`) in `stg_orders` to centralise the format coupling in one place.

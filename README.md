@@ -45,9 +45,11 @@ POST /orders
     ↓
 dbt stg_*   Hard Gate tests                 ← Silver entry, all records retained
     ↓
-dbt int_*   Row Filter                      ← Gold entry, blocking happens here
+dbt int_*   Row Filter + scenario models    ← Gold entry, blocking happens here
     ├── has_clean_error = FALSE → int_orders → dim_*/fct_*
-    └── has_clean_error = TRUE  → int_orders_quarantine
+    ├── has_clean_error = TRUE  → int_orders_quarantine
+    └── scenario-specific int_orders_* → scenario dim_*/fct_*
+                                           (accepts errors irrelevant to the scenario, with imputation)
     ↓
 Looker Studio (connected to BigQuery dim_*/fct_*/rpt_*)
 ```
@@ -79,6 +81,7 @@ dbt int_*                                      ← Gold entry
   Responsibility : Cross-table joins, derived fields, business logic
   Quality requirement : Only clean records pass (has_clean_error = FALSE)
   Destination for dirty records : int_orders_quarantine
+  Scenario repair : Scenario-specific models may accept errors irrelevant to their use case, apply imputation, and pass records through for that scenario; repair logic is documented in the model SQL
 
 dbt dim_*/fct_*                                ← Gold
   Quality requirement : Cleanest layer — no records with has_clean_error = TRUE
@@ -106,7 +109,9 @@ The Raw layer's responsibility is to preserve every inbound request exactly as r
 `format_clean()` handles format issues (lowercase normalisation, whitespace stripping). `business_clean()` validates business rules (quantity > 0, rating 1–5, delivery_date ≥ order_date, etc.). The two stages have distinct responsibilities — format standardisation versus business semantic validation — and are kept separate accordingly.
 
 **`has_clean_error` is non-blocking**
-Business-rule validation results are recorded in the `has_clean_error` flag rather than used to reject ODS writes. Blocking is delegated to `dbt int_*` for two concrete reasons: first, quarantine records are already format-cleaned and queryable by business fields (`format_clean` runs before business validation), so `int_orders_quarantine` supports direct field-level RCA without parsing raw payloads; second, Proposal B re-evaluation requires dirty records to exist in ODS — blocking at ingestion would make rule evolution apply only to new data, with no path to promote historical records.
+Business-rule validation results are recorded in the `has_clean_error` flag rather than used to reject ODS writes. Blocking is delegated to `dbt int_*` for two concrete reasons: 
+first, quarantine records are already format-cleaned and queryable by business fields (`format_clean` runs before business validation), so `int_orders_quarantine` supports direct field-level RCA without parsing raw payloads; 
+second, Proposal B re-evaluation requires dirty records to exist in ODS — blocking at ingestion would make rule evolution apply only to new data, with no path to promote historical records.
 
 **ODS-layer first-write-wins idempotency**
 Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
@@ -301,7 +306,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 
 | Document | Description |
 |---|---|
-| [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
+| [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), scenario repair strategy, quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
 
 ---
 
@@ -404,7 +409,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 
 **Phase 4 — Analytics Pipeline**
 - [ ] ODS → BigQuery extraction script (Python script, incremental by `received_at` watermark)
-- [ ] dbt Core: stg_* → int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Hard Gate tests, Row Filter, `int_orders_quarantine`, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
+- [ ] dbt Core: stg_* → int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Hard Gate tests, Row Filter, `int_orders_quarantine`, scenario-specific `int_orders_*` models, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — Automation + Queue Upgrade**

@@ -93,6 +93,31 @@ FROM {{ ref('stg_orders') }}
 WHERE has_clean_error = TRUE
 ```
 
+### 機制三：場景專用分析模型（int_* 層）
+
+特定分析場景可在 `int_*` 層建立場景專用模型，透過查詢 `clean_error_message` JSONB，接受全局 quarantine 中與該場景無關的錯誤，並在模型內對問題欄位補值：
+
+```sql
+-- int_orders_shipping_analysis.sql
+SELECT
+    *,
+    CASE
+        WHEN clean_error_message @> '["customer_rating 應在 1~5 之間"]'
+        THEN NULL
+        ELSE customer_rating
+    END AS customer_rating_cleaned
+FROM {{ ref('stg_orders') }}
+WHERE
+    has_clean_error = FALSE
+    OR (
+        -- 唯一問題是 rating，對出貨分析無關
+        ARRAY_LENGTH(clean_error_message) = 1
+        AND clean_error_message @> '["customer_rating 應在 1~5 之間"]'
+    )
+```
+
+**審計軌跡**：補值邏輯與轉換邏輯共存於 SQL 檔案，dbt model description 記錄該場景接受哪些錯誤及原因。SQL 本身即審計軌跡，進 version control。
+
 ---
 
 ## 被攔截資料的處理（Q2）
@@ -168,13 +193,19 @@ quality_events
 - `process.py` 成功寫 ODS 後 → 寫一筆 `initial_evaluation` 事件
 - Airflow 重評估促進記錄後 → 寫一筆 `promotion` 或 `rejection` 事件
 
+**語意邊界：**
+此表嚴格限定為全局狀態機，只記錄攝入層事件與跨層（PG → BQ）的 Proposal B 評估事件。BQ 內場景專用模型的補值決策**不寫回**此表——場景補值屬於分析層內部的業務邏輯，不是資料品質狀態的演進。
+
 ---
 
 ## 資料一致性處理
 
 ### ODS 與 BQ 的品質狀態分歧
 
-分歧**會存在**，但透過版本號與 `quality_events` 讓它有文件可查：
+分歧**會存在**，來源有兩種，處理方式不同：
+
+**情境一：規則版本演進造成的分歧**
+透過 `dq_rule_version` + `quality_events` 可追溯：
 
 ```
 無版本號時：
@@ -185,6 +216,11 @@ quality_events
   quality_events: promoted under "v2" at 2026-03-01 ← 後續演進的真實
   → 分歧有解釋，可追溯
 ```
+
+**情境二：場景專用模型造成的分歧**
+全局 quarantined 的記錄可能出現在特定場景的 `dim_*/fct_*` 中（因場景模型接受了與該場景無關的錯誤）。此分歧透過閱讀對應場景模型的 SQL 與 dbt description 說明，不建立獨立追蹤表。
+
+此為有意識的設計邊界：場景補值的可解釋性需求屬靜態審計（讀 code），非運行時稽核需求，SQL 文件就夠。
 
 ### Bounded Writeback 原則
 
@@ -288,6 +324,7 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | dbt `stg_*` Hard Gate tests | BQ Analytics | ⬜ Phase 4 |
 | `int_orders` Row Filter（`WHERE has_clean_error = FALSE`） | BQ Analytics | ⬜ Phase 4 |
 | `int_orders_quarantine` dbt model | BQ Analytics | ⬜ Phase 4 |
+| 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ Phase 4 |
 | Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 4 |
 | `rpt_quality_*` dbt 模型 | BQ Analytics | ⬜ Phase 4 |
 
@@ -312,3 +349,9 @@ BQ `dim_*/fct_*` 反映目前最新評估下的乾淨狀態。
 **`quality_events` 目前不覆蓋 BQ 層的促進事件**  
 Proposal B（Airflow 重評估）尚未實作。目前 `quality_events` 只有攝入時的 `initial_evaluation` 事件。  
 Phase 4 Airflow 建立後，促進（`promotion`）與永久拒絕（`rejection`）的事件寫入邏輯需一併補上。
+
+**場景補值審計軌跡為 SQL 文件**  
+場景專用 `int_*` 模型的補值邏輯記錄在 dbt 模型 SQL 與 model description，不建立獨立追蹤表。前提是無跨系統運行時稽核的實務需求；若未來出現此需求，再評估是否引入 BQ 層生命週期表。
+
+**`stg_*` boolean 欄位延後**  
+目前場景模型直接查詢 `clean_error_message` JSONB 字串。當錯誤條件需跨多個場景模型維護、或 `clean_error_message` 措辭異動的維護成本明顯上升時，再於 `stg_orders` 拆解為結構化 boolean 欄位（如 `has_rating_error`），將格式耦合集中到單一地方。

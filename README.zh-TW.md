@@ -45,9 +45,11 @@ POST /orders
     ↓
 dbt stg_*   Hard Gate tests                 ← Silver 入口，仍含全部資料
     ↓
-dbt int_*   Row Filter                      ← Gold 入口，攔截在這裡
+dbt int_*   Row Filter + 場景專用模型        ← Gold 入口，攔截在這裡
     ├── has_clean_error = FALSE → int_orders → dim_*/fct_*
-    └── has_clean_error = TRUE  → int_orders_quarantine
+    ├── has_clean_error = TRUE  → int_orders_quarantine
+    └── 場景專用 int_orders_*  → 特定場景 dim_*/fct_*
+                                  （接受場景無關的欄位錯誤，補值後流入）
     ↓
 Looker Studio（接 BigQuery dim_*/fct_*/rpt_*）
 ```
@@ -79,6 +81,7 @@ dbt int_*                                      ← Gold 入口
   職責：跨表 join、衍生欄位、業務邏輯
   品質要求：只讓乾淨資料通過（has_clean_error = FALSE）
   髒資料去向：int_orders_quarantine
+  場景補值：場景專用模型可接受與該場景無關的欄位錯誤，補值後供特定分析使用，補值邏輯記錄在 SQL 文件
 
 dbt dim_*/fct_*                                ← Gold
   品質要求：最乾淨，不含任何 has_clean_error = TRUE 的記錄
@@ -106,7 +109,9 @@ Raw 的職責是保留所有進來的原始資料，不對其結構做任何假�
 `format_clean()` 處理格式問題（統一小寫、去空白）。`business_clean()` 驗證業務規則（數量不能為負、評分要在 1–5 之間、出貨日不能早於訂單日等）。兩者職責分離，分別對應「格式標準化」與「業務語意驗證」兩個不同層次的問題。
 
 **`has_clean_error` 非阻斷**
-業務規則驗證結果只標記在 `has_clean_error` 欄位，不拒絕寫入 ODS。攔截責任下放到 `dbt int_*`，理由來自兩個具體機制：一、Quarantine 是可分析的業務層——進入 ODS 的髒資料已完成格式標準化（`format_clean` 先於業務驗證執行），`int_orders_quarantine` 能直接以業務欄位切片做 RCA，無需回溯解析 Raw payload；二、支援規則演進後的 Proposal B 重評估——當規則升版，ODS 中的 quarantine 記錄才有對象可以重評估並 promote，若在攝入時就攔截，規則演進只能對新資料有效。
+業務規則驗證結果只標記在 `has_clean_error` 欄位，不拒絕寫入 ODS。攔截責任下放到 `dbt int_*`，理由來自兩個具體機制：
+一、Quarantine 是可分析的業務層——進入 ODS 的髒資料已完成格式標準化（`format_clean` 先於業務驗證執行），`int_orders_quarantine` 能直接以業務欄位切片做 RCA，無需回溯解析 Raw payload；
+二、支援規則演進後的 Proposal B 重評估——當規則升版，ODS 中的 quarantine 記錄才有對象可以重評估並 promote，若在攝入時就攔截，規則演進只能對新資料有效。
 
 **ODS 層 first-write-wins idempotency**
 同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
@@ -301,7 +306,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 
 | 文件 | 說明 |
 |---|---|
-| [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
+| [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、場景補值策略、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
 
 ---
 
@@ -404,7 +409,7 @@ Looker Studio（直連 BigQuery）
 
 **Phase 4 — 分析層 Pipeline**
 - [ ] ODS → BigQuery 抽取腳本（Python script，以 `received_at` 為 watermark 做增量抽取）
-- [ ] dbt Core：stg_* → int_* → dim_*/fct_* → rpt_*；含 DQ BQ 層（Hard Gate tests、Row Filter、`int_orders_quarantine`、`rpt_quality_*`）（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
+- [ ] dbt Core：stg_* → int_* → dim_*/fct_* → rpt_*；含 DQ BQ 層（Hard Gate tests、Row Filter、`int_orders_quarantine`、場景專用 `int_orders_*` 模型、`rpt_quality_*`）（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — 自動化 + Queue 升級**

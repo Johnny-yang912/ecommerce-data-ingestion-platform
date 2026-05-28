@@ -82,11 +82,11 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
     return ods, errors
 
 
-def clean_order(ods: ODSOrder) -> tuple[ODSOrder, bool, Optional[str]]:
+def clean_order(ods: ODSOrder) -> tuple[ODSOrder, bool, Optional[list]]:
     ods = format_clean(ods)
     ods, business_errors = business_clean(ods)
 
     has_clean_error = len(business_errors) > 0
-    clean_error_message = "; ".join(business_errors) if business_errors else None
+    clean_error_message = business_errors if business_errors else None
 
     return ods, has_clean_error, clean_error_message

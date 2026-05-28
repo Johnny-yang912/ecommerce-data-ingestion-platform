@@ -161,7 +161,7 @@ quality_events
 ├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected"
 ├── rule_version: String     "v1" | "v2" | ...
 ├── event_at:     DateTime
-└── reason:       Text?
+└── reason:       JSONB?     list[str], same format as ODS.clean_error_message
 ```
 
 **When records are written:**
@@ -230,7 +230,7 @@ rpt_quality_daily
 rpt_quality_field_breakdown
 ├── which fields most frequently trigger has_clean_error
 ├── per-field error rate trend over time
-└── source: parse clean_error_message (or a future JSONB quality_profile column)
+└── source: clean_error_message (JSONB array) — UNNEST directly to extract field names, no text parsing required
 
 rpt_quality_version_comparison
 ├── how many quarantined under v1 → promoted under v2 → still in quarantine

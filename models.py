@@ -69,7 +69,7 @@ class ODS(Base):
 
     # 清洗錯誤標籤
     has_clean_error = Column(Boolean, nullable=False, default=False)
-    clean_error_message = Column(Text, nullable=True)
+    clean_error_message = Column(JSONB, nullable=True)
 
     # 品質評估版本（攝入時使用的規則版本，之後永遠不動）
     dq_rule_version = Column(String(10), nullable=True)
@@ -92,4 +92,4 @@ class QualityEvent(Base):
 
     rule_version = Column(String(10), nullable=False)
     event_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    reason = Column(Text, nullable=True)
+    reason = Column(JSONB, nullable=True)

@@ -243,8 +243,8 @@ class TestCleanOrder:
         ods = make_ods(customer_rating=99.0)
         _, has_error, msg = clean_order(ods)
         assert has_error is True
-        assert msg is not None
-        assert "customer_rating" in msg
+        assert isinstance(msg, list) and len(msg) > 0
+        assert any("customer_rating" in e for e in msg)
 
     def test_format_and_business_both_applied(self):
         """

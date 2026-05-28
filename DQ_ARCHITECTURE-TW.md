@@ -161,7 +161,7 @@ quality_events
 ├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected"
 ├── rule_version: String     "v1" | "v2" | ...
 ├── event_at:     DateTime
-└── reason:       Text?
+└── reason:       JSONB?     list[str]，與 ODS.clean_error_message 相同格式
 ```
 
 **寫入時機：**
@@ -230,7 +230,7 @@ rpt_quality_daily
 rpt_quality_field_breakdown
 ├── 哪些欄位最常觸發 has_clean_error
 ├── 每個欄位的 error rate 趨勢
-└── 來源：parse clean_error_message（或後續改成 JSONB 欄位）
+└── 來源：clean_error_message（JSONB array），直接 UNNEST 取欄位名稱，不需 parse 文字
 
 rpt_quality_version_comparison
 ├── v1 攔截了多少 → v2 促進了多少 → 目前仍在 quarantine 多少

@@ -106,7 +106,7 @@ Raw 的職責是保留所有進來的原始資料，不對其結構做任何假�
 `format_clean()` 處理格式問題（統一小寫、去空白）。`business_clean()` 驗證業務規則（數量不能為負、評分要在 1–5 之間、出貨日不能早於訂單日等）。兩者職責分離，分別對應「格式標準化」與「業務語意驗證」兩個不同層次的問題。
 
 **`has_clean_error` 非阻斷**
-業務規則驗證結果只標記在 `has_clean_error` 欄位，不拒絕寫入 ODS。攔截責任下放到 `dbt int_*`，讓 ODS 保持完整的原始資料狀況，分析層依照各自需求決定如何使用這些資料。
+業務規則驗證結果只標記在 `has_clean_error` 欄位，不拒絕寫入 ODS。攔截責任下放到 `dbt int_*`，理由來自兩個具體機制：一、Quarantine 是可分析的業務層——進入 ODS 的髒資料已完成格式標準化（`format_clean` 先於業務驗證執行），`int_orders_quarantine` 能直接以業務欄位切片做 RCA，無需回溯解析 Raw payload；二、支援規則演進後的 Proposal B 重評估——當規則升版，ODS 中的 quarantine 記錄才有對象可以重評估並 promote，若在攝入時就攔截，規則演進只能對新資料有效。
 
 **ODS 層 first-write-wins idempotency**
 同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。

@@ -116,6 +116,9 @@ second, Proposal B re-evaluation requires dirty records to exist in ODS — bloc
 **ODS-layer first-write-wins idempotency**
 Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
 
+**`Raw.status` and `ODS.order_status` are unrelated**
+`Raw.status` is the pipeline state machine (`pending → processing → processed / error / duplicate`), driven by `try_claim_raw` and `_commit_raw_status`. `ODS.order_status` is a business field carried in from the inbound payload — it describes the order's fulfillment state at the moment of ingestion (e.g. `"confirmed"`, `"pending_payment"`), not the pipeline's processing progress. This API handles order creation events only; status changes originating from other systems (payment, fulfillment, customer service) are out of scope and would be joined at the dbt layer.
+
 **`force=True` semantic boundary: single-record retry, not backfill**
 `POST /process_raw/{raw_id}?force=true` is only permitted on `error` or `duplicate` records — its semantics are "retry this failed record". Calling it on a `processed` record returns 400, because if downstream systems (Star Schema, aggregation tables) have already consumed that ODS record, deleting and rewriting it in isolation cannot cascade corrections downstream and would introduce inconsistencies instead. Quarantine records (`has_clean_error = TRUE`, `status = "processed"`) have a rule evaluation problem, not a pipeline failure — the correct remediation path is Airflow re-evaluation (Proposal B), not re-running the pipeline.
 

@@ -116,6 +116,9 @@ Raw 的職責是保留所有進來的原始資料，不對其結構做任何假�
 **ODS 層 first-write-wins idempotency**
 同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
 
+**`Raw.status` 與 `ODS.order_status` 無關**
+`Raw.status` 是 pipeline 狀態機（`pending → processing → processed / error / duplicate`），由 `try_claim_raw` 與 `_commit_raw_status` 驅動。`ODS.order_status` 是業務欄位，從進來的 payload 攤平而來，描述訂單在攝入當下的履約狀態（如 `"confirmed"`、`"pending_payment"`），與 pipeline 的處理進度無關。此 API 只負責接收訂單建立事件；後續狀態變更（付款、出貨、取消）來自其他系統，超出此 pipeline 的 scope，由 dbt 層 JOIN 其他來源表組合。
+
 **`force=True` 的語意邊界：單筆重試，而非 Backfill**
 `POST /process_raw/{raw_id}?force=true` 只允許對 `error` 或 `duplicate` 狀態的記錄使用，語意是「重試這筆處理失敗的記錄」。對 `processed` 的記錄呼叫會直接回 400——因為若下游（Star Schema、聚合統計表）已消費過此筆 ODS，單獨刪除再重寫 ODS 無法 cascade 修正下游，反而製造不一致。Quarantine 記錄（`has_clean_error=TRUE`，`status="processed"`）的問題是規則評估而非 pipeline 失敗，正確的 remediation 路徑是 Airflow 重評估（Proposal B），不是重跑 pipeline。
 

@@ -7,7 +7,6 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from schema import OrderIN, RawOut
 import asyncio
-import json
 import structlog
 from structlog.contextvars import clear_contextvars, bind_contextvars
 from database import SessionLocal, Base, engine
@@ -78,8 +77,10 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
     logger.info("收到訂單請求", order_id=order.order_id)
     db = SessionLocal()
     try:
-        payload_dict = order.model_dump()
-        payload_text = json.dumps(payload_dict, ensure_ascii=False, default=str)
+        # landing 層語意：請求已通過 OrderIN 結構驗證（壞資料在邊界以 422 擋掉），
+        # 此處逐字保留原始 request body，不做序列化/欄位過濾，避免上游 schema drift
+        # 時靜默丟失未知欄位。order_id 另外抽出作為關鍵追溯欄位。
+        payload_text = (await request.body()).decode("utf-8")
 
         raw = Raw(
             raw_payload=payload_text,

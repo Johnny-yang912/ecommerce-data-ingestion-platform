@@ -10,8 +10,8 @@ ODS serves as an immutable anchor that preserves the complete state of all data.
 ## Quality Contract per Layer (Q0)
 
 ```
-Raw (PostgreSQL)
-  Responsibility : Persist every inbound request exactly as received, no quality assumptions
+Raw (PostgreSQL)                               ← Landing
+  Responsibility : Persist the original request body verbatim; extract order_id only, as a key traceability field
   Quality requirement : None
   Mutable : No
 
@@ -95,14 +95,17 @@ WHERE has_clean_error = TRUE
 
 ### Mechanism 3: Scenario-Specific Analysis Models (int_* layer)
 
-Specific analytical scenarios can build dedicated models at the `int_*` layer. These models use `clean_error_message` JSONB conditions to accept records that are globally quarantined but whose errors are irrelevant to the scenario, and apply field-level imputation where needed:
+Specific analytical scenarios can build dedicated models at the `int_*` layer. `clean_error_message` is a JSONB array of objects (`{"code", "field", "value", ...}`), so scenarios match on the stable `code` rather than human-readable wording, accept records that are globally quarantined but whose errors are irrelevant to the scenario, and apply field-level imputation where needed:
 
 ```sql
 -- int_orders_shipping_analysis.sql
 SELECT
     *,
     CASE
-        WHEN clean_error_message @> '["customer_rating should be between 1 and 5"]'
+        WHEN EXISTS (
+            SELECT 1 FROM UNNEST(clean_error_message) AS e
+            WHERE JSON_VALUE(e, '$.code') = 'customer_rating_out_of_range'
+        )
         THEN NULL
         ELSE customer_rating
     END AS customer_rating_cleaned
@@ -112,7 +115,7 @@ WHERE
     OR (
         -- only error is rating, which is irrelevant to shipping analysis
         ARRAY_LENGTH(clean_error_message) = 1
-        AND clean_error_message @> '["customer_rating should be between 1 and 5"]'
+        AND JSON_VALUE(clean_error_message[0], '$.code') = 'customer_rating_out_of_range'
     )
 ```
 
@@ -186,7 +189,7 @@ quality_events
 ├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected"
 ├── rule_version: String     "v1" | "v2" | ...
 ├── event_at:     DateTime
-└── reason:       JSONB?     list[str], same format as ODS.clean_error_message
+└── reason:       JSONB?     list[dict] {code, field, value, ...}, same format as ODS.clean_error_message
 ```
 
 **When records are written:**
@@ -266,7 +269,7 @@ rpt_quality_daily
 rpt_quality_field_breakdown
 ├── which fields most frequently trigger has_clean_error
 ├── per-field error rate trend over time
-└── source: clean_error_message (JSONB array) — UNNEST directly to extract field names, no text parsing required
+└── source: clean_error_message (JSONB array of objects) — UNNEST and read e.field / e.code directly, no text parsing required
 
 rpt_quality_version_comparison
 ├── how many quarantined under v1 → promoted under v2 → still in quarantine
@@ -354,4 +357,4 @@ When Airflow is introduced in Phase 4, the write logic for `promotion` and `perm
 Repair logic in scenario-specific `int_*` models is documented in the dbt model SQL and model description — no separate tracking table is maintained. This assumes no runtime cross-system auditing requirement exists; if that need arises, a BQ-layer lifecycle table can be introduced at that point.
 
 **`stg_*` boolean flags deferred**  
-Scenario models currently query `clean_error_message` JSONB strings directly. When error conditions need to be maintained across multiple scenario models, or when `clean_error_message` wording changes raise the maintenance cost noticeably, parse the JSONB into structured boolean columns (e.g. `has_rating_error`) in `stg_orders` to centralise the format coupling in one place.
+Scenario models currently match on the stable `code` inside the `clean_error_message` JSONB array directly (the `code` is decoupled from human-readable wording, so wording changes no longer break these queries). When the same `code` conditions need to be maintained across many scenario models, parse the JSONB into structured boolean columns (e.g. `has_rating_error`) in `stg_orders` to centralise the coupling in one place.

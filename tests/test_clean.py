@@ -117,52 +117,52 @@ class TestBusinessClean:
     def test_quantity_zero_is_invalid(self):
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 0, "unit_price": 50.0}])
         _, errors = business_clean(ods)
-        assert any("quantity" in e for e in errors)
+        assert any(e["field"] == "quantity" for e in errors)
 
     def test_quantity_negative_is_invalid(self):
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": -1, "unit_price": 50.0}])
         _, errors = business_clean(ods)
-        assert any("quantity" in e for e in errors)
+        assert any(e["field"] == "quantity" for e in errors)
 
     def test_unit_price_negative_is_invalid(self):
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": -10.0}])
         _, errors = business_clean(ods)
-        assert any("unit_price" in e for e in errors)
+        assert any(e["field"] == "unit_price" for e in errors)
 
     def test_unit_price_zero_is_valid(self):
         """unit_price = 0 合法（免費商品）。"""
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": 0.0}])
         _, errors = business_clean(ods)
-        assert not any("unit_price" in e for e in errors)
+        assert not any(e["field"] == "unit_price" for e in errors)
 
     def test_discount_pct_above_100_is_invalid(self):
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": 50.0, "discount_pct": 101.0}])
         _, errors = business_clean(ods)
-        assert any("discount_pct" in e for e in errors)
+        assert any(e["field"] == "discount_pct" for e in errors)
 
     def test_discount_pct_negative_is_invalid(self):
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": 50.0, "discount_pct": -1.0}])
         _, errors = business_clean(ods)
-        assert any("discount_pct" in e for e in errors)
+        assert any(e["field"] == "discount_pct" for e in errors)
 
     @pytest.mark.parametrize("pct", [0.0, 100.0])
     def test_discount_pct_boundaries_are_valid(self, pct):
         """邊界值 0 和 100 都合法。"""
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": 50.0, "discount_pct": pct}])
         _, errors = business_clean(ods)
-        assert not any("discount_pct" in e for e in errors)
+        assert not any(e["field"] == "discount_pct" for e in errors)
 
     # ── 訂單層級驗證 ──────────────────────────────────────────────────────────
 
     def test_tax_pct_above_100_is_invalid(self):
         ods = make_ods(tax_pct=101.0)
         _, errors = business_clean(ods)
-        assert any("tax_pct" in e for e in errors)
+        assert any(e["field"] == "tax_pct" for e in errors)
 
     def test_tax_pct_negative_is_invalid(self):
         ods = make_ods(tax_pct=-1.0)
         _, errors = business_clean(ods)
-        assert any("tax_pct" in e for e in errors)
+        assert any(e["field"] == "tax_pct" for e in errors)
 
     def test_delivery_date_before_order_date_is_invalid(self):
         ods = make_ods(
@@ -170,7 +170,7 @@ class TestBusinessClean:
             delivery_date=date(2024, 1, 5),
         )
         _, errors = business_clean(ods)
-        assert any("delivery_date" in e for e in errors)
+        assert any(e["field"] == "delivery_date" for e in errors)
 
     def test_delivery_date_same_as_order_date_is_valid(self):
         """delivery_date == order_date 合法（當日出貨）。"""
@@ -179,31 +179,31 @@ class TestBusinessClean:
             delivery_date=date(2024, 1, 1),
         )
         _, errors = business_clean(ods)
-        assert not any("delivery_date" in e for e in errors)
+        assert not any(e["field"] == "delivery_date" for e in errors)
 
     @pytest.mark.parametrize("rating", [0.9, 5.1])
     def test_customer_rating_out_of_range_is_invalid(self, rating):
         ods = make_ods(customer_rating=rating)
         _, errors = business_clean(ods)
-        assert any("customer_rating" in e for e in errors)
+        assert any(e["field"] == "customer_rating" for e in errors)
 
     @pytest.mark.parametrize("rating", [1.0, 5.0])
     def test_customer_rating_boundaries_are_valid(self, rating):
         ods = make_ods(customer_rating=rating)
         _, errors = business_clean(ods)
-        assert not any("customer_rating" in e for e in errors)
+        assert not any(e["field"] == "customer_rating" for e in errors)
 
     @pytest.mark.parametrize("age", [-1, 121])
     def test_age_out_of_range_is_invalid(self, age):
         ods = make_ods(age=age)
         _, errors = business_clean(ods)
-        assert any("age" in e for e in errors)
+        assert any(e["field"] == "age" for e in errors)
 
     @pytest.mark.parametrize("age", [0, 120])
     def test_age_boundaries_are_valid(self, age):
         ods = make_ods(age=age)
         _, errors = business_clean(ods)
-        assert not any("age" in e for e in errors)
+        assert not any(e["field"] == "age" for e in errors)
 
     def test_multiple_violations_all_accumulated(self):
         """多個規則同時違反，全部錯誤都要被累積，不提前 return。"""
@@ -244,7 +244,7 @@ class TestCleanOrder:
         _, has_error, msg = clean_order(ods)
         assert has_error is True
         assert isinstance(msg, list) and len(msg) > 0
-        assert any("customer_rating" in e for e in msg)
+        assert any(e["field"] == "customer_rating" for e in msg)
 
     def test_format_and_business_both_applied(self):
         """

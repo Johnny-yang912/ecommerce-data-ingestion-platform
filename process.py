@@ -131,6 +131,8 @@ def process_raw_event(raw_id: int) -> None:
                 break  # 處理成功，跳出 retry loop
 
             except json.JSONDecodeError:
+                # 防禦性：/orders 路徑的 payload 已通過 OrderIN 驗證、必為合法 JSON，
+                # 此分支正常不會觸發；保留以涵蓋手動 replay 或直接寫入 DB 造成的髒資料。
                 logger.error("JSON 解析失敗")
                 db.rollback()
                 _commit_raw_status(db, raw_id, "error", "Invalid JSON payload")

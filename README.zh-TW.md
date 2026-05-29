@@ -103,7 +103,7 @@ dbt rpt_*
 `Raw.order_id` 刻意不加 UNIQUE 約束。Raw 的職責是完整記錄所有進來的請求，包含重複提交——不同提交之間可能欄位互補，異常的提交頻率本身也是訊號（攻擊偵測、用戶端 bug）。去重的責任下放到 ODS 層。
 
 **ODS 層 items 欄位使用 JSONB，Raw 層使用 TEXT**
-Raw 的職責是保留所有進來的原始資料，不對其結構做任何假設，TEXT 語義最貼切——資料庫不解析、不驗證，原樣存入。ODS 的 items 已經過 Pydantic 驗證與清洗，結構有保證，JSONB 讓資料庫在寫入時多一道格式驗證，且保留未來在 SQL 層直接查詢 items 內部欄位的彈性。
+Raw 是 landing 層：**逐字保留原文**（直接存原始 request body，而非重新序列化的 `model_dump()`），不對其結構做任何假設，上游 schema drift 時也不會靜默丟失未知欄位。只有 `order_id` 被**抽取為關鍵追溯欄位**（供索引與 idempotency 查詢），其餘欄位原封不動留在 payload 文字內。TEXT 語義最貼切——資料庫不解析、不驗證，原樣存入。ODS 的 items 已經過 Pydantic 驗證與清洗，結構有保證，JSONB 讓資料庫在寫入時多一道格式驗證，且保留未來在 SQL 層直接查詢 items 內部欄位的彈性。
 
 **資料清洗分層（`format_clean` + `business_clean`）**
 `format_clean()` 處理格式問題（統一小寫、去空白）。`business_clean()` 驗證業務規則（數量不能為負、評分要在 1–5 之間、出貨日不能早於訂單日等）。兩者職責分離，分別對應「格式標準化」與「業務語意驗證」兩個不同層次的問題。

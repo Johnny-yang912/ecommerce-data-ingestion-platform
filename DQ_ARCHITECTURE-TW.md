@@ -10,8 +10,8 @@ ODS 作為不可變的錨點，保留完整資料狀況；品質管控的責任�
 ## 各層品質合約（Q0）
 
 ```
-Raw (PostgreSQL)
-  職責：完整落地所有進來的請求，不做任何品質假設
+Raw (PostgreSQL)                               ← Landing
+  職責：逐字保留原始 request body；僅抽取 order_id 作為關鍵追溯欄位
   品質要求：無
   可修改：否
 
@@ -95,14 +95,17 @@ WHERE has_clean_error = TRUE
 
 ### 機制三：場景專用分析模型（int_* 層）
 
-特定分析場景可在 `int_*` 層建立場景專用模型，透過查詢 `clean_error_message` JSONB，接受全局 quarantine 中與該場景無關的錯誤，並在模型內對問題欄位補值：
+特定分析場景可在 `int_*` 層建立場景專用模型。`clean_error_message` 是 JSONB 物件陣列（`{"code", "field", "value", ...}`），場景以穩定的 `code` 比對（而非人類可讀的措辭），接受全局 quarantine 中與該場景無關的錯誤，並在模型內對問題欄位補值：
 
 ```sql
 -- int_orders_shipping_analysis.sql
 SELECT
     *,
     CASE
-        WHEN clean_error_message @> '["customer_rating 應在 1~5 之間"]'
+        WHEN EXISTS (
+            SELECT 1 FROM UNNEST(clean_error_message) AS e
+            WHERE JSON_VALUE(e, '$.code') = 'customer_rating_out_of_range'
+        )
         THEN NULL
         ELSE customer_rating
     END AS customer_rating_cleaned
@@ -112,7 +115,7 @@ WHERE
     OR (
         -- 唯一問題是 rating，對出貨分析無關
         ARRAY_LENGTH(clean_error_message) = 1
-        AND clean_error_message @> '["customer_rating 應在 1~5 之間"]'
+        AND JSON_VALUE(clean_error_message[0], '$.code') = 'customer_rating_out_of_range'
     )
 ```
 
@@ -186,7 +189,7 @@ quality_events
 ├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected"
 ├── rule_version: String     "v1" | "v2" | ...
 ├── event_at:     DateTime
-└── reason:       JSONB?     list[str]，與 ODS.clean_error_message 相同格式
+└── reason:       JSONB?     list[dict] {code, field, value, ...}，與 ODS.clean_error_message 相同格式
 ```
 
 **寫入時機：**
@@ -266,7 +269,7 @@ rpt_quality_daily
 rpt_quality_field_breakdown
 ├── 哪些欄位最常觸發 has_clean_error
 ├── 每個欄位的 error rate 趨勢
-└── 來源：clean_error_message（JSONB array），直接 UNNEST 取欄位名稱，不需 parse 文字
+└── 來源：clean_error_message（JSONB 物件陣列），直接 UNNEST 讀 e.field / e.code，不需 parse 文字
 
 rpt_quality_version_comparison
 ├── v1 攔截了多少 → v2 促進了多少 → 目前仍在 quarantine 多少
@@ -354,4 +357,4 @@ Phase 4 Airflow 建立後，促進（`promotion`）與永久拒絕（`rejection`
 場景專用 `int_*` 模型的補值邏輯記錄在 dbt 模型 SQL 與 model description，不建立獨立追蹤表。前提是無跨系統運行時稽核的實務需求；若未來出現此需求，再評估是否引入 BQ 層生命週期表。
 
 **`stg_*` boolean 欄位延後**  
-目前場景模型直接查詢 `clean_error_message` JSONB 字串。當錯誤條件需跨多個場景模型維護、或 `clean_error_message` 措辭異動的維護成本明顯上升時，再於 `stg_orders` 拆解為結構化 boolean 欄位（如 `has_rating_error`），將格式耦合集中到單一地方。
+目前場景模型直接比對 `clean_error_message` JSONB 陣列內的穩定 `code`（`code` 與人類可讀措辭解耦，措辭異動不再使查詢失效）。當相同的 `code` 條件需跨多個場景模型維護時，再於 `stg_orders` 拆解為結構化 boolean 欄位（如 `has_rating_error`），將耦合集中到單一地方。

@@ -127,6 +127,8 @@ def process_raw_event(raw_id: int) -> None:
                     has_clean_error=has_clean_error,
                     clean_error_message=clean_error_message,
                     dq_rule_version=DQ_RULE_VERSION,
+                    # 血緣：從 raw 取（非 payload），隨錨點落地到 ODS
+                    source_client_id=raw.source_client_id,
                 )
                 break  # 處理成功，跳出 retry loop
 

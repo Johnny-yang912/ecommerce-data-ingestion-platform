@@ -1,6 +1,6 @@
 import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
 from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -15,6 +15,7 @@ from process import process_raw_event, scan_and_recover
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from logging_config import configure_logging
+from auth import verify_api_key
 
 configure_logging()
 logger = structlog.get_logger()
@@ -73,7 +74,9 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.post("/orders")
 @limiter.limit("60/minute")
-async def create_order(request: Request, order: OrderIN, background_tasks: BackgroundTasks):
+async def create_order(request: Request, order: OrderIN, background_tasks: BackgroundTasks,
+                       client_id: str = Depends(verify_api_key)):
+    bind_contextvars(client_id=client_id)
     logger.info("收到訂單請求", order_id=order.order_id)
     db = SessionLocal()
     try:
@@ -85,6 +88,7 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
         raw = Raw(
             raw_payload=payload_text,
             order_id=order.order_id,
+            source_client_id=client_id,  # 血緣起點：來自驗證層的來源端
         )
         db.add(raw)
         for attempt in range(MAX_RAW_WRITE_RETRIES):
@@ -114,7 +118,8 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
 
 @app.post("/process_raw/{raw_id}")
 @limiter.limit("20/minute")
-async def process_raw(request: Request, raw_id: int, background_tasks: BackgroundTasks, force: bool = False):
+async def process_raw(request: Request, raw_id: int, background_tasks: BackgroundTasks, force: bool = False,
+                      client_id: str = Depends(verify_api_key)):
     logger.info("觸發 replay", raw_id=raw_id, force=force)
     db = SessionLocal()
     try:
@@ -142,7 +147,7 @@ async def process_raw(request: Request, raw_id: int, background_tasks: Backgroun
 
 @app.get("/raw/{raw_id}", response_model=RawOut)
 @limiter.limit("120/minute")
-async def get_raw(request: Request, raw_id: int):
+async def get_raw(request: Request, raw_id: int, client_id: str = Depends(verify_api_key)):
     db = SessionLocal()
     try:
         raw = db.execute(select(Raw).where(Raw.id == raw_id)).scalar_one_or_none()

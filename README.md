@@ -133,6 +133,17 @@ A global limit must be derived from "expected concurrent active IPs × per-IP li
 **Pool exhaustion → fast fail (503)**
 `POST /orders` separately catches `SATimeoutError` (pool failed to acquire a connection) and returns 503 Service Unavailable without entering the retry loop. Pool exhaustion is a resource contention issue, not a DB fault — retrying only makes it worse. Failing fast lets the client back off and retry.
 
+### Service-to-service authentication decisions
+
+**API Key, not user-facing JWT**
+This service is positioned as an *ingestion unit* within the data mesh; its callers are a small, stable set of upstream services (machine-to-machine), with **no human users**. The JWT username/password login flow taught in most tutorials is designed for *users* and would be architecturally incoherent here. So we use service-to-service auth: the upstream holds an `X-API-Key`; a match lets it through. Comparison uses `secrets.compare_digest` (constant-time); the key is never logged and never enters `raw_payload`.
+
+**Keys live in `.env` as static config, not a DB management table**
+A DB management table (runtime key issuance/revocation) is driven by the "many, volatile clients" reality of public / multi-tenant platforms. Internal ingestion has few, stable trusted sources; onboarding a new source is a **deliberate infra event**, not a runtime concern. The only real churn is key rotation (security hygiene), handled by "one client mapping to multiple valid keys + an overlap window." If the platform later grows to multi-domain / multi-tenant, migrate to an `api_clients` table.
+
+**Auth = the origin of data lineage**
+The `client_id` resolved during auth is not just for access control — it lands on Raw and ODS as `source_client_id`, answering "which upstream sent this row." `source_client_id` is immutable ingestion-time metadata (same nature as `dq_rule_version`); it travels with the anchor into ODS so governance / quality analytics past the BQ extraction boundary can slice by source without joining back to Raw. It is determined by the auth layer — **not payload content** — so it is stored as its own column rather than mixed into `raw_payload`.
+
 ---
 
 ## Ingestion Layer Reliability
@@ -184,6 +195,8 @@ Requests exceeding the limit receive `429 Too Many Requests`.
 
 **⚠️ Deployment note**
 Running directly under uvicorn, `request.client.host` is the real client IP and limiting behaves correctly. If deployed behind Nginx or a load balancer, `request.client.host` becomes the proxy IP — all requests share one counter and per-IP limiting breaks down. In that case, the key function must be updated to read the `X-Forwarded-For` header with appropriate trusted-proxy configuration.
+
+Also, `X-API-Key` is sent in clear text in the header, so production **must run over HTTPS** (TLS terminated at the LB / reverse proxy is fine); otherwise the key travels in the clear.
 
 ### What retry handles vs. what it does not
 
@@ -256,6 +269,8 @@ The proper fix is to make "already enqueued" visible in the database by introduc
 
 ## API Endpoints
 
+All endpoints require an `X-API-Key` header (see "Service-to-service authentication decisions"); a missing or invalid key returns `401`.
+
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/orders` | Ingest a new order (writes Raw, triggers background task) |
@@ -283,6 +298,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── main.py        # FastAPI app, route handlers
 ├── process.py     # Background task, state machine, claim logic
 ├── clean.py       # format_clean, business_clean, clean_order
+├── auth.py        # API Key authentication (X-API-Key → client_id)
 ├── schema.py      # Pydantic schemas (OrderIN, ODSOrder, RawOut...)
 ├── models.py      # SQLAlchemy models (Raw, ODS, QualityEvent)
 ├── database.py    # Engine, SessionLocal, Base
@@ -296,10 +312,11 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 │   ├── test_process.py    # Points 2–4: Claim / Processing / Status commit retry; Idempotency; Quality Events
 │   ├── test_scan.py       # scan_and_recover, lifespan startup, periodic scan
 │   ├── test_timeout.py    # Pool exhaustion, /process_raw, GET /raw, DB settings
-│   └── test_rate_limit.py # per-IP rate limiting
+│   ├── test_rate_limit.py # per-IP rate limiting
+│   └── test_auth.py       # API Key auth, rotation, source_client_id persistence
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture (English)
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
-├── .env           # DB_URL (not committed)
+├── .env           # DB_URL, API_KEYS (not committed)
 └── .gitignore
 ```
 
@@ -330,7 +347,9 @@ pip install pytest pytest-asyncio pytest-cov  # test dependencies
 
 # 4. Configure environment
 cp .env.example .env
-# Edit .env and set DB_URL=postgresql://user:password@localhost/dbname
+# Edit .env and set:
+#   DB_URL=postgresql://user:password@localhost/dbname
+#   API_KEYS=your_key:upstream-order-api   (format key:client_id, comma-separated for multiple)
 
 # 5. Run
 uvicorn main:app --reload
@@ -401,11 +420,11 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Rate limiting — per-IP limits via slowapi: `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
-- [v] Pytest — 84 tests, 100% coverage across all 7 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths; `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
+- [v] Pytest — 91 tests, 100% coverage across all 8 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
 - [v] Data quality control architecture (ODS layer) — full design document (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md)); ODS layer implemented: `DQ_RULE_VERSION` rule version constant, `dq_rule_version` column (ODS), `quality_events` table (append-only quality event log, state machine anchor), structlog `quality_metric` event; BQ Analytics layer (Hard Gate, Row Filter, `int_orders_quarantine`, Airflow re-evaluation, `rpt_quality_*`) deferred to Phase 4
 
 **Phase 3 — Operability**
-- [ ] JWT authentication
+- [v] Service-to-service authentication (API Key) — static `X-API-Key` (`.env`-loaded `key:client_id` mapping, supporting multiple keys per client for rotation), constant-time `secrets.compare_digest` comparison; mounted on all endpoints, 401 on missing/invalid; the resolved `client_id` lands as `source_client_id` (Raw + ODS) as the origin of data lineage. **No user-facing JWT** — this is an internal ingestion unit with no human users (see "Service-to-service authentication decisions")
 - [ ] Centralised config management
 - [ ] Alembic migrations
 - [ ] Docker / docker-compose (API + PostgreSQL containerisation)

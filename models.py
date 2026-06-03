@@ -16,6 +16,11 @@ class Raw(Base):
     # 系統攤平欄位
     order_id = Column(String(50), nullable=True, index=True)
 
+    # 資料血緣起點：驗證層解析出的來源端 client（非 payload 內容，由 API key 對應而來）
+    # NULL 的語意：此筆非經認證 API 落地（手動 replay / backfill / 直接寫 DB），來源未建立。
+    # Raw 作為不做假設的 landing 層，刻意保留「來源未知」這個可表達的狀態。
+    source_client_id = Column(String(50), nullable=True, index=True)
+
     # 整包原始資料
     raw_payload = Column(Text, nullable=False)  # 用Text保留完整JSON字串訊息，用以追蹤和除錯
 
@@ -73,6 +78,9 @@ class ODS(Base):
 
     # 品質評估版本（攝入時使用的規則版本，之後永遠不動）
     dq_rule_version = Column(String(10), nullable=True)
+
+    # 資料血緣：攝入當下的來源端（與 dq_rule_version 同類的不可變 metadata，隨錨點走）
+    source_client_id = Column(String(50), nullable=True, index=True)
 
 
 class QualityEvent(Base):

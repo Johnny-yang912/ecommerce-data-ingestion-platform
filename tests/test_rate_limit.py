@@ -51,12 +51,21 @@ def reset_limiter():
 
 @pytest.fixture
 def client():
-    """提供已 mock lifespan 依賴的 TestClient，每個測試拿到乾淨的 client。"""
-    with patch("main.scan_and_recover", return_value=[]), \
-         patch("main.process_raw_event"), \
-         patch("main.SessionLocal", return_value=_make_order_db()):
-        with TestClient(app) as c:
-            yield c
+    """提供已 mock lifespan 依賴的 TestClient，每個測試拿到乾淨的 client。
+
+    驗證層以 dependency_overrides 旁路（這裡測的是限流，不是 auth），
+    讓既有測試不必每個請求都塞 X-API-Key。
+    """
+    from auth import verify_api_key
+    app.dependency_overrides[verify_api_key] = lambda: "test-client"
+    try:
+        with patch("main.scan_and_recover", return_value=[]), \
+             patch("main.process_raw_event"), \
+             patch("main.SessionLocal", return_value=_make_order_db()):
+            with TestClient(app) as c:
+                yield c
+    finally:
+        app.dependency_overrides.pop(verify_api_key, None)
 
 
 SAMPLE_ORDER = {

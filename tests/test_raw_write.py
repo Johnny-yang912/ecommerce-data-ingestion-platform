@@ -33,7 +33,7 @@ class TestRawWriteRetry:
              patch("main.process_raw_event"), \
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks))
+            result = await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="test-client")
 
         assert mock_db.commit.call_count == 1
         assert mock_db.rollback.call_count == 0
@@ -52,7 +52,7 @@ class TestRawWriteRetry:
              patch("main.process_raw_event"), \
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks))
+            result = await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="test-client")
 
         assert mock_db.commit.call_count == 2
         assert mock_db.rollback.call_count == 1
@@ -71,7 +71,7 @@ class TestRawWriteRetry:
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              pytest.raises(OperationalError):
-            await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks))
+            await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="test-client")
 
         assert mock_db.commit.call_count == MAX_RAW_WRITE_RETRIES
         assert mock_db.rollback.call_count == MAX_RAW_WRITE_RETRIES

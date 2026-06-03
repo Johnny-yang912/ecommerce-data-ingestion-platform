@@ -32,7 +32,7 @@ class TestPoolExhaustion:
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              pytest.raises(HTTPException) as exc_info:
-            await create_order(mock_request, SAMPLE_ORDER, MagicMock(spec=BackgroundTasks))
+            await create_order(mock_request, SAMPLE_ORDER, MagicMock(spec=BackgroundTasks), client_id="test-client")
 
         assert exc_info.value.status_code == 503
         # pool 耗盡不應 retry

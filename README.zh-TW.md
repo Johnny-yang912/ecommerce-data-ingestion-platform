@@ -133,6 +133,17 @@ Raw 是 landing 層：**逐字保留原文**（直接存原始 request body，�
 **Pool 耗盡快速失敗（503）**
 `POST /orders` 額外 catch `SATimeoutError`（pool 等不到連線），直接回傳 503 Service Unavailable，不走 retry loop。Pool 耗盡是資源競爭問題而非 DB 故障，retry 無法改善，應快速失敗讓 client 自行退讓。
 
+### 服務對服務驗證決策
+
+**用 API Key，而非 JWT 使用者登入**
+本服務的定位是資料網格中的**攝取單元**，呼叫者是少數且穩定的上游服務（machine-to-machine），**沒有人類使用者**。教學常見的 JWT 帳密登入流程是為「使用者」設計的，套到這裡會造成架構不協調。故採服務對服務驗證：上游持有 `X-API-Key`，命中即放行。比對用 `secrets.compare_digest`（constant-time），key 不進 log、不進 `raw_payload`。
+
+**Key 存 `.env` 靜態對應，而非 DB 管理表**
+DB 管理表（執行期發/撤 key）的需求來自「來源多又常變」的對外 / 多租戶平台；內部攝取的信賴來源少且穩定，新增來源是**有計畫的基建事件**，不需要執行期管理。唯一真實的變動是 key 輪替（安全衛生），以「同一 client 對應多把有效 key + 重疊期」處理。若未來擴張為多 domain / 多租戶，再遷移到 `api_clients` 表。
+
+**驗證 = 資料血緣起點**
+驗證解析出的 `client_id` 不只用於放行，也以 `source_client_id` 落地到 Raw 與 ODS，回答「這筆資料是哪個上游送的」。`source_client_id` 是攝入當下的不可變 metadata（與 `dq_rule_version` 同類），隨錨點走進 ODS，讓 BQ 抽取邊界後的治理 / 品質分析能 by 來源端切片，無需回 JOIN Raw。它由驗證層判定、**非 payload 內容**，故存為獨立欄位而不混入 `raw_payload`。
+
 ---
 
 ## 攝取層可靠性
@@ -184,6 +195,8 @@ Raw 是 landing 層：**逐字保留原文**（直接存原始 request body，�
 
 **⚠️ 部署注意事項**
 目前直接跑 uvicorn，`request.client.host` 是真實的 client IP，限流行為正確。若未來在 Nginx / Load Balancer 後面部署，`request.client.host` 會變成 proxy 的 IP，所有請求共用同一個計數器，per-IP 限流將失效。屆時需將 key_func 改為讀取 `X-Forwarded-For` header，並搭配適當的 trusted proxy 設定。
+
+此外，`X-API-Key` 以明文置於 header，正式環境**必須走 HTTPS**（TLS 終結於 LB / reverse proxy 亦可），否則 key 會在傳輸中裸奔。
 
 ### 能應對 vs. 不能應對
 
@@ -256,6 +269,8 @@ Periodic scan 與 startup scan 會撈出所有 `status='pending'` 的 Raw 記錄
 
 ## API 端點
 
+所有端點均需帶 `X-API-Key` header（見下方〈服務對服務驗證〉），缺失或無效回 `401`。
+
 | Method | Path | 說明 |
 |---|---|---|
 | `POST` | `/orders` | 寫入新訂單（存 Raw，觸發背景任務） |
@@ -283,6 +298,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 ├── main.py        # FastAPI app、路由
 ├── process.py     # 背景任務、狀態機、claim 邏輯
 ├── clean.py       # format_clean、business_clean、clean_order
+├── auth.py        # API Key 驗證（X-API-Key → client_id）
 ├── schema.py      # Pydantic schemas（OrderIN、ODSOrder、RawOut...）
 ├── models.py      # SQLAlchemy models（Raw、ODS、QualityEvent）
 ├── database.py    # Engine、SessionLocal、Base
@@ -296,10 +312,11 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 │   ├── test_process.py    # Point 2–4：Claim / Processing / Status retry；Idempotency；Quality Events
 │   ├── test_scan.py       # scan_and_recover、lifespan startup、periodic scan
 │   ├── test_timeout.py    # Pool 耗盡、/process_raw、GET /raw、DB 設定
-│   └── test_rate_limit.py # per-IP 限流
+│   ├── test_rate_limit.py # per-IP 限流
+│   └── test_auth.py       # API Key 驗證、輪替、source_client_id 落地
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture（English）
-├── .env           # DB_URL（不進版控）
+├── .env           # DB_URL、API_KEYS（不進版控）
 └── .gitignore
 ```
 
@@ -330,7 +347,9 @@ pip install pytest pytest-asyncio pytest-cov  # 測試依賴
 
 # 4. 設定環境變數
 cp .env.example .env
-# 編輯 .env，填入你的 DB_URL=postgresql://user:password@localhost/dbname
+# 編輯 .env，填入：
+#   DB_URL=postgresql://user:password@localhost/dbname
+#   API_KEYS=your_key:upstream-order-api   （格式 key:client_id，逗號分隔多組）
 
 # 5. 啟動
 uvicorn main:app --reload
@@ -401,11 +420,11 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-IP 限流（slowapi），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 84 個測試，7 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] Pytest — 91 個測試，8 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）待 Phase 4 實作
 
 **Phase 3 — 工程化**
-- [ ] JWT 身份驗證
+- [v] 服務對服務驗證（API Key）— 靜態 `X-API-Key`（`.env` 載入 `key:client_id` 對應，支援同 client 多把 key 做輪替），`secrets.compare_digest` constant-time 比對；掛載於全部端點，缺失/無效回 401；驗證出的 `client_id` 落地為 `source_client_id`（Raw + ODS），作為資料血緣起點。**未採 JWT 使用者登入**——本服務是內部攝取單元、無人類使用者（見〈服務對服務驗證〉設計決策）
 - [ ] 環境變數集中管理
 - [ ] Alembic DB migration
 - [ ] Docker / docker-compose（API + PostgreSQL 容器化）

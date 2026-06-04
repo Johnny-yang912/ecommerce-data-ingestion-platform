@@ -1,11 +1,12 @@
 import logging
-import os
 import sys
 import structlog
 
+from config import settings
+
 
 def configure_logging() -> None:
-    log_format = os.getenv("LOG_FORMAT", "console")
+    log_format = settings.log_format
 
     shared_processors = [
         structlog.contextvars.merge_contextvars,

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 *.pyc
 .env.*
+!.env.example
 CLAUDE.md
 load_test.py
 restart_test.sh

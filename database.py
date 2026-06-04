@@ -1,17 +1,14 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
-import os
+from config import settings
 
-load_dotenv()
-
-DB_URL = os.getenv("DB_URL")
 engine = create_engine(
-    DB_URL,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-    connect_args={"options": "-c statement_timeout=30000"}, #30秒的 statement_timeout
+    settings.db_url,
+    pool_size=settings.pool_size,
+    max_overflow=settings.max_overflow,
+    pool_timeout=settings.pool_timeout,
+    # PostgreSQL session-level statement_timeout（毫秒），防 lock wait 掛住 thread
+    connect_args={"options": f"-c statement_timeout={settings.statement_timeout_ms}"},
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()

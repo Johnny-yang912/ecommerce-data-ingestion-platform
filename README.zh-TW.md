@@ -302,6 +302,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 ├── schema.py      # Pydantic schemas（OrderIN、ODSOrder、RawOut...）
 ├── models.py      # SQLAlchemy models（Raw、ODS、QualityEvent）
 ├── database.py    # Engine、SessionLocal、Base
+├── config.py      # 設定集中管理（pydantic-settings Settings 單例）
 ├── pytest.ini     # 測試設定（asyncio_mode、coverage）
 ├── tests/
 │   ├── conftest.py        # 共用 fixtures
@@ -317,6 +318,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture（English）
 ├── .env           # DB_URL、API_KEYS（不進版控）
+├── .env.example   # 環境變數範本（進版控）
 └── .gitignore
 ```
 
@@ -425,7 +427,7 @@ Looker Studio（直連 BigQuery）
 
 **Phase 3 — 工程化**
 - [v] 服務對服務驗證（API Key）— 靜態 `X-API-Key`（`.env` 載入 `key:client_id` 對應，支援同 client 多把 key 做輪替），`secrets.compare_digest` constant-time 比對；掛載於全部端點，缺失/無效回 401；驗證出的 `client_id` 落地為 `source_client_id`（Raw + ODS），作為資料血緣起點。**未採 JWT 使用者登入**——本服務是內部攝取單元、無人類使用者（見〈服務對服務驗證〉設計決策）
-- [ ] 環境變數集中管理
+- [v] 環境變數集中管理 — `config.py` 以 pydantic-settings 的 `Settings` 為單一真相來源，啟動時實例化一次，各模組統一 `from config import settings`，不再各自 `load_dotenv()` / `os.getenv`。**決策邊界**：只集中「會因部署環境而異」的值——必填的 `DB_URL`（缺值即 fail-fast，不再延遲到連線才炸）、`API_KEYS`，以及帶預設值的 `pool_size` / `max_overflow` / `pool_timeout` / `statement_timeout_ms` / `scan_interval_seconds` / `log_format`；演算法常數（`MAX_*_RETRIES`、`STALE_PROCESSING_MINUTES`）**刻意留在各自模組開頭**——它們是程式行為的一部分、不隨環境變動，改動應走 code review 而非環境變數。附 `.env.example` 範本進版控
 - [ ] Alembic DB migration
 - [ ] Docker / docker-compose（API + PostgreSQL 容器化）
 

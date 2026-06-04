@@ -16,6 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from logging_config import configure_logging
 from auth import verify_api_key
+from config import settings
 
 configure_logging()
 logger = structlog.get_logger()
@@ -27,8 +28,7 @@ def _limiter_key(request: Request) -> str:
 
 limiter = Limiter(key_func=_limiter_key)
 
-MAX_RAW_WRITE_RETRIES = 3
-SCAN_INTERVAL_SECONDS = 300  # periodic scan 間隔（5 分鐘）
+MAX_RAW_WRITE_RETRIES = 3  # 演算法常數：Raw 寫入重試上限，行為固定不隨環境變動
 
 Base.metadata.create_all(bind=engine)
 
@@ -46,7 +46,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 async def _periodic_scan():
     while True:
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        await asyncio.sleep(settings.scan_interval_seconds)
         try:
             raw_ids = await asyncio.to_thread(scan_and_recover)
             for raw_id in raw_ids:

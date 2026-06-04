@@ -10,15 +10,14 @@ API Key 驗證（Phase 3 - Option A：靜態 key + 多 key 輪替）
 Raw / ODS，回答「這筆資料是哪個上游送的」。
 """
 
-import os
 import secrets
 
 import structlog
-from dotenv import load_dotenv
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 
-load_dotenv()
+from config import settings
+
 logger = structlog.get_logger()
 
 API_KEY_HEADER_NAME = "X-API-Key"
@@ -47,7 +46,7 @@ def _parse_api_keys(raw: str | None) -> dict[str, str]:
 
 
 # 啟動時解析一次，存記憶體 dict。測試可 monkeypatch 此變數。
-API_KEYS: dict[str, str] = _parse_api_keys(os.getenv("API_KEYS"))
+API_KEYS: dict[str, str] = _parse_api_keys(settings.api_keys)
 
 
 def verify_api_key(api_key: str | None = Security(api_key_header)) -> str:

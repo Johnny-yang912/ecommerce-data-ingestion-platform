@@ -302,6 +302,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── schema.py      # Pydantic schemas (OrderIN, ODSOrder, RawOut...)
 ├── models.py      # SQLAlchemy models (Raw, ODS, QualityEvent)
 ├── database.py    # Engine, SessionLocal, Base
+├── config.py      # Centralised config (pydantic-settings Settings singleton)
 ├── pytest.ini     # Test configuration (asyncio_mode, coverage)
 ├── tests/
 │   ├── conftest.py        # Shared fixtures
@@ -317,6 +318,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture (English)
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── .env           # DB_URL, API_KEYS (not committed)
+├── .env.example   # Environment variable template (committed)
 └── .gitignore
 ```
 
@@ -425,7 +427,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 
 **Phase 3 — Operability**
 - [v] Service-to-service authentication (API Key) — static `X-API-Key` (`.env`-loaded `key:client_id` mapping, supporting multiple keys per client for rotation), constant-time `secrets.compare_digest` comparison; mounted on all endpoints, 401 on missing/invalid; the resolved `client_id` lands as `source_client_id` (Raw + ODS) as the origin of data lineage. **No user-facing JWT** — this is an internal ingestion unit with no human users (see "Service-to-service authentication decisions")
-- [ ] Centralised config management
+- [v] Centralised config management — `config.py` exposes a single `Settings` (pydantic-settings) as the source of truth, instantiated once at startup; modules read `from config import settings` instead of each calling `load_dotenv()` / `os.getenv`. **Decision boundary**: only values that vary by deployment environment are centralised — the required `DB_URL` (fail-fast on missing value instead of crashing late at first connection), `API_KEYS`, plus defaulted `pool_size` / `max_overflow` / `pool_timeout` / `statement_timeout_ms` / `scan_interval_seconds` / `log_format`. Algorithmic constants (`MAX_*_RETRIES`, `STALE_PROCESSING_MINUTES`) **deliberately stay at the top of their own modules** — they are part of program behaviour, not environment, so changing them should go through code review rather than an env var. Ships with a version-controlled `.env.example` template
 - [ ] Alembic migrations
 - [ ] Docker / docker-compose (API + PostgreSQL containerisation)
 

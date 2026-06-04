@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 class Raw(Base):
     __tablename__ = "raw"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     status = Column(String(20), nullable=False, default="pending")
     error_message = Column(Text, nullable=True)
@@ -28,7 +28,7 @@ class Raw(Base):
 class ODS(Base):
     __tablename__ = "ods"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     raw_id = Column(Integer, nullable=True, unique=True)
 
@@ -86,7 +86,7 @@ class ODS(Base):
 class QualityEvent(Base):
     __tablename__ = "quality_events"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     raw_id = Column(Integer, nullable=False, index=True)
     order_id = Column(String(50), nullable=False, index=True)
 

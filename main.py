@@ -9,7 +9,7 @@ from schema import OrderIN, RawOut
 import asyncio
 import structlog
 from structlog.contextvars import clear_contextvars, bind_contextvars
-from database import SessionLocal, Base, engine
+from database import SessionLocal
 from models import Raw
 from process import process_raw_event, scan_and_recover
 from sqlalchemy import select, update
@@ -30,7 +30,7 @@ limiter = Limiter(key_func=_limiter_key)
 
 MAX_RAW_WRITE_RETRIES = 3  # 演算法常數：Raw 寫入重試上限，行為固定不隨環境變動
 
-Base.metadata.create_all(bind=engine)
+# Schema 由 Alembic 管理（alembic upgrade head），啟動時不再 create_all。
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):

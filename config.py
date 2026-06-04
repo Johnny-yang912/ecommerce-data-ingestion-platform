@@ -1,5 +1,5 @@
 """
-設定集中管理（Phase 3 - 工程化）
+設定集中管理
 
 單一真相來源：所有「會因部署環境而異」的設定都在此宣告，啟動時實例化一次，
 其他模組一律 `from config import settings` 取用，不再各自 `load_dotenv()` / `os.getenv`。

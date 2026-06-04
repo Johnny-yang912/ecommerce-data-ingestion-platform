@@ -303,6 +303,8 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 ├── models.py      # SQLAlchemy models（Raw、ODS、QualityEvent）
 ├── database.py    # Engine、SessionLocal、Base
 ├── config.py      # 設定集中管理（pydantic-settings Settings 單例）
+├── alembic/        # DB migration（env.py 接 settings.db_url + Base.metadata；versions/ 為遷移腳本）
+├── alembic.ini     # Alembic 設定（sqlalchemy.url 留空，由 env.py 注入）
 ├── pytest.ini     # 測試設定（asyncio_mode、coverage）
 ├── tests/
 │   ├── conftest.py        # 共用 fixtures
@@ -344,7 +346,7 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # 3. 裝套件
-pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi alembic
 pip install pytest pytest-asyncio pytest-cov  # 測試依賴
 
 # 4. 設定環境變數
@@ -353,10 +355,13 @@ cp .env.example .env
 #   DB_URL=postgresql://user:password@localhost/dbname
 #   API_KEYS=your_key:upstream-order-api   （格式 key:client_id，逗號分隔多組）
 
-# 5. 啟動
+# 5. 建立資料庫 schema（Alembic migration，非 create_all）
+alembic upgrade head
+
+# 6. 啟動
 uvicorn main:app --reload
 
-# 6. 執行測試（需先設定 .env）
+# 7. 執行測試（需先設定 .env）
 pytest
 ```
 
@@ -428,7 +433,7 @@ Looker Studio（直連 BigQuery）
 **Phase 3 — 工程化**
 - [v] 服務對服務驗證（API Key）— 靜態 `X-API-Key`（`.env` 載入 `key:client_id` 對應，支援同 client 多把 key 做輪替），`secrets.compare_digest` constant-time 比對；掛載於全部端點，缺失/無效回 401；驗證出的 `client_id` 落地為 `source_client_id`（Raw + ODS），作為資料血緣起點。**未採 JWT 使用者登入**——本服務是內部攝取單元、無人類使用者（見〈服務對服務驗證〉設計決策）
 - [v] 環境變數集中管理 — `config.py` 以 pydantic-settings 的 `Settings` 為單一真相來源，啟動時實例化一次，各模組統一 `from config import settings`，不再各自 `load_dotenv()` / `os.getenv`。**決策邊界**：只集中「會因部署環境而異」的值——必填的 `DB_URL`（缺值即 fail-fast，不再延遲到連線才炸）、`API_KEYS`，以及帶預設值的 `pool_size` / `max_overflow` / `pool_timeout` / `statement_timeout_ms` / `scan_interval_seconds` / `log_format`；演算法常數（`MAX_*_RETRIES`、`STALE_PROCESSING_MINUTES`）**刻意留在各自模組開頭**——它們是程式行為的一部分、不隨環境變動，改動應走 code review 而非環境變數。附 `.env.example` 範本進版控
-- [ ] Alembic DB migration
+- [v] Alembic DB migration — 以 Alembic 作為 schema 唯一真相來源，**移除 `Base.metadata.create_all`**（`create_all` 只建不改，無法承載 schema 演進）。`env.py` 從 `settings.db_url` 取連線、`import models` 註冊 `Base.metadata` 供 autogenerate；`alembic.ini` 的 `sqlalchemy.url` 留空，DB_URL 維持單一真相。`Base.metadata` 掛 **naming convention**（`ix/uq/ck/fk/pk_*`），讓約束命名穩定可預期、未來 drop/rename 不因環境命名不一致而出錯。初始 migration 以 convention 原生命名生成；schema 變更流程改為 `alembic revision --autogenerate` → review → `alembic upgrade head`
 - [ ] Docker / docker-compose（API + PostgreSQL 容器化）
 
 **Phase 4 — 分析層 Pipeline**

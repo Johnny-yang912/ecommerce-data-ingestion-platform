@@ -1,5 +1,5 @@
 """
-API Key 驗證（Phase 3 - Option A：靜態 key + 多 key 輪替）
+API Key 驗證（靜態 key + 多 key 輪替）
 
 定位說明：此服務是內部資料網格中的攝取單元，呼叫者是少數且穩定的上游服務
 （machine-to-machine），不是會自助來去的外部客戶。因此採「.env 靜態對應」而非

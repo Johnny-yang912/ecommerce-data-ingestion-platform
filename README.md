@@ -303,6 +303,8 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── models.py      # SQLAlchemy models (Raw, ODS, QualityEvent)
 ├── database.py    # Engine, SessionLocal, Base
 ├── config.py      # Centralised config (pydantic-settings Settings singleton)
+├── alembic/        # DB migrations (env.py wires settings.db_url + Base.metadata; versions/ holds scripts)
+├── alembic.ini     # Alembic config (sqlalchemy.url left blank, injected by env.py)
 ├── pytest.ini     # Test configuration (asyncio_mode, coverage)
 ├── tests/
 │   ├── conftest.py        # Shared fixtures
@@ -344,7 +346,7 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # 3. Install dependencies
-pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi alembic
 pip install pytest pytest-asyncio pytest-cov  # test dependencies
 
 # 4. Configure environment
@@ -353,10 +355,13 @@ cp .env.example .env
 #   DB_URL=postgresql://user:password@localhost/dbname
 #   API_KEYS=your_key:upstream-order-api   (format key:client_id, comma-separated for multiple)
 
-# 5. Run
+# 5. Create the database schema (Alembic migration, not create_all)
+alembic upgrade head
+
+# 6. Run
 uvicorn main:app --reload
 
-# 6. Run tests (requires .env to be configured)
+# 7. Run tests (requires .env to be configured)
 pytest
 ```
 
@@ -428,7 +433,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 **Phase 3 — Operability**
 - [v] Service-to-service authentication (API Key) — static `X-API-Key` (`.env`-loaded `key:client_id` mapping, supporting multiple keys per client for rotation), constant-time `secrets.compare_digest` comparison; mounted on all endpoints, 401 on missing/invalid; the resolved `client_id` lands as `source_client_id` (Raw + ODS) as the origin of data lineage. **No user-facing JWT** — this is an internal ingestion unit with no human users (see "Service-to-service authentication decisions")
 - [v] Centralised config management — `config.py` exposes a single `Settings` (pydantic-settings) as the source of truth, instantiated once at startup; modules read `from config import settings` instead of each calling `load_dotenv()` / `os.getenv`. **Decision boundary**: only values that vary by deployment environment are centralised — the required `DB_URL` (fail-fast on missing value instead of crashing late at first connection), `API_KEYS`, plus defaulted `pool_size` / `max_overflow` / `pool_timeout` / `statement_timeout_ms` / `scan_interval_seconds` / `log_format`. Algorithmic constants (`MAX_*_RETRIES`, `STALE_PROCESSING_MINUTES`) **deliberately stay at the top of their own modules** — they are part of program behaviour, not environment, so changing them should go through code review rather than an env var. Ships with a version-controlled `.env.example` template
-- [ ] Alembic migrations
+- [v] Alembic migrations — Alembic is the single source of truth for schema; **`Base.metadata.create_all` removed** (`create_all` only creates, never alters — it cannot carry schema evolution). `env.py` pulls the connection from `settings.db_url` and `import models` to register `Base.metadata` for autogenerate; `alembic.ini`'s `sqlalchemy.url` is left blank so DB_URL stays a single source of truth. `Base.metadata` carries a **naming convention** (`ix/uq/ck/fk/pk_*`) so constraint names are stable and predictable, and future drop/rename won't break on environment-inconsistent names. The initial migration is generated with convention-native names; schema changes now flow through `alembic revision --autogenerate` → review → `alembic upgrade head`
 - [ ] Docker / docker-compose (API + PostgreSQL containerisation)
 
 **Phase 4 — Analytics Pipeline**

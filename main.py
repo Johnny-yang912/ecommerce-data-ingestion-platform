@@ -72,6 +72,13 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
+@app.get("/health")
+async def health():
+    # liveness：行程活著即回 200。不掛 verify_api_key（healthcheck 不帶 key）、
+    # 不掛 limiter（不消耗速率配額）。容器 healthcheck 與未來 LB/K8s 探針用。
+    return {"status": "ok"}
+
+
 @app.post("/orders")
 @limiter.limit("60/minute")
 async def create_order(request: Request, order: OrderIN, background_tasks: BackgroundTasks,

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+.env.*
+!.env.example
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+*:Zone.Identifier
+load_test.py
+restart_test.sh
+*.db

@@ -276,6 +276,7 @@ All endpoints require an `X-API-Key` header (see "Service-to-service authenticat
 | `POST` | `/orders` | Ingest a new order (writes Raw, triggers background task) |
 | `POST` | `/process_raw/{raw_id}` | Manually replay a raw record (`?force=true` resets status) |
 | `GET` | `/raw/{raw_id}` | Query raw record status and payload preview |
+| `GET` | `/health` | Liveness probe — **no `X-API-Key` required**, returns `{"status": "ok"}` (used by the container healthcheck and future LB/K8s probes) |
 
 ---
 
@@ -367,6 +368,26 @@ pytest
 
 API docs available at `http://localhost:8000/docs`
 
+### Run with Docker (recommended)
+
+The repository ships a `Dockerfile` + `docker-compose.yml` that bring up PostgreSQL, run the Alembic migration, then start the API — one command, no local Python/Postgres setup:
+
+```bash
+# 1. Set API_KEYS (and optionally POSTGRES_USER/PASSWORD/DB) in .env
+cp .env.example .env
+
+# 2. Build and start: db → migrate (alembic upgrade head) → api
+docker compose up --build
+```
+
+- `db` (postgres:16) starts first; `pg_isready` healthcheck gates the rest.
+- A one-shot `migrate` service runs `alembic upgrade head` and exits.
+- `api` only starts once the DB is healthy **and** the migration has completed successfully (`service_completed_successfully`).
+- `DB_URL` is injected by Compose pointing at the `db` service — it overrides the `.env` value (env vars outrank the `.env` file in pydantic-settings), so no code change is needed. `.env` is **not** baked into the image; secrets are injected at runtime.
+- The API runs with `--workers 1` on purpose: `BackgroundTasks` and the periodic recovery scan are in-process state, so multiple workers would each run their own scan loop. Horizontal scaling waits on the Phase 5 queue (Redis/Celery).
+
+API available at `http://localhost:8000` (docs at `/docs`, health at `/health`).
+
 ---
 
 ## Target Architecture
@@ -434,7 +455,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Service-to-service authentication (API Key) — static `X-API-Key` (`.env`-loaded `key:client_id` mapping, supporting multiple keys per client for rotation), constant-time `secrets.compare_digest` comparison; mounted on all endpoints, 401 on missing/invalid; the resolved `client_id` lands as `source_client_id` (Raw + ODS) as the origin of data lineage. **No user-facing JWT** — this is an internal ingestion unit with no human users (see "Service-to-service authentication decisions")
 - [v] Centralised config management — `config.py` exposes a single `Settings` (pydantic-settings) as the source of truth, instantiated once at startup; modules read `from config import settings` instead of each calling `load_dotenv()` / `os.getenv`. **Decision boundary**: only values that vary by deployment environment are centralised — the required `DB_URL` (fail-fast on missing value instead of crashing late at first connection), `API_KEYS`, plus defaulted `pool_size` / `max_overflow` / `pool_timeout` / `statement_timeout_ms` / `scan_interval_seconds` / `log_format`. Algorithmic constants (`MAX_*_RETRIES`, `STALE_PROCESSING_MINUTES`) **deliberately stay at the top of their own modules** — they are part of program behaviour, not environment, so changing them should go through code review rather than an env var. Ships with a version-controlled `.env.example` template
 - [v] Alembic migrations — Alembic is the single source of truth for schema; **`Base.metadata.create_all` removed** (`create_all` only creates, never alters — it cannot carry schema evolution). `env.py` pulls the connection from `settings.db_url` and `import models` to register `Base.metadata` for autogenerate; `alembic.ini`'s `sqlalchemy.url` is left blank so DB_URL stays a single source of truth. `Base.metadata` carries a **naming convention** (`ix/uq/ck/fk/pk_*`) so constraint names are stable and predictable, and future drop/rename won't break on environment-inconsistent names. The initial migration is generated with convention-native names; schema changes now flow through `alembic revision --autogenerate` → review → `alembic upgrade head`
-- [ ] Docker / docker-compose (API + PostgreSQL containerisation)
+- [v] Docker / docker-compose (API + PostgreSQL containerisation) — single-stage `python:3.12-slim` image (non-root, pinned `requirements.txt`), reused by both the `api` and one-shot `migrate` services; `docker compose up` orchestrates **db (healthcheck) → migrate (`alembic upgrade head`) → api** via `depends_on` conditions (`service_healthy` + `service_completed_successfully`); `DB_URL` injected at runtime pointing at the `db` service (no code change — env vars outrank `.env`), secrets never baked into the image; API pinned to `--workers 1` (in-process `BackgroundTasks` / periodic scan); `GET /health` liveness probe added for the container healthcheck
 
 **Phase 4 — Analytics Pipeline**
 - [ ] ODS → BigQuery extraction script (Python script, incremental by `received_at` watermark)

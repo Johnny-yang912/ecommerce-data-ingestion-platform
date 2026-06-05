@@ -276,6 +276,7 @@ Periodic scan 與 startup scan 會撈出所有 `status='pending'` 的 Raw 記錄
 | `POST` | `/orders` | 寫入新訂單（存 Raw，觸發背景任務） |
 | `POST` | `/process_raw/{raw_id}` | 手動 replay 指定 raw（加 `?force=true` 可重置狀態） |
 | `GET` | `/raw/{raw_id}` | 查詢 raw 的處理狀態和 payload 預覽 |
+| `GET` | `/health` | liveness 探針 — **不需 `X-API-Key`**，回 `{"status": "ok"}`（供容器 healthcheck 與未來 LB/K8s 探針用） |
 
 ---
 
@@ -367,6 +368,26 @@ pytest
 
 跑起來之後 API 文件在 `http://localhost:8000/docs`
 
+### 用 Docker 跑（推薦）
+
+專案附 `Dockerfile` + `docker-compose.yml`，會依序拉起 PostgreSQL、跑 Alembic migration、再啟動 API —— 一個指令，本機不必裝 Python/Postgres：
+
+```bash
+# 1. 在 .env 設好 API_KEYS（POSTGRES_USER/PASSWORD/DB 可選）
+cp .env.example .env
+
+# 2. build 並啟動：db → migrate（alembic upgrade head）→ api
+docker compose up --build
+```
+
+- `db`（postgres:16）先起，`pg_isready` healthcheck 把關後續服務。
+- 一次性 `migrate` 服務跑完 `alembic upgrade head` 後退出。
+- `api` 要等 DB 健康 **且** migration 成功完成（`service_completed_successfully`）才啟動。
+- `DB_URL` 由 Compose 注入、指向 `db` 服務，會覆蓋 `.env` 內的值（pydantic-settings 中 env var 優先序高於 `.env` 檔），故**不需改任何程式碼**。`.env` **不會**烤進映像，secrets 於執行期注入。
+- API 刻意以 `--workers 1` 啟動：`BackgroundTasks` 與週期恢復掃描是行程內狀態，多 worker 會各跑一份掃描迴圈。水平擴展留待 Phase 5 的佇列（Redis/Celery）。
+
+API 位於 `http://localhost:8000`（文件 `/docs`，健康檢查 `/health`）。
+
 ---
 
 ## 預期完整架構
@@ -434,7 +455,7 @@ Looker Studio（直連 BigQuery）
 - [v] 服務對服務驗證（API Key）— 靜態 `X-API-Key`（`.env` 載入 `key:client_id` 對應，支援同 client 多把 key 做輪替），`secrets.compare_digest` constant-time 比對；掛載於全部端點，缺失/無效回 401；驗證出的 `client_id` 落地為 `source_client_id`（Raw + ODS），作為資料血緣起點。**未採 JWT 使用者登入**——本服務是內部攝取單元、無人類使用者（見〈服務對服務驗證〉設計決策）
 - [v] 環境變數集中管理 — `config.py` 以 pydantic-settings 的 `Settings` 為單一真相來源，啟動時實例化一次，各模組統一 `from config import settings`，不再各自 `load_dotenv()` / `os.getenv`。**決策邊界**：只集中「會因部署環境而異」的值——必填的 `DB_URL`（缺值即 fail-fast，不再延遲到連線才炸）、`API_KEYS`，以及帶預設值的 `pool_size` / `max_overflow` / `pool_timeout` / `statement_timeout_ms` / `scan_interval_seconds` / `log_format`；演算法常數（`MAX_*_RETRIES`、`STALE_PROCESSING_MINUTES`）**刻意留在各自模組開頭**——它們是程式行為的一部分、不隨環境變動，改動應走 code review 而非環境變數。附 `.env.example` 範本進版控
 - [v] Alembic DB migration — 以 Alembic 作為 schema 唯一真相來源，**移除 `Base.metadata.create_all`**（`create_all` 只建不改，無法承載 schema 演進）。`env.py` 從 `settings.db_url` 取連線、`import models` 註冊 `Base.metadata` 供 autogenerate；`alembic.ini` 的 `sqlalchemy.url` 留空，DB_URL 維持單一真相。`Base.metadata` 掛 **naming convention**（`ix/uq/ck/fk/pk_*`），讓約束命名穩定可預期、未來 drop/rename 不因環境命名不一致而出錯。初始 migration 以 convention 原生命名生成；schema 變更流程改為 `alembic revision --autogenerate` → review → `alembic upgrade head`
-- [ ] Docker / docker-compose（API + PostgreSQL 容器化）
+- [v] Docker / docker-compose（API + PostgreSQL 容器化）— 單階段 `python:3.12-slim` 映像（非 root、鎖版 `requirements.txt`），由 `api` 與一次性 `migrate` 服務共用；`docker compose up` 以 `depends_on` 條件（`service_healthy` + `service_completed_successfully`）編排 **db（healthcheck）→ migrate（`alembic upgrade head`）→ api**；`DB_URL` 於執行期注入、指向 `db` 服務（不需改程式碼 —— env var 優先序高於 `.env`），secrets 不烤進映像；API 固定 `--workers 1`（行程內 `BackgroundTasks` / 週期掃描）；新增 `GET /health` liveness 探針供容器 healthcheck
 
 **Phase 4 — 分析層 Pipeline**
 - [ ] ODS → BigQuery 抽取腳本（Python script，以 `received_at` 為 watermark 做增量抽取）

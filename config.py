@@ -40,5 +40,10 @@ class Settings(BaseSettings):
     # --- 日誌輸出格式：console（dev）| json（prod）---
     log_format: str = "console"
 
+    # --- Phase 4 分析管線（ODS → BigQuery）---
+    # service-account 金鑰路徑（選填）：只有抽取腳本用得到，API server 不碰 BQ，
+    # 故給空字串預設，避免每次 API 啟動就因缺值 fail。實際使用見 bq.get_bq_client()。
+    google_application_credentials: str = ""
+
 
 settings = Settings()

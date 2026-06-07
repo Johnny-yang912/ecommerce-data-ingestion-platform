@@ -1,6 +1,11 @@
-from schema import ODSOrder
-from datetime import date
+import types
+import typing
+from datetime import date, datetime
 from typing import Optional
+
+from pydantic import BaseModel
+
+from schema import ODSOrder, OrderIN
 
 DQ_RULE_VERSION = "v1"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
 
@@ -124,3 +129,132 @@ def clean_order(ods: ODSOrder) -> tuple[ODSOrder, bool, Optional[list]]:
     clean_error_message = business_errors if business_errors else None
 
     return ods, has_clean_error, clean_error_message
+
+
+# ─── Schema drift 偵測 ──────────────────────────────────────────────────────────
+#
+# 與 has_clean_error（業務值品質）平行、互不混用的獨立訊號：偵測「上游契約漂移」。
+# 依設計決策只在記錄層偵測「多欄位 #1 + 型別漂移 #4」；少欄位/改名 #2/#3 留給觀測層
+# （null-rate 監控），改名的新名字會被多欄位偵測捕捉。非阻斷：drift 不阻止資料落地。
+#
+# 預期 schema 直接從 Pydantic model 反射（model_fields / annotations），模型即契約，
+# 單一真相——新增欄位自動同步，不需另維護一份清單。
+
+class DriftCode:
+    UNEXPECTED_FIELD = "unexpected_field"   # 多了契約外的欄位
+    TYPE_DRIFT       = "type_drift"         # 已知欄位的 JSON 型別與契約不符
+    NON_OBJECT_GROUP = "non_object_group"   # 巢狀群組/陣列元素應為物件卻不是
+
+
+_SCALAR_KIND = {
+    str: "string", int: "integer", float: "number", bool: "boolean",
+    date: "string", datetime: "string",  # 日期以 ISO 字串表示
+}
+
+
+def _unwrap_optional(ann):
+    """剝掉 Optional/Union[..., None]，回傳實際型別。"""
+    origin = typing.get_origin(ann)
+    if origin is typing.Union or origin is getattr(types, "UnionType", None):
+        args = [a for a in typing.get_args(ann) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return ann
+
+
+def _expected_kind(ann):
+    """回傳 (category, payload)：
+    ("scalar", kind_str) / ("dict", SubModel) / ("list", ElemModel|None) / ("other", None)。"""
+    ann = _unwrap_optional(ann)
+    if typing.get_origin(ann) in (list, typing.List):
+        args = typing.get_args(ann)
+        elem = args[0] if args else None
+        sub = elem if (isinstance(elem, type) and issubclass(elem, BaseModel)) else None
+        return ("list", sub)
+    if isinstance(ann, type) and issubclass(ann, BaseModel):
+        return ("dict", ann)
+    if ann in _SCALAR_KIND:
+        return ("scalar", _SCALAR_KIND[ann])
+    return ("other", None)
+
+
+def _json_kind(v):
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return "null"
+
+
+def _type_compatible(expected_kind: str, actual_kind: str) -> bool:
+    if expected_kind == "number":
+        return actual_kind in ("number", "integer")  # int 進 float 欄不算漂移
+    if expected_kind in ("string", "integer", "boolean"):
+        return actual_kind == expected_kind
+    return True  # 未知預期型別不誤報
+
+
+def _walk(model, data: dict, path: str, messages: list, unmapped: dict) -> None:
+    fields = model.model_fields
+    expected = set(fields)
+
+    # 多欄位（#1）：契約外的 key → 標記 + 收進 unmapped（保留路徑與值）
+    for key, value in data.items():
+        if key not in expected:
+            full = f"{path}{key}"
+            messages.append({"code": DriftCode.UNEXPECTED_FIELD, "field": full})
+            unmapped[full] = value
+
+    # 已知欄位：純量做型別漂移（#4），巢狀則遞迴。缺欄位不在記錄層偵測（留給觀測層）。
+    for name, field_info in fields.items():
+        if name not in data:
+            continue
+        value = data[name]
+        if value is None:
+            continue
+
+        category, sub = _expected_kind(field_info.annotation)
+        full = f"{path}{name}"
+
+        if category == "scalar":
+            actual = _json_kind(value)
+            if not _type_compatible(sub, actual):
+                messages.append({"code": DriftCode.TYPE_DRIFT, "field": full,
+                                 "expected": sub, "actual": actual})
+        elif category == "dict":
+            if isinstance(value, dict):
+                _walk(sub, value, f"{full}.", messages, unmapped)
+            else:
+                messages.append({"code": DriftCode.NON_OBJECT_GROUP, "field": full,
+                                 "actual": _json_kind(value)})
+        elif category == "list":
+            if isinstance(value, list):
+                if sub is not None:
+                    for i, elem in enumerate(value):
+                        if isinstance(elem, dict):
+                            _walk(sub, elem, f"{full}[{i}].", messages, unmapped)
+                        else:
+                            messages.append({"code": DriftCode.NON_OBJECT_GROUP,
+                                             "field": f"{full}[{i}]", "actual": _json_kind(elem)})
+            else:
+                messages.append({"code": DriftCode.NON_OBJECT_GROUP, "field": full,
+                                 "actual": _json_kind(value)})
+        # "other" → 不檢查
+
+
+def detect_schema_drift(payload: dict) -> tuple[bool, Optional[list], Optional[dict]]:
+    """偵測上游契約漂移。回傳 (has_schema_drift, schema_drift_message, unmapped_fields)。"""
+    messages: list = []
+    unmapped: dict = {}
+    if isinstance(payload, dict):
+        _walk(OrderIN, payload, "", messages, unmapped)
+    has_drift = len(messages) > 0
+    return has_drift, (messages or None), (unmapped or None)

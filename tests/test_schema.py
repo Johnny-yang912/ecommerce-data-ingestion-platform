@@ -6,7 +6,8 @@ ODSOrder.from_nested：把巢狀的 POST payload 攤平為 ODS 扁平 model。
 """
 
 import pytest
-from schema import ODSOrder
+from pydantic import ValidationError
+from schema import ODSOrder, OrderIN
 
 
 FULL_PAYLOAD = {
@@ -157,3 +158,45 @@ class TestODSOrderFromNested:
         assert ods.returned is None
         assert ods.payment_method is None
         assert ods.tax_pct is None
+
+    # ── 防禦性：巢狀群組送成非 dict（#10）不應崩潰 ────────────────────────────
+
+    def test_non_dict_nested_group_does_not_crash(self):
+        """customer 送成字串 → 攤平不崩潰，顧客欄位皆 None。"""
+        payload = {**FULL_PAYLOAD, "customer": "just-a-string"}
+        ods = ODSOrder.from_nested(payload)
+        assert ods.customer_id is None
+        assert ods.customer_name is None
+
+    def test_non_dict_behavior_does_not_crash(self):
+        payload = {**FULL_PAYLOAD, "behavior": ["unexpected", "list"]}
+        ods = ODSOrder.from_nested(payload)
+        assert ods.device_used is None
+        assert ods.customer_rating is None
+
+
+# ─── order_id 為唯一硬閘門（OrderIN / ODSOrder 放寬）──────────────────────────
+
+class TestOrderIdOnlyHardGate:
+
+    def test_orderin_accepts_only_order_id(self):
+        """OrderIN 只有 order_id 必填，其餘缺失皆可通過（落地）。"""
+        order = OrderIN(order_id="ORD-X")
+        assert order.order_id == "ORD-X"
+        assert order.customer is None
+        assert order.items is None
+
+    def test_orderin_missing_order_id_is_rejected(self):
+        """缺 order_id → 仍 422（唯一硬閘門）。"""
+        with pytest.raises(ValidationError):
+            OrderIN(order_date="2024-01-01", customer={"customer_id": "C1"})
+
+    def test_odsorder_accepts_only_order_id(self):
+        ods = ODSOrder(order_id="ORD-X")
+        assert ods.order_id == "ORD-X"
+        assert ods.customer_id is None
+        assert ods.order_date is None
+
+    def test_odsorder_missing_order_id_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ODSOrder(order_date="2024-01-01")

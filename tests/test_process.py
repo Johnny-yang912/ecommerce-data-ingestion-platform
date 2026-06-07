@@ -29,7 +29,7 @@ from process import (
     MAX_PROCESS_RETRIES,
     MAX_STATUS_RETRIES,
 )
-from models import QualityEvent
+from models import QualityEvent, ODS
 from helpers import (
     make_mock_db, claim_result, select_result,
     no_ods_result, existing_ods_result, make_mock_raw, VALID_PAYLOAD,
@@ -589,6 +589,48 @@ class TestQualityEvents:
         events = _quality_events_from_add(mock_db)
         assert len(events) == 1
         assert mock_db.rollback.call_count == 1
+
+    def _ods_from_add(self, mock_db):
+        return [c[0][0] for c in mock_db.add.call_args_list if isinstance(c[0][0], ODS)]
+
+    def test_schema_drift_columns_written_and_logged(self):
+        """payload 有契約外欄位 → ODS 帶 has_schema_drift/unmapped_fields，並發 schema_drift log。"""
+        drift_payload = {**VALID_PAYLOAD, "loyalty_points": 99}
+        mock_raw = make_mock_raw(drift_payload)
+        mock_db = make_mock_db(
+            exec_results=[claim_result(1), select_result(mock_raw), no_ods_result(), MagicMock()],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch.object(process.logger, "warning") as mock_warning:
+            process_raw_event(1)
+
+        ods = self._ods_from_add(mock_db)[0]
+        assert ods.has_schema_drift is True
+        assert ods.unmapped_fields == {"loyalty_points": 99}
+        assert ods.schema_drift_message is not None
+        assert any(c[0][0] == "schema_drift" for c in mock_warning.call_args_list)
+
+    def test_clean_payload_has_no_schema_drift(self):
+        """乾淨 payload → has_schema_drift=False、message/unmapped 為 None，不發 schema_drift log。"""
+        mock_raw = make_mock_raw()  # VALID_PAYLOAD
+        mock_db = make_mock_db(
+            exec_results=[claim_result(1), select_result(mock_raw), no_ods_result(), MagicMock()],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch.object(process.logger, "warning") as mock_warning:
+            process_raw_event(1)
+
+        ods = self._ods_from_add(mock_db)[0]
+        assert ods.has_schema_drift is False
+        assert ods.schema_drift_message is None
+        assert ods.unmapped_fields is None
+        assert not any(c[0][0] == "schema_drift" for c in mock_warning.call_args_list)
 
     def test_quality_metric_log_emitted_on_success(self):
         """

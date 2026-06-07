@@ -42,7 +42,8 @@ class ODS(Base):
     returned = Column(Boolean, nullable=True)
 
     # 顧客
-    customer_id = Column(String(50), nullable=False, index=True)
+    # order_id 是唯一硬閘門；customer_id 缺失改為可落地（nullable）+ 由 schema drift 訊號標記
+    customer_id = Column(String(50), nullable=True, index=True)
     customer_name = Column(String(255), nullable=True)
     age = Column(Integer, nullable=True)
     gender = Column(String(32), nullable=True)
@@ -72,9 +73,16 @@ class ODS(Base):
     # items 整包 (清理與攤平後使用JSONB存儲，方便後續分析和查詢)
     items = Column(JSONB, nullable=True)
 
-    # 清洗錯誤標籤
+    # 清洗錯誤標籤（業務值品質）
     has_clean_error = Column(Boolean, nullable=False, default=False)
     clean_error_message = Column(JSONB, nullable=True)
+
+    # Schema drift 標籤（上游契約漂移，與 has_clean_error 平行、互不混用的獨立訊號）
+    # 非阻斷：drift 不會把乾淨訂單踢出下游 Gold，僅作監控訊號
+    has_schema_drift = Column(Boolean, nullable=False, default=False)
+    schema_drift_message = Column(JSONB, nullable=True)
+    # 收容上游多送的未知欄位（保留路徑與值），讓「多欄位」也能落地、不靜默丟失
+    unmapped_fields = Column(JSONB, nullable=True)
 
     # 品質評估版本（攝入時使用的規則版本，之後永遠不動）
     dq_rule_version = Column(String(10), nullable=True)

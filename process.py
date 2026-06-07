@@ -8,7 +8,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from pytz import UTC
-from clean import clean_order, DQ_RULE_VERSION
+from clean import clean_order, detect_schema_drift, DQ_RULE_VERSION
 from sqlalchemy.exc import OperationalError, IntegrityError, DataError
 
 logger = structlog.get_logger()
@@ -88,6 +88,10 @@ def process_raw_event(raw_id: int) -> None:
                 if has_clean_error:
                     logger.warning("資料品質問題", order_id=ods_order.order_id, clean_error_message=clean_error_message)
 
+                # schema drift（上游契約漂移）：與 has_clean_error 平行的獨立非阻斷訊號，
+                # 跑在原始 payload 上以看見原始型別與多餘欄位（log 延後到 success path，避免 retry 重複記）。
+                has_schema_drift, schema_drift_message, unmapped_fields = detect_schema_drift(payload)
+
                 ods = ODS(
                     raw_id=raw_id,
                     order_id=ods_order.order_id,
@@ -126,6 +130,9 @@ def process_raw_event(raw_id: int) -> None:
 
                     has_clean_error=has_clean_error,
                     clean_error_message=clean_error_message,
+                    has_schema_drift=has_schema_drift,
+                    schema_drift_message=schema_drift_message,
+                    unmapped_fields=unmapped_fields,
                     dq_rule_version=DQ_RULE_VERSION,
                     # 血緣：從 raw 取（非 payload），隨錨點落地到 ODS
                     source_client_id=raw.source_client_id,
@@ -197,6 +204,12 @@ def process_raw_event(raw_id: int) -> None:
                     order_id=ods_order.order_id,
                     error_fields=clean_error_message,
                 )
+                if has_schema_drift:
+                    logger.warning("schema_drift",
+                        order_id=ods_order.order_id,
+                        schema_drift_message=schema_drift_message,
+                        unmapped_fields=unmapped_fields,
+                    )
                 break
             except IntegrityError:
                 db.rollback()

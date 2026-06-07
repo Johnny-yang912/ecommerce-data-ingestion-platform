@@ -1,6 +1,8 @@
 import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -70,6 +72,19 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(RequestContextMiddleware)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RequestValidationError)
+async def _on_validation_error(request: Request, exc: RequestValidationError):
+    # 攝入硬閘門（order_id 必填 / 型別不可強轉）擋下的請求不會落地 Raw，
+    # 在此記一筆訊號，讓「上游開始送壞資料」也進得了可觀測性，而非只在 access log 浮現。
+    logger.warning(
+        "ingress_rejected",
+        path=request.url.path,
+        method=request.method,
+        errors=[{"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")} for e in exc.errors()],
+    )
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.get("/health")

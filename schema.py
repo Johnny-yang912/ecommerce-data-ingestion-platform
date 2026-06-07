@@ -5,7 +5,7 @@ from datetime import datetime, date
 # --- 子群組 ---
 
 class CustomerInfo(BaseModel):
-    customer_id: str
+    customer_id: Optional[str] = None
     customer_name: Optional[str] = None
     age: Optional[int] = None
     gender: Optional[str] = None
@@ -26,7 +26,7 @@ class AddressInfo(BaseModel):
 
 
 class ProductInfo(BaseModel):
-    product_id: str
+    product_id: Optional[str] = None
     product_name: Optional[str] = None
     category: Optional[str] = None
     sub_category: Optional[str] = None
@@ -40,9 +40,9 @@ class PaymentInfo(BaseModel):
 
 
 class OrderItemInfo(BaseModel):
-    product: ProductInfo
-    quantity: int
-    unit_price: float
+    product: Optional[ProductInfo] = None
+    quantity: Optional[int] = None
+    unit_price: Optional[float] = None
     cost_price: Optional[float] = None
     discount_pct: Optional[float] = None
     shipping_fee: Optional[float] = None
@@ -56,28 +56,30 @@ class BehaviorInfo(BaseModel):
 
 # --- 主體 ---
 
+# order_id 為唯一硬閘門：缺 order_id → 422（不落地）；其餘欄位缺失皆可落地，
+# 結構/型別漂移由 detect_schema_drift 標記為 has_schema_drift（非阻斷）。
 class OrderIN(BaseModel):
     order_id: str
-    order_date: date
+    order_date: Optional[date] = None
     ship_mode: Optional[str] = None
     order_status: Optional[str] = None
     delivery_date: Optional[date] = None
     delivery_days: Optional[int] = None
     returned: Optional[bool] = None
 
-    customer: CustomerInfo
-    address: AddressInfo
-    items: list[OrderItemInfo]
-    payment: PaymentInfo
+    customer: Optional[CustomerInfo] = None
+    address: Optional[AddressInfo] = None
+    items: Optional[list[OrderItemInfo]] = None
+    payment: Optional[PaymentInfo] = None
     behavior: Optional[BehaviorInfo] = None
 
 
 
 #攤平
 class ODSOrder(BaseModel):
-    # 訂單主體
+    # 訂單主體（order_id 唯一必填，與 OrderIN 一致；其餘缺失可落地）
     order_id: str
-    order_date: date
+    order_date: Optional[date] = None
     ship_mode: Optional[str] = None
     order_status: Optional[str] = None
     delivery_date: Optional[date] = None
@@ -85,7 +87,7 @@ class ODSOrder(BaseModel):
     returned: Optional[bool] = None
 
     # 顧客
-    customer_id: str
+    customer_id: Optional[str] = None
     customer_name: Optional[str] = None
     age: Optional[int] = None
     gender: Optional[str] = None
@@ -117,10 +119,15 @@ class ODSOrder(BaseModel):
 
     @classmethod
     def from_nested(cls, payload: dict):
-        customer = payload.get("customer", {})
-        address = payload.get("address", {})
-        payment = payload.get("payment", {})
-        behavior = payload.get("behavior", {}) or {}
+        # 防禦性：上游可能把巢狀群組送成非 dict（字串/陣列），直接 .get() 會 AttributeError。
+        # 視為空 dict 讓攤平不崩潰（該結構漂移另由 detect_schema_drift 標記）。
+        def _as_dict(v):
+            return v if isinstance(v, dict) else {}
+
+        customer = _as_dict(payload.get("customer"))
+        address = _as_dict(payload.get("address"))
+        payment = _as_dict(payload.get("payment"))
+        behavior = _as_dict(payload.get("behavior"))
 
         return cls(
             # 訂單主體

@@ -16,6 +16,7 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from sqlalchemy.exc import OperationalError
 from fastapi import BackgroundTasks
+from fastapi.exceptions import RequestValidationError
 
 import main
 from main import create_order, MAX_RAW_WRITE_RETRIES
@@ -99,3 +100,24 @@ class TestNulByteHandling:
         assert "\x00" not in raw_obj.raw_payload
         assert mock_warning.called
         assert result == {"raw_id": 1, "status": "pending"}
+
+
+class TestIngressRejectedHandler:
+
+    async def test_validation_error_logged_and_returns_422(self, mock_request):
+        """攝入硬閘門擋下的請求 → 記 ingress_rejected 訊號，且仍回 422。"""
+        exc = RequestValidationError([
+            {"loc": ("body", "order_id"), "msg": "field required", "type": "missing"},
+        ])
+
+        with patch.object(main.logger, "warning") as mock_warning:
+            response = await main._on_validation_error(mock_request, exc)
+
+        assert response.status_code == 422
+        assert any(c[0][0] == "ingress_rejected" for c in mock_warning.call_args_list)
+
+
+class TestHealth:
+
+    async def test_health_returns_ok(self):
+        assert await main.health() == {"status": "ok"}

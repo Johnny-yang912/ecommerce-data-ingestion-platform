@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta
 from pytz import UTC
 from clean import clean_order, DQ_RULE_VERSION
-from sqlalchemy.exc import OperationalError, IntegrityError
+from sqlalchemy.exc import OperationalError, IntegrityError, DataError
 
 logger = structlog.get_logger()
 
@@ -207,6 +207,13 @@ def process_raw_event(raw_id: int) -> None:
                                existing_raw_id=existing_ods.raw_id if existing_ods else None)
                 _commit_raw_status(db, raw_id, "duplicate",
                                    f"race condition: order_id {ods_order.order_id} 已由 raw_id={existing_ods.raw_id if existing_ods else '?'} 寫入 ODS")
+                return
+            except DataError as e:
+                # 欄位長度超限等資料層錯誤是 deterministic（重試必然再失敗），
+                # 直接 fast-fail 到終態 error，避免卡在 processing 被 scan 反覆重排（poison-pill）。
+                db.rollback()
+                logger.error("ODS 寫入 DataError（如欄位長度超限），標記 error", error=str(e))
+                _commit_raw_status(db, raw_id, "error", f"DataError: {type(e).__name__}: {e}")
                 return
             except Exception as e:
                 db.rollback()

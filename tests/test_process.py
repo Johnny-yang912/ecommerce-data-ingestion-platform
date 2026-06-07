@@ -19,7 +19,7 @@ Idempotency               : pre-check 攔截 / IntegrityError TOCTOU race
 
 import pytest
 from unittest.mock import MagicMock, patch
-from sqlalchemy.exc import OperationalError, IntegrityError
+from sqlalchemy.exc import OperationalError, IntegrityError, DataError
 
 import process
 from process import (
@@ -343,6 +343,44 @@ class TestStatusCommitRetry:
         assert mock_critical.called
         # (ods + quality_event) × initial(1) + re-add × (MAX-1) = MAX_STATUS_RETRIES * 2
         assert mock_db.add.call_count == MAX_STATUS_RETRIES * 2
+
+
+# ─── DataError fast-fail（欄位長度超限等資料層錯誤）─────────────────────────
+
+class TestDataErrorFastFail:
+
+    def test_data_error_on_ods_commit_marks_error_without_retry(self):
+        """
+        ODS 寫入觸發 DataError（如欄位長度超限）→ fast-fail 終態 error，不重試。
+        驗證：deterministic 失敗不會卡在 processing 被反覆重排（poison-pill）。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),   # pre-check
+                MagicMock(),       # UPDATE status（success commit，將 DataError）
+                MagicMock(),       # _commit_raw_status：UPDATE error
+            ],
+            commit_effects=[
+                None,                                       # claim
+                DataError("value too long", None, None),    # success commit → DataError
+                None,                                       # _commit_raw_status
+            ],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch.object(process.logger, "error") as mock_error:
+            process_raw_event(1)
+
+        # claim + 失敗的 success commit + error status = 3 次 commit
+        assert mock_db.commit.call_count == 3
+        assert mock_db.rollback.call_count == 1
+        # ods + quality_event 各只 add 一次，DataError 後不重試、不 re-add
+        assert mock_db.add.call_count == 2
+        assert mock_error.called
 
 
 # ─── Idempotency: first-write-wins ───────────────────────────────────────────

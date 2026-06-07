@@ -90,7 +90,13 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
         # landing 層語意：請求已通過 OrderIN 結構驗證（壞資料在邊界以 422 擋掉），
         # 此處逐字保留原始 request body，不做序列化/欄位過濾，避免上游 schema drift
         # 時靜默丟失未知欄位。order_id 另外抽出作為關鍵追溯欄位。
-        payload_text = (await request.body()).decode("utf-8")
+        # PostgreSQL 的 TEXT/VARCHAR 無法儲存 NUL byte（\x00），含 NUL 的 payload 直接寫入
+        # 會在 commit 拋非 OperationalError 例外、不被下方 retry 攔截 → 500、訂單連 Raw 都進不來。
+        # 此處先移除 NUL 讓資料得以落地，並記一筆 warning 作為上游異常訊號。
+        raw_body = (await request.body()).decode("utf-8")
+        payload_text = raw_body.replace("\x00", "")
+        if len(payload_text) != len(raw_body):
+            logger.warning("payload 含 NUL byte，已移除後落地", order_id=order.order_id)
 
         raw = Raw(
             raw_payload=payload_text,

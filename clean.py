@@ -18,6 +18,17 @@ class DQCode:
     DELIVERY_BEFORE_ORDER        = "delivery_before_order"
     CUSTOMER_RATING_OUT_OF_RANGE = "customer_rating_out_of_range"
     AGE_OUT_OF_RANGE             = "age_out_of_range"
+    FIELD_TOO_LONG               = "field_too_long"
+
+
+# 自由文字欄位的「軟性」長度上限：超過則標記 has_clean_error（資料仍落地 ODS），
+# 由下游 quarantine 處理——對應「接受一定程度的意外，但標記出來」。
+# 此閾值刻意低於 models.py 的 DB 欄位硬牆（customer_name 255 / city 128）：
+# 偏長 → 軟規則標記並落地；離譜塞爆 → 撞 DB 硬牆，由 process.py 的 DataError fast-fail 終態 error。
+SOFT_MAX_LENGTHS = {
+    "customer_name": 100,
+    "city": 80,
+}
 
 
 def format_clean(ods: ODSOrder) -> ODSOrder:
@@ -95,6 +106,12 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
     # age 0~120
     if ods.age is not None and not (0 <= ods.age <= 120):
         errors.append({"code": DQCode.AGE_OUT_OF_RANGE, "field": "age", "value": ods.age})
+
+    # 自由文字欄位軟性長度上限（超過則標記，資料仍落地；硬牆與 fast-fail 為下一道防線）
+    for field, max_len in SOFT_MAX_LENGTHS.items():
+        value = getattr(ods, field, None)
+        if value is not None and len(value) > max_len:
+            errors.append({"code": DQCode.FIELD_TOO_LONG, "field": field, "length": len(value), "max": max_len})
 
     return ods, errors
 

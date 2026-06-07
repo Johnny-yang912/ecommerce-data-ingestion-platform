@@ -35,37 +35,37 @@ class ODS(Base):
     # 訂單主體
     order_id = Column(String(50), nullable=False, index=True, unique=True)
     order_date = Column(Date, nullable=True)
-    ship_mode = Column(String(50), nullable=True)
-    order_status = Column(String(20), nullable=True)
+    ship_mode = Column(String(64), nullable=True)
+    order_status = Column(String(64), nullable=True)
     delivery_date = Column(Date, nullable=True)
     delivery_days = Column(Integer, nullable=True)
     returned = Column(Boolean, nullable=True)
 
     # 顧客
     customer_id = Column(String(50), nullable=False, index=True)
-    customer_name = Column(String(100), nullable=True)
+    customer_name = Column(String(255), nullable=True)
     age = Column(Integer, nullable=True)
-    gender = Column(String(20), nullable=True)
-    membership_tier = Column(String(20), nullable=True)
+    gender = Column(String(32), nullable=True)
+    membership_tier = Column(String(64), nullable=True)
     registration_date = Column(Date, nullable=True)
-    acquisition_channel = Column(String(50), nullable=True)
+    acquisition_channel = Column(String(64), nullable=True)
     newsletter_subscribed = Column(Boolean, nullable=True)
-    preferred_payment_method = Column(String(50), nullable=True)
-    preferred_device = Column(String(50), nullable=True)
+    preferred_payment_method = Column(String(64), nullable=True)
+    preferred_device = Column(String(64), nullable=True)
 
     # 地址
-    country = Column(String(50), nullable=True)
-    region = Column(String(50), nullable=True)
-    state = Column(String(50), nullable=True)
-    city = Column(String(50), nullable=True)
-    postal_code = Column(String(20), nullable=True)
+    country = Column(String(64), nullable=True)
+    region = Column(String(64), nullable=True)
+    state = Column(String(64), nullable=True)
+    city = Column(String(128), nullable=True)
+    postal_code = Column(String(32), nullable=True)
 
     # 金流
-    payment_method = Column(String(50), nullable=True)
+    payment_method = Column(String(64), nullable=True)
     tax_pct = Column(Float, nullable=True)
 
     # 行為
-    device_used = Column(String(50), nullable=True)
+    device_used = Column(String(64), nullable=True)
     customer_rating = Column(Float, nullable=True)
     is_repeat_customer = Column(Boolean, nullable=True)
 

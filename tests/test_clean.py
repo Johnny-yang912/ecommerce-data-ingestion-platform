@@ -205,6 +205,26 @@ class TestBusinessClean:
         _, errors = business_clean(ods)
         assert not any(e["field"] == "age" for e in errors)
 
+    # ── 自由文字欄位軟性長度上限（2b）────────────────────────────────────────
+
+    def test_customer_name_over_soft_limit_is_flagged(self):
+        """customer_name 超過軟性上限（100）→ 標記 field_too_long，但資料仍落地。"""
+        ods = make_ods(customer_name="x" * 101)
+        _, errors = business_clean(ods)
+        assert any(e["field"] == "customer_name" and e["code"] == "field_too_long" for e in errors)
+
+    def test_customer_name_at_soft_limit_is_valid(self):
+        """customer_name 等於軟性上限（100）→ 不標記。"""
+        ods = make_ods(customer_name="x" * 100)
+        _, errors = business_clean(ods)
+        assert not any(e["field"] == "customer_name" for e in errors)
+
+    def test_city_over_soft_limit_is_flagged(self):
+        """city 超過軟性上限（80）→ 標記 field_too_long。"""
+        ods = make_ods(city="x" * 81)
+        _, errors = business_clean(ods)
+        assert any(e["field"] == "city" and e["code"] == "field_too_long" for e in errors)
+
     def test_multiple_violations_all_accumulated(self):
         """多個規則同時違反，全部錯誤都要被累積，不提前 return。"""
         ods = make_ods(

@@ -47,6 +47,89 @@ dbt rpt_*
 
 ---
 
+## 攝入層：上游異常與雙訊號治理
+
+ODS 攝入邊界產生兩個**互不混用、權限不同**的品質訊號。核心原則：**「資料的值對不對」與「上游契約變了沒」是兩件事，分開標記、分開處置。**
+
+### 兩個訊號的權限分界
+
+| 面向 | `has_clean_error` | `has_schema_drift` |
+|---|---|---|
+| 語意 | 這筆資料的**值**有業務問題 | 上游送來的**結構/契約**變了 |
+| 典型來源 | 數量≤0、評分超範圍、NaN/Inf、未來日期、超長文字、數值 sentinel | 多欄位、改名新欄、型別漂移、巢狀群組非物件 |
+| 訊息欄位 | `clean_error_message` | `schema_drift_message` + `unmapped_fields` |
+| **對 Gold 的權限** | **可攔截**：`int_*` 以 `WHERE has_clean_error=FALSE` 把它擋進 quarantine | **不可攔截**：值乾淨的訂單即使有 drift 仍流入 Gold；drift 純為監控訊號 |
+| 進 `quality_events` 狀態機？ | ✅ 是（`initial_evaluation` → `clean`/`quarantined` → `promoted`…） | ❌ 否（非品質狀態演進，屬 ops 訊號） |
+| 與規則版本相關？ | ✅ 隨 `DQ_RULE_VERSION` 演進 | ❌ 與規則版本無關，與「程式對 schema 的對映」有關 |
+| Remediation 路徑 | **Proposal B**（規則升版重評估）／`force=True`（pipeline 失敗重跑） | **工程行動**：與上游對齊契約／新增欄位對映／更新 Pydantic model——**不是**規則重評估 |
+| 觀測 | `quality_metric` log、`rpt_quality_*` | `schema_drift` log、`ingress_rejected` log、（Phase 4）drift 率監控 |
+
+一句話：`has_clean_error` 有「把資料擋出 Gold」的權限；`has_schema_drift` **沒有**——它只能告警，要求人去對齊契約。
+
+### 四象限：兩訊號組合 → 處置 → 結果
+
+| `has_clean_error` | `has_schema_drift` | 情況 | 處置 | 結果 |
+|:---:|:---:|---|---|---|
+| FALSE | FALSE | 完全乾淨 | 正常流入 | 進 Gold（`dim_*`/`fct_*`）；`quality_events` → `clean` |
+| TRUE | FALSE | 值有業務問題 | `int_*` Row Filter 攔截 | 進 `int_orders_quarantine`；`quality_events` → `quarantined`；走 Proposal B |
+| FALSE | TRUE | 契約變了但**值乾淨** | **仍流入 Gold** + drift 告警 | 進 Gold（不被擋）；同時通知工程端對齊契約／補欄位對映 |
+| TRUE | TRUE | 值有問題**且**契約也變 | 因 `has_clean_error` 被攔 + drift 告警 | 進 quarantine（值問題走 Proposal B）；drift 另由工程端處理。**兩條路各自獨立** |
+
+關鍵：第三象限是設計重點——**一筆只是多了 `loyalty_points` 的好訂單，不會因此被踢出 Gold**；這正是當初選擇「獨立訊號」而非共用 `has_clean_error` 的理由。
+
+### 上游可能的異常與應對（15 項對照）
+
+| 異常 | 訊號 / 機制 | 結果 |
+|---|---|---|
+| 多一個沒見過的欄位 | `has_schema_drift`（`UNEXPECTED_FIELD`） | 落地；新欄存入 `unmapped_fields`，原欄正常 |
+| 少一個預期欄位 | ingress 放寬（落地 NULL）；偵測留觀測層 | 落地為 NULL；少欄位偵測由 Phase 4 null-rate 監控 |
+| 改名 | 新名→`UNEXPECTED_FIELD`；舊名→NULL | 新名標記+收容；舊名 NULL |
+| 改型別 | 可強轉→`TYPE_DRIFT`；硬錯→422 | 可強轉落地+標記；硬型別錯 422 + `ingress_rejected` |
+| 改日期格式 / 時區 | 格式錯→422；時區→契約約定 | 格式錯 422+log；時區屬明文契約（見設計邊界） |
+| 沒見過的 enum | 落地；長度由超長處理；偵測留 dbt | 新值落地；超長不卡死；Phase 4 `accepted_values`（warn） |
+| 語意漂移 | — | 留 Phase 4–5 分佈監控（規則抓不到） |
+| 沒有資料 | — | 留 Phase 5 OTel volume/freshness 告警 |
+| 同 order_id 重送 | 既有 idempotency | first-write-wins，重複標 `duplicate` |
+| 巢狀結構非物件 | `has_schema_drift`（`NON_OBJECT_GROUP`）+ 防禦守衛 | 不崩潰；標記，該群組落地為 NULL |
+| sentinel / 假空值 | `format_clean` 正規化（字串）；range check（數值） | 字串 sentinel→NULL；數值 sentinel 標 `has_clean_error` |
+| 超長字串爆長度 | `has_clean_error`（`FIELD_TOO_LONG`）+ DB 硬牆 fast-fail | 偏長→標記落地；離譜→終態 `error`（不再卡死） |
+| NUL byte | 寫入前 strip + warning | 移除後落地，不再 500 掉單 |
+| NaN / Infinity | `has_clean_error`（`NON_FINITE_NUMBER`） | 標記落地、下游 quarantine、不毒化聚合 |
+| 未來日期 / 時鐘回撥 | `has_clean_error`（`ORDER_DATE_IN_FUTURE`）；抽取 `>=` | 未來日期標記；回撥由增量抽取 `>=` 緩解 |
+
+### 與 `DQ_RULE_VERSION` 的關係
+
+`DQ_RULE_VERSION` 只版本化**業務值評估規則**（`business_clean`），不版本化 schema 對映。兩者是正交的軸：
+
+> **上游契約變動本身不 bump `DQ_RULE_VERSION`**；只有當你因應而修改了 `business_clean`（值評估規則）時才 bump。
+
+但兩者之間存在一條**間接因果鏈**：schema drift（上游變動）常常**逼你修改一條業務規則**——例如新增的 enum 值要納入驗證、語意漂移要收緊 range、新對映的欄位要加範圍檢查——那一刻才 bump。所以「schema drift 間接導致 bump」在實務上常見，但要說精準：bump 的觸發點是「**你動了 `business_clean`**」，不是「上游動了」。
+
+bump 判準：**同一筆 raw payload 重跑一次，`has_clean_error` / `clean_error_message` 會不會得到不同結果？**
+
+| 改動 | 會改變值評估結果嗎 | bump？ |
+|---|---|---|
+| 新增/修改 `business_clean` 規則（新檢查、改閾值） | ✅ | **要** |
+| `format_clean` 改動且**影響後續判定**（如新 sentinel→NULL 改變了會被標記的值） | ✅ | **要** |
+| 新增欄位對映（`from_nested` 多撈一欄） | ❌ | 不用（走 code review／migration） |
+| 改名重新對映 | ❌ | 不用 |
+| `detect_schema_drift` 偵測邏輯改動 | ❌（屬另一個訊號，不碰 `has_clean_error`） | 不用 |
+
+**本次 v1 → v2 的 bump**：攝入層強化新增了 `FIELD_TOO_LONG`、`NON_FINITE_NUMBER`、`ORDER_DATE_IN_FUTURE` 三條 `business_clean` 規則，並以 sentinel 正規化影響值評估——同一筆 raw 重跑會得到不同的 `has_clean_error`，故 bump。此次規則是**變嚴**（標記更多），只往後生效即可、**不需回溯重評估**；回溯只在規則放寬要 promote 舊 quarantine 時才做（對應狀態機的 `re_quarantined` 邊緣情況）。
+
+### 觀測與告警
+
+- **逐筆**：`quality_metric`（含 `has_clean_error`）、`schema_drift`（drift 詳情）、`ingress_rejected`（被硬閘門擋下、不落地者）。
+- **批次**（Phase 4）：`rpt_quality_*` 之外，可加 **drift 率門檻告警**（類比 Hard Gate，但 drift 率超標只**告警不中止** run——因 drift 不具攔截權限）。
+
+### 設計邊界
+
+- **order_id 為唯一硬閘門**：缺 order_id → 422（不落地，記 `ingress_rejected`）；其餘欄位缺失／型別／結構問題一律「落地 + 標記」，把判斷下放。
+- **時區語意屬契約，非演算法**：裸 `order_date` 無法偵測時區漂移，以明文契約約定（UTC）解決；附帶的未來日期防線僅為健全性檢查。
+- **`quality_events` 不記 schema drift**：維持其作為「業務品質狀態機」的語意純淨（與〈版本號與 quality_events 表〉的語意邊界一致）。
+
+---
+
 ## 攔截機制（Q1）
 
 兩個機制並用，覆蓋不同層次的問題。
@@ -165,7 +248,7 @@ promoted
 
 ```python
 # clean.py
-DQ_RULE_VERSION = "v1"    # 每次規則改動時 bump，搭配 git tag 記錄變更內容
+DQ_RULE_VERSION = "v2"    # 每次規則改動時 bump，搭配 git tag 記錄變更內容
 ```
 
 ### ODS 新增欄位

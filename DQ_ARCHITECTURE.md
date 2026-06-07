@@ -47,6 +47,89 @@ dbt rpt_*
 
 ---
 
+## Ingestion Layer: Upstream Anomalies and Two-Signal Governance
+
+The ODS ingestion boundary produces two quality signals that are **kept separate and carry different authority**. Core principle: **"is the value correct" and "has the upstream contract changed" are two different questions — flagged separately, handled separately.**
+
+### Authority boundary of the two signals
+
+| Aspect | `has_clean_error` | `has_schema_drift` |
+|---|---|---|
+| Meaning | The **value** of this record has a business problem | The **structure/contract** the upstream sent has changed |
+| Typical sources | quantity ≤ 0, rating out of range, NaN/Inf, future date, over-long text, numeric sentinel | unexpected field, renamed field, type drift, non-object nested group |
+| Message column | `clean_error_message` | `schema_drift_message` + `unmapped_fields` |
+| **Authority over Gold** | **Can block**: `int_*` quarantines it via `WHERE has_clean_error=FALSE` | **Cannot block**: a clean order still flows to Gold even with drift; drift is purely a monitoring signal |
+| Part of the `quality_events` state machine? | ✅ Yes (`initial_evaluation` → `clean`/`quarantined` → `promoted`…) | ❌ No (not a quality-state evolution; an ops signal) |
+| Tied to rule version? | ✅ Evolves with `DQ_RULE_VERSION` | ❌ Unrelated to rule version; relates to how code maps the schema |
+| Remediation path | **Proposal B** (re-evaluate under a new rule version) / `force=True` (re-run a failed pipeline) | **Engineering action**: align the contract with upstream / add a field mapping / update the Pydantic model — **not** rule re-evaluation |
+| Observability | `quality_metric` log, `rpt_quality_*` | `schema_drift` log, `ingress_rejected` log, (Phase 4) drift-rate monitoring |
+
+In one line: `has_clean_error` has the authority to keep data out of Gold; `has_schema_drift` **does not** — it can only alert and ask a human to realign the contract.
+
+### Four quadrants: signal combination → action → result
+
+| `has_clean_error` | `has_schema_drift` | Situation | Action | Result |
+|:---:|:---:|---|---|---|
+| FALSE | FALSE | Fully clean | Flows normally | Reaches Gold (`dim_*`/`fct_*`); `quality_events` → `clean` |
+| TRUE | FALSE | Value has a business problem | `int_*` Row Filter blocks it | Goes to `int_orders_quarantine`; `quality_events` → `quarantined`; Proposal B |
+| FALSE | TRUE | Contract changed but the **value is clean** | **Still flows to Gold** + drift alert | Reaches Gold (not blocked); engineering is notified to realign the contract / add a mapping |
+| TRUE | TRUE | Value is bad **and** contract changed | Blocked by `has_clean_error` + drift alert | Goes to quarantine (value issue via Proposal B); drift handled separately by engineering. **The two paths are independent** |
+
+The third quadrant is the key design point: **an otherwise-good order that merely carries an extra `loyalty_points` field is not kicked out of Gold** — exactly why a separate signal was chosen over overloading `has_clean_error`.
+
+### Upstream anomalies and handling (15-item map)
+
+| Anomaly | Signal / mechanism | Result |
+|---|---|---|
+| Unexpected new field | `has_schema_drift` (`UNEXPECTED_FIELD`) | Lands; new field stored in `unmapped_fields`, existing columns unaffected |
+| Missing expected field | ingress relaxed (lands as NULL); detection deferred | Lands as NULL; missing-field detection via Phase 4 null-rate monitoring |
+| Renamed field | new name → `UNEXPECTED_FIELD`; old name → NULL | New name flagged + captured; old name NULL |
+| Changed type | coercible → `TYPE_DRIFT`; hard error → 422 | Coercible lands + flagged; hard type error 422 + `ingress_rejected` |
+| Changed date format / timezone | format error → 422; timezone → contract | Format error 422 + log; timezone is a written contract (see boundaries) |
+| Unseen enum value | lands; length handled by over-long path; detection deferred | New value lands; over-long no longer stalls; Phase 4 `accepted_values` (warn) |
+| Semantic drift | — | Deferred to Phase 4–5 distribution monitoring (rules cannot catch it) |
+| No data at all | — | Deferred to Phase 5 OTel volume/freshness alerting |
+| Same order_id resent | existing idempotency | first-write-wins; duplicates marked `duplicate` |
+| Non-object nested group | `has_schema_drift` (`NON_OBJECT_GROUP`) + defensive guard | No crash; flagged, that group lands as NULL |
+| sentinel / fake nulls | `format_clean` normalization (strings); range check (numbers) | String sentinels → NULL; numeric sentinels flagged `has_clean_error` |
+| Over-long string vs column cap | `has_clean_error` (`FIELD_TOO_LONG`) + generous DB wall + fast-fail | Moderately long → flagged + lands; egregious → terminal `error` (no more poison-pill) |
+| NUL byte | stripped before write + warning | Stripped and landed; no more 500 / dropped order |
+| NaN / Infinity | `has_clean_error` (`NON_FINITE_NUMBER`) | Flagged + lands; quarantined downstream; does not poison aggregates |
+| Future date / clock skew | `has_clean_error` (`ORDER_DATE_IN_FUTURE`); extraction `>=` | Future date flagged; clock rollback mitigated by `>=` in incremental extraction |
+
+### Relationship to `DQ_RULE_VERSION`
+
+`DQ_RULE_VERSION` versions only the **business value-evaluation rules** (`business_clean`), not the schema mapping. The two are orthogonal axes:
+
+> **An upstream contract change by itself does not bump `DQ_RULE_VERSION`**; it is bumped only when you modify `business_clean` (the value-evaluation rules) in response.
+
+But there is an **indirect causal chain** between them: schema drift (an upstream change) often **forces a business-rule change** — e.g. a new enum value must now be validated, semantic drift requires tightening a range, a newly-mapped field needs a range check — and that is when you bump. So "schema drift indirectly causes a bump" is common in practice, but to be precise: the trigger is "**you changed `business_clean`**," not "the upstream changed."
+
+Bump criterion: **if you re-run the same raw payload, would `has_clean_error` / `clean_error_message` come out different?**
+
+| Change | Changes the value-evaluation result? | Bump? |
+|---|---|---|
+| Add/modify a `business_clean` rule (new check, changed threshold) | ✅ | **Yes** |
+| A `format_clean` change that **affects later evaluation** (e.g. a new sentinel→NULL changes which values get flagged) | ✅ | **Yes** |
+| Add a field mapping (`from_nested` picks up one more field) | ❌ | No (goes through code review / migration) |
+| Renamed-field remapping | ❌ | No |
+| Change to `detect_schema_drift` logic | ❌ (a different signal; does not touch `has_clean_error`) | No |
+
+**This v1 → v2 bump**: the ingestion hardening added three `business_clean` rules — `FIELD_TOO_LONG`, `NON_FINITE_NUMBER`, `ORDER_DATE_IN_FUTURE` — and sentinel normalization that affects evaluation; re-running the same raw payload yields a different `has_clean_error`, hence the bump. These rules are **stricter** (they flag more), so they apply going forward only and need **no retroactive re-evaluation**; retroactive re-evaluation only applies when rules are loosened to promote old quarantined rows (the `re_quarantined` edge case in the state machine).
+
+### Observability and alerting
+
+- **Per record**: `quality_metric` (includes `has_clean_error`), `schema_drift` (drift detail), `ingress_rejected` (records blocked by the hard gate that never land).
+- **Batch** (Phase 4): besides `rpt_quality_*`, a **drift-rate threshold alert** can be added (analogous to the Hard Gate, but an over-threshold drift rate only **alerts, never aborts** the run — because drift has no blocking authority).
+
+### Design boundaries
+
+- **order_id is the only hard gate**: missing order_id → 422 (does not land, logged as `ingress_rejected`); every other missing/type/structure problem always "lands + is flagged," pushing the judgment downstream.
+- **Timezone semantics are a contract, not an algorithm**: a bare `order_date` cannot reveal timezone drift; it is resolved by an explicit (UTC) contract. The accompanying future-date guard is only a sanity check.
+- **`quality_events` does not record schema drift**: keeping its semantics as a "business quality state machine" clean (consistent with the semantic boundary in *Rule Versioning and the quality_events Table*).
+
+---
+
 ## Blocking Mechanism (Q1)
 
 Two mechanisms used together, each covering a different level of failure.
@@ -165,7 +248,7 @@ promoted
 
 ```python
 # clean.py
-DQ_RULE_VERSION = "v1"    # bump on every rule change; pair with a git tag documenting what changed
+DQ_RULE_VERSION = "v2"    # bump on every rule change; pair with a git tag documenting what changed
 ```
 
 ### New column on ODS

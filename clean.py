@@ -8,7 +8,9 @@ from pydantic import BaseModel
 
 from schema import ODSOrder, OrderIN
 
-DQ_RULE_VERSION = "v1"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
+DQ_RULE_VERSION = "v2"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
+# v2：新增 FIELD_TOO_LONG / NON_FINITE_NUMBER / ORDER_DATE_IN_FUTURE 規則，
+#     並以 sentinel 正規化影響值評估（同一筆 raw 重跑會得到不同 has_clean_error）。
 
 
 class DQCode:

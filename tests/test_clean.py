@@ -9,7 +9,7 @@ clean_order   : 整合路徑（format + business 都有被執行）
 """
 
 import pytest
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from schema import ODSOrder
 import typing
 from clean import (
@@ -98,6 +98,24 @@ class TestFormatClean:
         assert result.gender is None
         assert result.ship_mode is None
         assert result.delivery_days is None
+
+    # ── sentinel 假空值正規化（#11）────────────────────────────────────────────
+
+    def test_sentinel_values_normalized_to_none(self):
+        """已知假空值（含被 strip 成空字串）→ None。"""
+        ods = make_ods(country="N/A", city="null", gender="NONE", order_status="")
+        result = format_clean(ods)
+        assert result.country is None
+        assert result.city is None
+        assert result.gender is None
+        assert result.order_status is None
+
+    def test_conservative_set_preserves_ambiguous_values(self):
+        """保守集合：'NA'（North America）/'-' 不應被誤殺。"""
+        ods = make_ods(region="NA", state="-")
+        result = format_clean(ods)
+        assert result.region == "NA"
+        assert result.state == "-"
 
 
 # ─── business_clean ───────────────────────────────────────────────────────────
@@ -228,6 +246,63 @@ class TestBusinessClean:
         ods = make_ods(city="x" * 81)
         _, errors = business_clean(ods)
         assert any(e["field"] == "city" and e["code"] == "field_too_long" for e in errors)
+
+    # ── 未來日期防線（#15）────────────────────────────────────────────────────
+
+    def test_future_order_date_is_flagged(self):
+        ods = make_ods(order_date=date(2999, 1, 1))
+        _, errors = business_clean(ods)
+        assert any(e["code"] == "order_date_in_future" for e in errors)
+
+    def test_order_date_within_tolerance_not_flagged(self):
+        """今天 +1 天落在容差內，不標記。"""
+        today = datetime.now(timezone.utc).date()
+        ods = make_ods(order_date=today + timedelta(days=1))
+        _, errors = business_clean(ods)
+        assert not any(e["code"] == "order_date_in_future" for e in errors)
+
+    def test_order_date_beyond_tolerance_is_flagged(self):
+        today = datetime.now(timezone.utc).date()
+        ods = make_ods(order_date=today + timedelta(days=2))
+        _, errors = business_clean(ods)
+        assert any(e["code"] == "order_date_in_future" for e in errors)
+
+    # ── NaN / Infinity（#14）：非有限值只報一次 non_finite_number ──────────────
+
+    def test_non_finite_item_unit_price_flagged_once(self):
+        ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": float("nan")}])
+        _, errors = business_clean(ods)
+        codes = [e["code"] for e in errors]
+        assert codes.count("non_finite_number") == 1
+        assert "unit_price_negative" not in codes  # 不重複報
+
+    def test_negative_infinity_unit_price_only_non_finite(self):
+        """-inf 雖 < 0，但有 isfinite 守衛 → 只報 non_finite，不報 unit_price_negative。"""
+        ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": float("-inf")}])
+        _, errors = business_clean(ods)
+        codes = [e["code"] for e in errors]
+        assert "non_finite_number" in codes
+        assert "unit_price_negative" not in codes
+
+    def test_non_finite_tax_pct_only_non_finite(self):
+        ods = make_ods(tax_pct=float("inf"))
+        _, errors = business_clean(ods)
+        codes = [e["code"] for e in errors]
+        assert "non_finite_number" in codes
+        assert "tax_pct_out_of_range" not in codes
+
+    def test_non_finite_customer_rating_only_non_finite(self):
+        ods = make_ods(customer_rating=float("nan"))
+        _, errors = business_clean(ods)
+        codes = [e["code"] for e in errors]
+        assert "non_finite_number" in codes
+        assert "customer_rating_out_of_range" not in codes
+
+    def test_string_item_numeric_does_not_crash(self):
+        """items 內數值送成字串（型別漂移由 B 偵測）→ business_clean 不崩潰、不誤報範圍違規。"""
+        ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "discount_pct": "10"}])
+        _, errors = business_clean(ods)  # 不應拋 TypeError
+        assert not any(e["code"] == "discount_pct_out_of_range" for e in errors)
 
     def test_multiple_violations_all_accumulated(self):
         """多個規則同時違反，全部錯誤都要被累積，不提前 return。"""

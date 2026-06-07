@@ -112,11 +112,14 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
     # 非有限值（NaN/±Inf）只報一次 non_finite_number，不再意外觸發 range 違規。
     if ods.items:
         for i, item in enumerate(ods.items):
-            # 非有限值優先攔截（NaN/±Inf）
+            # 非有限值優先攔截（NaN/±Inf）：標記後正規化為 None。
+            # items 是 JSONB 欄位、PostgreSQL 不接受 NaN token，必須 sanitize 才能落地；
+            # 同時建立不變量——ODS 永不儲存 NaN/Inf（原始值仍逐字保留在 Raw）。
             for num_field in ("quantity", "unit_price", "cost_price", "discount_pct", "shipping_fee"):
                 v = item.get(num_field)
                 if _is_number(v) and not math.isfinite(v):
                     errors.append({"code": DQCode.NON_FINITE_NUMBER, "field": num_field, "value": str(v), "index": i})
+                    item[num_field] = None
 
             # quantity 不能是 0 或負數
             qty = item.get("quantity")
@@ -131,10 +134,11 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
             if _is_number(discount_pct) and math.isfinite(discount_pct) and not (0 <= discount_pct <= 100):
                 errors.append({"code": DQCode.DISCOUNT_PCT_OUT_OF_RANGE, "field": "discount_pct", "value": discount_pct, "index": i})
 
-    # tax_pct 0~100（非有限值只報 non_finite）
+    # tax_pct 0~100（非有限值標記後正規化為 None，維持 ODS 不存 NaN/Inf 的不變量）
     if ods.tax_pct is not None:
         if not math.isfinite(ods.tax_pct):
             errors.append({"code": DQCode.NON_FINITE_NUMBER, "field": "tax_pct", "value": str(ods.tax_pct)})
+            ods.tax_pct = None
         elif not (0 <= ods.tax_pct <= 100):
             errors.append({"code": DQCode.TAX_PCT_OUT_OF_RANGE, "field": "tax_pct", "value": ods.tax_pct})
 
@@ -152,10 +156,11 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
             errors.append({"code": DQCode.ORDER_DATE_IN_FUTURE, "field": "order_date",
                            "value": ods.order_date.isoformat()})
 
-    # customer_rating 1~5（非有限值只報 non_finite）
+    # customer_rating 1~5（非有限值標記後正規化為 None）
     if ods.customer_rating is not None:
         if not math.isfinite(ods.customer_rating):
             errors.append({"code": DQCode.NON_FINITE_NUMBER, "field": "customer_rating", "value": str(ods.customer_rating)})
+            ods.customer_rating = None
         elif not (1 <= ods.customer_rating <= 5):
             errors.append({"code": DQCode.CUSTOMER_RATING_OUT_OF_RANGE, "field": "customer_rating", "value": ods.customer_rating})
 

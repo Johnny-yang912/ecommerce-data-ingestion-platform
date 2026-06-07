@@ -271,10 +271,12 @@ class TestBusinessClean:
 
     def test_non_finite_item_unit_price_flagged_once(self):
         ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": float("nan")}])
-        _, errors = business_clean(ods)
+        result, errors = business_clean(ods)
         codes = [e["code"] for e in errors]
         assert codes.count("non_finite_number") == 1
         assert "unit_price_negative" not in codes  # 不重複報
+        # sanitize：非有限值正規化為 None，讓含 NaN 的 items 能寫進 JSONB
+        assert result.items[0]["unit_price"] is None
 
     def test_negative_infinity_unit_price_only_non_finite(self):
         """-inf 雖 < 0，但有 isfinite 守衛 → 只報 non_finite，不報 unit_price_negative。"""
@@ -286,17 +288,19 @@ class TestBusinessClean:
 
     def test_non_finite_tax_pct_only_non_finite(self):
         ods = make_ods(tax_pct=float("inf"))
-        _, errors = business_clean(ods)
+        result, errors = business_clean(ods)
         codes = [e["code"] for e in errors]
         assert "non_finite_number" in codes
         assert "tax_pct_out_of_range" not in codes
+        assert result.tax_pct is None  # sanitize
 
     def test_non_finite_customer_rating_only_non_finite(self):
         ods = make_ods(customer_rating=float("nan"))
-        _, errors = business_clean(ods)
+        result, errors = business_clean(ods)
         codes = [e["code"] for e in errors]
         assert "non_finite_number" in codes
         assert "customer_rating_out_of_range" not in codes
+        assert result.customer_rating is None  # sanitize
 
     def test_string_item_numeric_does_not_crash(self):
         """items 內數值送成字串（型別漂移由 B 偵測）→ business_clean 不崩潰、不誤報範圍違規。"""

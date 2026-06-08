@@ -84,7 +84,7 @@ ODS 攝入邊界產生兩個**互不混用、權限不同**的品質訊號。核
 | 多一個沒見過的欄位 | `has_schema_drift`（`UNEXPECTED_FIELD`） | 落地；新欄存入 `unmapped_fields`，原欄正常 |
 | 少一個預期欄位 | ingress 放寬（落地 NULL）；偵測留觀測層 | 落地為 NULL；少欄位偵測由 Phase 4 null-rate 監控 |
 | 改名 | 拆成上兩列：新名＝「多一個沒見過的欄位」；舊名＝「少一個預期欄位」 | 同上兩列：新名收進 `unmapped_fields`；舊名落地 NULL |
-| 改型別 | 可強轉→`TYPE_DRIFT`；硬錯→422 | 可強轉落地+標記；硬型別錯 422 + `ingress_rejected` |
+| 改型別 | 可強轉→`TYPE_DRIFT`；硬錯→422（詳見下方〈改型別：從強轉行為到宣告治理〉） | 可強轉落地+標記；硬型別錯 422 + `ingress_rejected` |
 | 改日期格式 / 時區 | 格式錯→422；時區→契約約定 | 格式錯 422+log；時區屬明文契約（見設計邊界） |
 | 沒見過的 enum | 落地；長度由超長處理；偵測留 dbt | 新值落地；超長不卡死；Phase 4 `accepted_values`（warn） |
 | 語意漂移 | — | 留 Phase 4–5 分佈監控（規則抓不到） |
@@ -96,6 +96,33 @@ ODS 攝入邊界產生兩個**互不混用、權限不同**的品質訊號。核
 | NUL byte | 寫入前 strip + warning | 移除後落地，不再 500 掉單 |
 | NaN / Infinity | `has_clean_error`（`NON_FINITE_NUMBER`） | 標記落地、下游 quarantine、不毒化聚合 |
 | 未來日期 / 時鐘回撥 | `has_clean_error`（`ORDER_DATE_IN_FUTURE`）；抽取 `>=` | 未來日期標記；回撥由增量抽取 `>=` 緩解 |
+
+### 改型別：從強轉行為到宣告治理（第 4 列展開）
+
+攝入層對「上游改型別」的處置，取決於 Pydantic lax 模式能不能把值轉成宣告型別——而這是**雙向不對稱**的：
+
+| 方向 | 例子 | Pydantic 行為 | 結果 |
+|---|---|---|---|
+| 該是字串、上游送數字 | `customer_name: 123` | 不接受 int→str 強轉 | `ValidationError` → 422 + `ingress_rejected`（不落地） |
+| 該是數字、上游送可轉字串 | `age: "00501"` | 靜默強轉 `"00501"→501` | 通過、落地，值在下游運算正確 |
+
+第一列是「硬型別錯」，在邊界就被擋掉，乾淨。**真正的盲區是第二列**：`"00501"→501` 一切符合 schema、下游也算得對，但「上游這次把整數欄位送成字串」這個契約偏離的事實，會在 Pydantic 層被無聲吃掉。這正是 `TYPE_DRIFT` 存在的理由——`detect_schema_drift` 不經過 Pydantic，而是跑在**逐字保留的原始 payload** 上（landing 層刻意不以 `OrderIN` 序列化回存，見〈設計邊界〉），用 JSON 原生型別比對契約，把強轉前的真實型別記成 `has_schema_drift` + `TYPE_DRIFT`（非阻斷）。
+
+強轉本身也有邊界，不是「送字串就一定無聲通過」：只有**乾淨、可整數化的字串**會過（`"501"`、`" 501 "`；`"12.0"→12` 會截斷），`"12.5"`、`"abc"` 仍被擋成 422。所以第 4 列精確說是：**可強轉**（值能落到宣告型別）→ 落地 + `TYPE_DRIFT` 標記（被觀測）；**硬型別錯**（值無法轉）→ 422 + `ingress_rejected`（不落地）。
+
+而既然強轉是「向宣告對齊」，**宣告本身就決定了什麼會被無聲改寫**——這把問題從「值」往上推到「宣告」。識別碼類欄位（`postal_code`、`customer_id`、`product_id`）一律宣告為 `str`，正是為了保住前導零：若誤宣告成 `int`，`"00501"` 會被靜默截成 `501`、語意遺失且難以察覺；反過來，只有「概念上可被運算」的量（`age`、`delivery_days`、`tax_pct`）才宣告 `int/float`。所以設定型別時的紀律不是格式問題，而是**在決定「哪些偏離會被無聲吃掉、哪些會被 `TYPE_DRIFT` 看見」**。
+
+這也暴露了 `TYPE_DRIFT` 的極限：它能抓「上游送的值型別 ≠ 宣告」，卻**無法判斷「宣告本身對不對」**——因為它的比對基準就是那份宣告，無法拿宣告自證。基準錯了，`TYPE_DRIFT` 只會拿錯的尺去量。因此「宣告」需要另一套守護，分三層，前兩層可自動化、第三層必須靠人：
+
+| 層 | 機制 | 守什麼 | 守不到 |
+|---|---|---|---|
+| 1 跨層一致性 | `tests/test_schema_db_consistency.py`：`ODSOrder`（Pydantic）↔ `ODS`（SQLAlchemy）逐欄位比對 `python_type` | 改了 schema.py 忘了改 models.py（或反之）、漏對映 | 兩層一起宣告錯 |
+| 2 契約快照 | `tests/test_schema_snapshot.py`：`model_json_schema()` 對 committed golden 檔 | 任何型別宣告改動都變成會紅的測試 + 可審查 diff | 有意但錯誤的改動（快照隨之更新） |
+| 3 人治理 | CODEOWNERS（`schema.py` / `models.py` / `tests/snapshots/`）+ 上游 data contract | 「這個型別到底對不對」 | —（這層即最終裁判） |
+
+前兩層把「純靠紀律」收斂成「會紅的測試 + 會被看到的 diff」，但它們只回答**一致 / 沒被偷改**；**「`age` 本來該是 int 嗎」這種正確性問題沒有任何測試能自證**，因為「正確」的定義是「符合與上游約定的契約」，需要一個宣告以外的事實來源。所以最後一層逃不掉人的判斷：**CODEOWNERS** 讓指定的資料負責人必審 schema 改動，使快照 diff 真的有人看（機制 2 給鉤子、人給判斷）；**data contract** 把每欄的約定型別與理由寫成白紙黑字，讓 review 有可比基準；而既有的 `TYPE_DRIFT` **drift 率**也能反向利用——某欄位 drift 率長期居高，合理懷疑不是上游一直錯，而是自己的宣告錯了（見〈觀測與告警〉）。
+
+**目前狀態**：機制 1、2 已落地（測試綠）；機制 3 的 CODEOWNERS 與 data contract 屬團隊治理項。
 
 ### 與 `DQ_RULE_VERSION` 的關係
 

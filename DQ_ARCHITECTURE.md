@@ -84,7 +84,7 @@ The third quadrant is the key design point: **an otherwise-good order that merel
 | Unexpected new field | `has_schema_drift` (`UNEXPECTED_FIELD`) | Lands; new field stored in `unmapped_fields`, existing columns unaffected |
 | Missing expected field | ingress relaxed (lands as NULL); detection deferred | Lands as NULL; missing-field detection via Phase 4 null-rate monitoring |
 | Renamed field | Decomposes into the two rows above: new name = "unexpected field"; old name = "missing field" | Same as above: new name captured in `unmapped_fields`; old name lands NULL |
-| Changed type | coercible → `TYPE_DRIFT`; hard error → 422 | Coercible lands + flagged; hard type error 422 + `ingress_rejected` |
+| Changed type | coercible → `TYPE_DRIFT`; hard error → 422 (see "Changed type: from coercion behavior to declaration governance" below) | Coercible lands + flagged; hard type error 422 + `ingress_rejected` |
 | Changed date format / timezone | format error → 422; timezone → contract | Format error 422 + log; timezone is a written contract (see boundaries) |
 | Unseen enum value | lands; length handled by over-long path; detection deferred | New value lands; over-long no longer stalls; Phase 4 `accepted_values` (warn) |
 | Semantic drift | — | Deferred to Phase 4–5 distribution monitoring (rules cannot catch it) |
@@ -96,6 +96,33 @@ The third quadrant is the key design point: **an otherwise-good order that merel
 | NUL byte | stripped before write + warning | Stripped and landed; no more 500 / dropped order |
 | NaN / Infinity | `has_clean_error` (`NON_FINITE_NUMBER`) | Flagged + lands; quarantined downstream; does not poison aggregates |
 | Future date / clock skew | `has_clean_error` (`ORDER_DATE_IN_FUTURE`); extraction `>=` | Future date flagged; clock rollback mitigated by `>=` in incremental extraction |
+
+### Changed type: from coercion behavior to declaration governance (row 4 expanded)
+
+How the ingress layer handles an upstream "changed type" depends on whether Pydantic's lax mode can coerce the value into the declared type — and this is **asymmetric in the two directions**:
+
+| Direction | Example | Pydantic behavior | Result |
+|---|---|---|---|
+| Should be string, upstream sends a number | `customer_name: 123` | Does not coerce int→str | `ValidationError` → 422 + `ingress_rejected` (does not land) |
+| Should be a number, upstream sends a coercible string | `age: "00501"` | Silently coerces `"00501"→501` | Passes, lands, value computes correctly downstream |
+
+The first row is a "hard type error," rejected cleanly at the boundary. **The real blind spot is the second row**: `"00501"→501` conforms to the schema and computes correctly downstream, but the fact that "upstream sent an integer field as a string this time" is silently swallowed at the Pydantic layer. This is exactly why `TYPE_DRIFT` exists — `detect_schema_drift` bypasses Pydantic and runs on the **verbatim-preserved raw payload** (the landing layer deliberately does not re-serialize through `OrderIN`, see "Design boundaries"), comparing JSON-native types against the contract and recording the pre-coercion true type as `has_schema_drift` + `TYPE_DRIFT` (non-blocking).
+
+Coercion itself also has a boundary — it is not "any string passes silently": only a **clean, integer-parseable string** passes (`"501"`, `" 501 "`; `"12.0"→12` truncates), while `"12.5"` and `"abc"` are still rejected as 422. So row 4 precisely means: **coercible** (value lands in the declared type) → lands + `TYPE_DRIFT` flag (observed); **hard type error** (value cannot convert) → 422 + `ingress_rejected` (does not land).
+
+And since coercion is "alignment toward the declaration," **the declaration itself decides what gets silently rewritten** — pushing the problem up from "the value" to "the declaration." Identifier-like fields (`postal_code`, `customer_id`, `product_id`) are all declared `str` precisely to preserve leading zeros: declare one as `int` by mistake and `"00501"` gets silently truncated to `501`, semantics lost and hard to notice; conversely, only quantities that are "conceptually computable" (`age`, `delivery_days`, `tax_pct`) are declared `int/float`. So the discipline when setting a type is not a formatting concern — it **decides which deviations get silently swallowed and which get seen by `TYPE_DRIFT`**.
+
+This also exposes the limit of `TYPE_DRIFT`: it can catch "the value type upstream sent ≠ the declaration," but **cannot judge whether the declaration itself is correct** — because its comparison baseline *is* that declaration, and a declaration cannot validate itself. If the baseline is wrong, `TYPE_DRIFT` just measures with the wrong ruler. The declaration therefore needs its own protection, in three layers — the first two automatable, the third necessarily human:
+
+| Layer | Mechanism | Guards | Does not guard |
+|---|---|---|---|
+| 1 Cross-layer consistency | `tests/test_schema_db_consistency.py`: `ODSOrder` (Pydantic) ↔ `ODS` (SQLAlchemy), per-field `python_type` comparison | Changing schema.py but forgetting models.py (or vice versa); missing mappings | Both layers declared wrong together |
+| 2 Contract snapshot | `tests/test_schema_snapshot.py`: `model_json_schema()` against a committed golden file | Any type-declaration change becomes a failing test + a reviewable diff | An intentional-but-wrong change (the snapshot updates with it) |
+| 3 Human governance | CODEOWNERS (`schema.py` / `models.py` / `tests/snapshots/`) + an upstream data contract | "Is this type actually correct" | — (this layer is the final arbiter) |
+
+The first two layers collapse "pure discipline" into "a test that goes red + a diff that gets seen," but they only answer **consistent / not silently altered**; **the correctness question "should `age` be an int in the first place" cannot be self-validated by any test**, because "correct" is defined as "matches the contract agreed with upstream," which needs a source of truth outside the declaration. So the final layer cannot escape human judgment: **CODEOWNERS** forces a designated data owner to review schema changes so the snapshot diff is actually looked at (mechanism 2 provides the hook, the human provides the judgment); a **data contract** writes down each field's agreed type and rationale so review has a comparable baseline; and the existing `TYPE_DRIFT` **drift rate** can be used in reverse — a field whose drift rate is chronically high is reasonable grounds to suspect not that upstream is persistently wrong, but that your own declaration is (see "Observability and alerting").
+
+**Current status**: mechanisms 1 and 2 are in place (tests green); mechanism 3's CODEOWNERS and data contract are team-governance items.
 
 ### Relationship to `DQ_RULE_VERSION`
 

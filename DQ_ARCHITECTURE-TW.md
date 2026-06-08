@@ -83,7 +83,7 @@ ODS 攝入邊界產生兩個**互不混用、權限不同**的品質訊號。核
 |---|---|---|
 | 多一個沒見過的欄位 | `has_schema_drift`（`UNEXPECTED_FIELD`） | 落地；新欄存入 `unmapped_fields`，原欄正常 |
 | 少一個預期欄位 | ingress 放寬（落地 NULL）；偵測留觀測層 | 落地為 NULL；少欄位偵測由 Phase 4 null-rate 監控 |
-| 改名 | 新名→`UNEXPECTED_FIELD`；舊名→NULL | 新名標記+收容；舊名 NULL |
+| 改名 | 拆成上兩列：新名＝「多一個沒見過的欄位」；舊名＝「少一個預期欄位」 | 同上兩列：新名收進 `unmapped_fields`；舊名落地 NULL |
 | 改型別 | 可強轉→`TYPE_DRIFT`；硬錯→422 | 可強轉落地+標記；硬型別錯 422 + `ingress_rejected` |
 | 改日期格式 / 時區 | 格式錯→422；時區→契約約定 | 格式錯 422+log；時區屬明文契約（見設計邊界） |
 | 沒見過的 enum | 落地；長度由超長處理；偵測留 dbt | 新值落地；超長不卡死；Phase 4 `accepted_values`（warn） |

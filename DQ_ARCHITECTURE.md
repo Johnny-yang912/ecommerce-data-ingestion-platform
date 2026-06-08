@@ -83,7 +83,7 @@ The third quadrant is the key design point: **an otherwise-good order that merel
 |---|---|---|
 | Unexpected new field | `has_schema_drift` (`UNEXPECTED_FIELD`) | Lands; new field stored in `unmapped_fields`, existing columns unaffected |
 | Missing expected field | ingress relaxed (lands as NULL); detection deferred | Lands as NULL; missing-field detection via Phase 4 null-rate monitoring |
-| Renamed field | new name → `UNEXPECTED_FIELD`; old name → NULL | New name flagged + captured; old name NULL |
+| Renamed field | Decomposes into the two rows above: new name = "unexpected field"; old name = "missing field" | Same as above: new name captured in `unmapped_fields`; old name lands NULL |
 | Changed type | coercible → `TYPE_DRIFT`; hard error → 422 | Coercible lands + flagged; hard type error 422 + `ingress_rejected` |
 | Changed date format / timezone | format error → 422; timezone → contract | Format error 422 + log; timezone is a written contract (see boundaries) |
 | Unseen enum value | lands; length handled by over-long path; detection deferred | New value lands; over-long no longer stalls; Phase 4 `accepted_values` (warn) |

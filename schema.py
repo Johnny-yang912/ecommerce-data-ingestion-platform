@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, Any
 from datetime import datetime, date
 
@@ -178,8 +178,7 @@ class RawOut(BaseModel):
     processed_at: Optional[datetime] = None
     raw_payload: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class RawListItem(BaseModel):
     id: int
@@ -187,5 +186,4 @@ class RawListItem(BaseModel):
     error_message: Optional[str] = None
     processed_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

@@ -126,7 +126,7 @@ def get_watermark(client: bigquery.Client):
 
     回傳最新分區當天 00:00:00 UTC 的 timestamp；表空/不存在 → None（觸發首次全量抽取）。
 
-    - 免費：查 INFORMATION_SCHEMA 是 metadata 操作，不掃資料、不計費。
+    - 免費(近似):查 INFORMATION_SCHEMA 是 metadata 操作,不掃 staging 本體;on-demand 下每次有 10 MB 最低計費門檻,金額可忽略,且通常在免費額度內。
     - 不受 require_partition_filter 限制：查的是 metadata view，非 staging 表本體。
     - 天粒度：每次抽取會重抽「最新分區整天」，配 `>=` 邊界與 dbt stg_ 去重 → 不漏不錯。
 

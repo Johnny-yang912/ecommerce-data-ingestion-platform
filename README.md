@@ -320,6 +320,8 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 │   └── test_auth.py       # API Key auth, rotation, source_client_id persistence
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture (English)
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
+├── CLOUD_LAYER.md         # Cloud Layer Architecture: ODS → BigQuery (English)
+├── CLOUD_LAYER-TW.md      # 雲端層架構：ODS → BigQuery（繁體中文）
 ├── .env           # DB_URL, API_KEYS (not committed)
 ├── .env.example   # Environment variable template (committed)
 └── .gitignore
@@ -332,6 +334,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 | Document | Description |
 |---|---|
 | [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), scenario repair strategy, quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
+| [Cloud Layer Architecture](./CLOUD_LAYER.md) | ODS → BigQuery extraction and staging: partition/clustering/fuse design, watermark strategy (Approach A + the `get_watermark()` seam), batch-load and JSON landing decisions, and the ODS schema evolution strategy (additive staging + dbt absorption + `FIELDS` consistency test) |
 
 ---
 
@@ -458,7 +461,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Docker / docker-compose (API + PostgreSQL containerisation) — single-stage `python:3.12-slim` image (non-root, pinned `requirements.txt`), reused by both the `api` and one-shot `migrate` services; `docker compose up` orchestrates **db (healthcheck) → migrate (`alembic upgrade head`) → api** via `depends_on` conditions (`service_healthy` + `service_completed_successfully`); `DB_URL` injected at runtime pointing at the `db` service (no code change — env vars outrank `.env`), secrets never baked into the image; API pinned to `--workers 1` (in-process `BackgroundTasks` / periodic scan); `GET /health` liveness probe added for the container healthcheck
 
 **Phase 4 — Analytics Pipeline**
-- [ ] ODS → BigQuery extraction script (Python script, incremental by `received_at` watermark)
+- [v] ODS → BigQuery extraction script (`extract_ods_to_bq.py`) — incremental by `received_at` watermark (Approach A, derived from `INFORMATION_SCHEMA.PARTITIONS`, wrapped in `get_watermark()` as the seam for a future micro-batch Approach B); partitioned (`received_at` DAY) + clustered (`order_id`, `has_clean_error`) staging table with `require_partition_filter` fuse; batch load only (no streaming), JSON columns landed as native objects, `ALLOW_FIELD_ADDITION` for additive schema evolution; `FIELDS` single source of truth guarded by `tests/test_schema_bq_consistency.py` (see [CLOUD_LAYER.md](./CLOUD_LAYER.md))
 - [ ] dbt Core: stg_* → int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Hard Gate tests, Row Filter, `int_orders_quarantine`, scenario-specific `int_orders_*` models, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
 

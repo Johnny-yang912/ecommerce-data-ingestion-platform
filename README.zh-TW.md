@@ -320,6 +320,8 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 │   └── test_auth.py       # API Key 驗證、輪替、source_client_id 落地
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture（English）
+├── CLOUD_LAYER-TW.md      # 雲端層架構：ODS → BigQuery（繁體中文）
+├── CLOUD_LAYER.md         # Cloud Layer Architecture: ODS → BigQuery（English）
 ├── .env           # DB_URL、API_KEYS（不進版控）
 ├── .env.example   # 環境變數範本（進版控）
 └── .gitignore
@@ -332,6 +334,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 | 文件 | 說明 |
 |---|---|
 | [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、場景補值策略、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
+| [雲端層架構](./CLOUD_LAYER-TW.md) | ODS → BigQuery 抽取與 staging：分區/叢集/保險絲設計、watermark 策略（方案 A 與 `get_watermark()` 接縫）、批次載入與 JSON 落地決策、ODS schema 演進策略（staging 只做加法 + dbt 吸收 + `FIELDS` 一致性測試）|
 
 ---
 
@@ -458,7 +461,7 @@ Looker Studio（直連 BigQuery）
 - [v] Docker / docker-compose（API + PostgreSQL 容器化）— 單階段 `python:3.12-slim` 映像（非 root、鎖版 `requirements.txt`），由 `api` 與一次性 `migrate` 服務共用；`docker compose up` 以 `depends_on` 條件（`service_healthy` + `service_completed_successfully`）編排 **db（healthcheck）→ migrate（`alembic upgrade head`）→ api**；`DB_URL` 於執行期注入、指向 `db` 服務（不需改程式碼 —— env var 優先序高於 `.env`），secrets 不烤進映像；API 固定 `--workers 1`（行程內 `BackgroundTasks` / 週期掃描）；新增 `GET /health` liveness 探針供容器 healthcheck
 
 **Phase 4 — 分析層 Pipeline**
-- [ ] ODS → BigQuery 抽取腳本（Python script，以 `received_at` 為 watermark 做增量抽取）
+- [v] ODS → BigQuery 抽取腳本（`extract_ods_to_bq.py`）— 以 `received_at` 為 watermark 做增量抽取（方案 A，由 `INFORMATION_SCHEMA.PARTITIONS` 推導，封裝在 `get_watermark()` 作為未來微批方案 B 的接縫）；staging 表分區（`received_at` DAY）+ 叢集（`order_id`、`has_clean_error`）+ `require_partition_filter` 保險絲；只走 batch load（不串流）、JSON 欄位以原生物件落地、`ALLOW_FIELD_ADDITION` 支援 additive schema 演進；`FIELDS` 單一真相來源由 `tests/test_schema_bq_consistency.py` 把關（見 [CLOUD_LAYER-TW.md](./CLOUD_LAYER-TW.md)）
 - [ ] dbt Core：stg_* → int_* → dim_*/fct_* → rpt_*；含 DQ BQ 層（Hard Gate tests、Row Filter、`int_orders_quarantine`、場景專用 `int_orders_*` 模型、`rpt_quality_*`）（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 

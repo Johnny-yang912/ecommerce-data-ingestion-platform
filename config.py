@@ -45,5 +45,10 @@ class Settings(BaseSettings):
     # 故給空字串預設，避免每次 API 啟動就因缺值 fail。實際使用見 bq.get_bq_client()。
     google_application_credentials: str = ""
 
+    # BQ 目的地專案 ID（隨部署環境而異 → 集中注入，真實 ID 不入版控）。
+    # 同上：只有抽取腳本用得到，故給空字串預設讓 API server 啟動不受影響；
+    # 腳本啟動時自行檢查缺值並 fail-fast（見 extract_ods_to_bq.main）。
+    bq_project: str = ""
+
 
 settings = Settings()

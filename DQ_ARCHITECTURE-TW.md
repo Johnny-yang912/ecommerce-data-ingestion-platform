@@ -188,20 +188,51 @@ models:
 
 ### 機制二：Row Filter（record-level）
 
-在 `dbt int_*` 的 SQL 中過濾，逐筆隔離。
+在 `dbt int_*` 的 SQL 中過濾，逐筆隔離。Row Filter 的判定基準**不是 ODS 的 `has_clean_error` 快照，而是「有效品質狀態」**——即 ODS 攝入當下判定，疊加 `quality_events` 後續演進（Proposal B promote）的合成結果。
 
 ```sql
--- int_orders.sql（乾淨資料流）
-SELECT * FROM {{ ref('stg_orders') }}
-WHERE has_clean_error = FALSE
+-- int_orders.sql（乾淨資料流，含 Proposal B 重評估回流）
+WITH latest_quality_state AS (
+    -- 每筆 raw_id 只取最新一筆品質事件（append-only，故以 event_at 排序取首列）
+    SELECT
+        raw_id,
+        to_state,
+        ROW_NUMBER() OVER (
+            PARTITION BY raw_id ORDER BY event_at DESC
+        ) AS rn
+    FROM {{ ref('stg_quality_events') }}
+)
+SELECT s.*
+FROM {{ ref('stg_orders') }} s
+LEFT JOIN latest_quality_state q
+    ON s.raw_id = q.raw_id AND q.rn = 1
+WHERE
+    s.has_clean_error = FALSE      -- 攝入當下即乾淨
+    OR q.to_state = 'promoted'     -- 或被 Proposal B 重評估提升（最新狀態為 promoted）
 
--- int_orders_quarantine.sql（品質問題資料）
+-- int_orders_quarantine.sql（仍被隔離的資料 = 有效狀態非乾淨）
+WITH latest_quality_state AS (
+    SELECT
+        raw_id,
+        to_state,
+        ROW_NUMBER() OVER (
+            PARTITION BY raw_id ORDER BY event_at DESC
+        ) AS rn
+    FROM {{ ref('stg_quality_events') }}
+)
 SELECT
-    *,
+    s.*,
     CURRENT_TIMESTAMP() AS quarantined_at
-FROM {{ ref('stg_orders') }}
-WHERE has_clean_error = TRUE
+FROM {{ ref('stg_orders') }} s
+LEFT JOIN latest_quality_state q
+    ON s.raw_id = q.raw_id AND q.rn = 1
+WHERE
+    s.has_clean_error = TRUE
+    AND (q.to_state IS NULL OR q.to_state != 'promoted')  -- 從未 promote，或 promote 後又 re_quarantined
 ```
+
+**為什麼 Row Filter 不能只讀 `has_clean_error`？**
+ODS 是不可變錨點，`has_clean_error` 永遠停在**攝入當下**（`dq_rule_version` 那一版）的判定，被 Proposal B promote 的記錄**在 ODS 裡仍是 `has_clean_error=TRUE`**。若 Row Filter 照字面只寫 `WHERE has_clean_error = FALSE`，promoted 記錄會永遠卡在 quarantine、流不回 Gold。因此「有效品質狀態」必須由 `int_*` 在每次 dbt run 時，把 ODS 快照與 `quality_events` 最新事件**合成**出來——`has_clean_error` 是 `initial_evaluation` 那一筆的快照，`quality_events` 最新 `to_state` 才是當前真實。這也是「重評估不改 ODS、只 append `quality_events`」（見〈Bounded Writeback 原則〉）能讓資料回流的銜接點。`re_quarantined` 邊緣情況自動被涵蓋：只要最新事件不是 `promoted`，記錄就留在 quarantine，無需額外條件。
 
 ### 機制三：場景專用分析模型（int_* 層）
 
@@ -251,6 +282,53 @@ A 和 B 修的是**不同類型**的問題，需明確知道用哪個：
 
 > **注意**：`force=True` 對 quarantine 記錄無效（status="processed" → 回 400）。  
 > Quarantine 記錄的問題是**規則評估**，不是 pipeline 失敗，不需要重跑 pipeline。
+
+### Proposal B：不重跑的重評估流程
+
+B 的對象是 `Raw.status = "processed"` 且 `has_clean_error = TRUE` 的記錄——**它們早已乾淨落地在 ODS（並鏡像到 BQ staging）**，只是被舊版規則判定為髒、在 `int_*` 被 Row Filter 隔離。B 要做的是「用新版規則重新評估」，而非重跑 pipeline。
+
+**為什麼不用重跑 pipeline／不用回讀 raw payload？**
+因為攝入層刻意讓 `format_clean` **先於** `business_clean` 執行——進到 ODS 的 quarantine 記錄，欄位值**已經標準化過**（小寫、去空白、sentinel→NULL、型別對齊），只是業務規則判它不合格。而 `DQ_RULE_VERSION` 只版本化 `business_clean`（值評估規則），不碰 schema 對映。因此「v2 重評估」＝**拿 ODS 那一列現成的標準化欄位值，重跑一次新版 `business_clean`**，輸入全在 ODS 裡，無需 raw payload、無需重新攤平。
+
+> 對比 A（`force=True`）：A 的記錄 `status=error`，**ODS 沒有那一列**，沒有可重評估的對象，只能從 Raw 重走整條 pipeline。這就是為什麼 `force=True` 對 `processed` 記錄回 400——對 quarantine 記錄重跑 pipeline 是用錯工具修錯問題。
+
+**重評估結果寫去哪——Bounded Writeback：只 append `quality_events`，不碰 ODS。**
+ODS 永遠停在攝入當下的真實（`has_clean_error=TRUE, dq_rule_version="v1"`）。重評估通過後，新事實不覆蓋 ODS，而是在 append-only 的 `quality_events` 補一筆：
+
+```
+event_type:  "promotion"
+from_state:  "quarantined"
+to_state:    "promoted"
+rule_version: "v2"
+event_at:     <重評估時間>
+reason:       null（或本次仍殘留、但不再阻斷的訊息）
+```
+
+這樣歷史指標不會被追溯性改寫：v1 當下攔了多少、v2 又 promote 了多少，是兩個各自永存的獨立指標（見〈歷史品質指標〉）。
+
+**怎麼流回 Gold。**
+下次 dbt run，`int_orders` 以「ODS 快照 + `quality_events` 最新狀態」合成有效品質（見〈機制二：Row Filter〉的 JOIN 版），最新 `to_state='promoted'` 的記錄即被視為乾淨，自然流入 `int_orders → dim_*/fct_*`。ODS 說髒（v1）、BQ Gold 說乾淨（v2）的**永久分歧**是有意設計，靠 `dq_rule_version` + `quality_events` 提供追溯能力。
+
+**完整資料流：**
+
+```
+[ODS] has_clean_error=TRUE, dq_rule_version=v1   ← 永遠是這個快照，不動
+   │
+   │  Airflow 重評估 task（Proposal B，Phase 5）
+   ├─ 1. 撈 staging 中 has_clean_error=TRUE 的記錄（欄位值已標準化）
+   ├─ 2. 對這些現成的 ODS 欄位值重跑 v2 business_clean   ← 不碰 raw、不重跑 pipeline
+   ├─ 3a. v2 通過      → append quality_events: promotion (quarantined → promoted, v2)
+   └─ 3b. v2 仍不過 / 人工放棄 → append rejection (→ permanently_rejected)
+   │
+   ▼
+[quality_events]  append-only，新事實住這裡（ODS 不被改）
+   │
+   ▼
+下次 dbt run：int_orders 以「ODS + quality_events 最新狀態」合成有效品質
+   → 最新狀態為 promoted 的記錄流入 int_orders → dim_*/fct_*
+```
+
+> **適用邊界**：本次 v1→v2 是**變嚴**（標記更多），只往後生效、**不需回溯重評估**。回溯重評估（B 的 promote 路徑）只在**規則放寬**、要把舊 quarantine 撈回來時才觸發；規則變嚴反而可能讓既有 `promoted` 記錄在重評估時落到 `re_quarantined`（狀態機邊緣情況）。
 
 ### 狀態機
 
@@ -435,7 +513,8 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | 元件 | 所在層 | 狀態 |
 |---|---|---|
 | dbt `stg_*` Hard Gate tests | BQ Analytics | ⬜ Phase 4 |
-| `int_orders` Row Filter（`WHERE has_clean_error = FALSE`） | BQ Analytics | ⬜ Phase 4 |
+| `stg_quality_events` dbt model（供 `int_*` JOIN 取最新品質狀態） | BQ Analytics | ⬜ Phase 4 |
+| `int_orders` Row Filter（JOIN `quality_events` 最新狀態：`has_clean_error=FALSE OR to_state='promoted'`） | BQ Analytics | ⬜ Phase 4 |
 | `int_orders_quarantine` dbt model | BQ Analytics | ⬜ Phase 4 |
 | 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ Phase 4 |
 | Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 4 |

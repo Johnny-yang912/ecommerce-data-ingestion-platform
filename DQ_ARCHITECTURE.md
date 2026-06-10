@@ -188,20 +188,51 @@ models:
 
 ### Mechanism 2: Row Filter (record-level)
 
-Applied in `dbt int_*` SQL — isolates individual dirty records.
+Applied in `dbt int_*` SQL — isolates individual dirty records. The Row Filter's decision basis is **not the `has_clean_error` snapshot in ODS, but the "effective quality state"** — the ingestion-time verdict composed with any later evolution in `quality_events` (a Proposal B promotion).
 
 ```sql
--- int_orders.sql  (clean data flow)
-SELECT * FROM {{ ref('stg_orders') }}
-WHERE has_clean_error = FALSE
+-- int_orders.sql  (clean data flow, includes Proposal B re-evaluation flow-back)
+WITH latest_quality_state AS (
+    -- one row per raw_id: the latest quality event (append-only, so order by event_at and take the first)
+    SELECT
+        raw_id,
+        to_state,
+        ROW_NUMBER() OVER (
+            PARTITION BY raw_id ORDER BY event_at DESC
+        ) AS rn
+    FROM {{ ref('stg_quality_events') }}
+)
+SELECT s.*
+FROM {{ ref('stg_orders') }} s
+LEFT JOIN latest_quality_state q
+    ON s.raw_id = q.raw_id AND q.rn = 1
+WHERE
+    s.has_clean_error = FALSE      -- clean at ingestion time
+    OR q.to_state = 'promoted'     -- or promoted by Proposal B re-evaluation (latest state = promoted)
 
--- int_orders_quarantine.sql  (quality-flagged records)
+-- int_orders_quarantine.sql  (records still isolated = effective state not clean)
+WITH latest_quality_state AS (
+    SELECT
+        raw_id,
+        to_state,
+        ROW_NUMBER() OVER (
+            PARTITION BY raw_id ORDER BY event_at DESC
+        ) AS rn
+    FROM {{ ref('stg_quality_events') }}
+)
 SELECT
-    *,
+    s.*,
     CURRENT_TIMESTAMP() AS quarantined_at
-FROM {{ ref('stg_orders') }}
-WHERE has_clean_error = TRUE
+FROM {{ ref('stg_orders') }} s
+LEFT JOIN latest_quality_state q
+    ON s.raw_id = q.raw_id AND q.rn = 1
+WHERE
+    s.has_clean_error = TRUE
+    AND (q.to_state IS NULL OR q.to_state != 'promoted')  -- never promoted, or promoted then re_quarantined
 ```
+
+**Why can't the Row Filter just read `has_clean_error`?**
+ODS is an immutable anchor — `has_clean_error` is frozen at the **ingestion-time** verdict (under that `dq_rule_version`), and a record promoted by Proposal B **still reads `has_clean_error=TRUE` in ODS**. If the Row Filter were written literally as `WHERE has_clean_error = FALSE`, promoted records would stay stuck in quarantine forever and never flow back to Gold. The "effective quality state" must therefore be **composed** by `int_*` on every dbt run, joining the ODS snapshot with the latest `quality_events` event — `has_clean_error` is the snapshot from the `initial_evaluation` event, while the latest `to_state` in `quality_events` is the current truth. This is the seam that lets "re-evaluate without modifying ODS, append `quality_events` only" (see *Bounded Writeback Principle*) actually flow data back. The `re_quarantined` edge case is covered automatically: as long as the latest event is not `promoted`, the record stays in quarantine, with no extra condition needed.
 
 ### Mechanism 3: Scenario-Specific Analysis Models (int_* layer)
 
@@ -251,6 +282,53 @@ A and B fix **different types of problems**. It is essential to know which path 
 
 > **Important**: `force=True` does **not** work on quarantine records (`status = "processed"` → returns 400).  
 > Quarantine records have a **rule evaluation problem**, not a pipeline failure — re-running the pipeline cannot fix them.
+
+### Proposal B: re-evaluation without re-running the pipeline
+
+B targets records with `Raw.status = "processed"` and `has_clean_error = TRUE` — **they already landed cleanly in ODS (and are mirrored to BQ staging)**; they were merely judged dirty by an older rule version and isolated at `int_*` by the Row Filter. B's job is to "re-evaluate against the new rules," not to re-run the pipeline.
+
+**Why no pipeline re-run / no reading back the raw payload?**
+Because the ingestion layer deliberately runs `format_clean` **before** `business_clean` — a quarantine record that reached ODS already has its **values normalized** (lowercased, trimmed, sentinel→NULL, type-aligned); only the business rules judged it non-compliant. And `DQ_RULE_VERSION` versions only `business_clean` (the value-evaluation rules), never the schema mapping. So "v2 re-evaluation" = **take that record's already-normalized ODS column values and re-run the new `business_clean` once**; all inputs already live in ODS — no raw payload, no re-flattening required.
+
+> Contrast with A (`force=True`): an A record has `status=error`, so **ODS has no such row** — there is nothing to re-evaluate, and the only option is to re-walk the whole pipeline from Raw. This is exactly why `force=True` returns 400 on `processed` records: re-running the pipeline on a quarantine record is using the wrong tool for the wrong problem.
+
+**Where the re-evaluation result is written — Bounded Writeback: append to `quality_events` only, never touch ODS.**
+ODS stays frozen at the ingestion-time truth (`has_clean_error=TRUE, dq_rule_version="v1"`). Once re-evaluation passes, the new fact does not overwrite ODS — it appends one row to the append-only `quality_events`:
+
+```
+event_type:  "promotion"
+from_state:  "quarantined"
+to_state:    "promoted"
+rule_version: "v2"
+event_at:     <re-evaluation time>
+reason:       null (or any residual, now non-blocking, message)
+```
+
+This keeps historical metrics from being retroactively rewritten: how many v1 blocked and how many v2 promoted are two independent, permanently-preserved metrics (see *Historical Quality Metrics*).
+
+**How it flows back to Gold.**
+On the next dbt run, `int_orders` composes the effective quality from "ODS snapshot + latest `quality_events` state" (see the JOIN version under *Mechanism 2: Row Filter*); a record whose latest `to_state='promoted'` is treated as clean and flows naturally into `int_orders → dim_*/fct_*`. The **permanent divergence** of ODS saying dirty (v1) while BQ Gold says clean (v2) is intentional by design, with traceability provided by `dq_rule_version` + `quality_events`.
+
+**Full data flow:**
+
+```
+[ODS] has_clean_error=TRUE, dq_rule_version=v1   ← always this snapshot, never modified
+   │
+   │  Airflow re-evaluation task (Proposal B, Phase 5)
+   ├─ 1. pull staging records with has_clean_error=TRUE (column values already normalized)
+   ├─ 2. re-run v2 business_clean on those existing ODS column values   ← no raw, no pipeline re-run
+   ├─ 3a. passes v2      → append quality_events: promotion (quarantined → promoted, v2)
+   └─ 3b. still fails v2 / manually written off → append rejection (→ permanently_rejected)
+   │
+   ▼
+[quality_events]  append-only; the new fact lives here (ODS is not changed)
+   │
+   ▼
+next dbt run: int_orders composes effective quality from "ODS + latest quality_events state"
+   → records whose latest state is promoted flow into int_orders → dim_*/fct_*
+```
+
+> **Applicability boundary**: this v1→v2 bump is **stricter** (flags more), so it applies going forward only and needs **no retroactive re-evaluation**. Retroactive re-evaluation (B's promote path) only triggers when rules are **loosened** to pull old quarantine back; tightening rules can instead push existing `promoted` records to `re_quarantined` on re-evaluation (the state-machine edge case).
 
 ### State machine
 
@@ -435,7 +513,8 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | Component | Layer | Status |
 |---|---|---|
 | dbt `stg_*` Hard Gate tests | BQ Analytics | ⬜ Phase 4 |
-| `int_orders` Row Filter (`WHERE has_clean_error = FALSE`) | BQ Analytics | ⬜ Phase 4 |
+| `stg_quality_events` dbt model (for `int_*` to JOIN the latest quality state) | BQ Analytics | ⬜ Phase 4 |
+| `int_orders` Row Filter (JOIN latest `quality_events` state: `has_clean_error=FALSE OR to_state='promoted'`) | BQ Analytics | ⬜ Phase 4 |
 | `int_orders_quarantine` dbt model | BQ Analytics | ⬜ Phase 4 |
 | Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Phase 4 |
 | Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 4 |

@@ -125,7 +125,29 @@ Even though BigQuery can DROP/RENAME, staging **deliberately** stays additive-on
 
 ---
 
-## 7. Open Items and Future
+## 7. Correction-Batch Flow-Back (Cloud Side of Proposal C)
+
+[DQ_ARCHITECTURE](./DQ_ARCHITECTURE.md)'s Proposal C (batch repair of historical value defects — a directional design, not yet implemented) touches the cloud layer in four places:
+
+### 7.1 The watermark never sees corrected rows — pushing is an explicit step
+
+Corrected rows keep their original `received_at` (landing back in old partitions), while Approach A's watermark is `MAX(partition_id)` and only looks forward; the scheduled incremental extraction's `received_at >= latest partition` filter will never pick up new rows in old partitions. Pushing to staging must therefore be an explicit runbook step (select the corrected rows by batch id, call the existing `load_to_staging()` to append) — not the scheduled extraction. The watermark mechanism is neither involved nor modified.
+
+### 7.2 Migration shape: reuse the append + dedup channel — no JOIN needed
+
+Staging is append-only: after the corrected rows are appended, the same `raw_id` exists as two rows forever (wrong old + correct new), and the two rows share identical `received_at` / `raw_id` / `order_id` — "take the latest" has no natural sort key, so `stg_` dedup must tie-break on `rebuild_batch_id DESC NULLS LAST`. The batch id is thus a functional part of the flow-back mechanism, not merely an audit column. A bonus: if the blast window's right edge falls on today's partition, the scheduled extraction will pull the corrected rows a second time — harmless, since the duplicate rows are identical down to the batch id and dedup may keep either ("re-pull rather than miss" absorbs this by design). BQ load jobs are atomic per batch; no half-visible loads.
+
+### 7.3 Patch shape: a second table, another hand-maintained declaration, and a re-extract landmine
+
+If corrections land as a separate BQ table, it needs its own `FIELDS` declaration, extraction logic, and a consistency guard on par with `test_schema_bq_consistency` (§5.4's spirit applies equally). And any full staging rebuild (e.g. the repartitioning case in §5.3) re-extracts the main table's wrong values verbatim — the rebuild steps must explicitly include re-pushing corrections, or the wrong values resurrect.
+
+### 7.4 Late-arriving: targeted refresh of the affected partitions
+
+Corrected values land in old partitions; a `received_at`-incremental `stg_` run won't see them. The runbook's final step must be a targeted refresh of the affected partitions (insert_overwrite those partitions, or a one-off full-refresh of the single `stg_` model). A scheduled dbt run that races ahead of the push merely "hasn't taken effect yet" — it is not an inconsistent state.
+
+---
+
+## 8. Open Items and Future
 
 - On micro-batch upgrade: swap `get_watermark()` to Approach B (+ `advance_watermark()`).
 - Move into dbt layering (starting at `stg_`).

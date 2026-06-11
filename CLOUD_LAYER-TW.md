@@ -125,7 +125,29 @@ WHERE table_name = 'orders' AND partition_id NOT IN ('__NULL__', '__UNPARTITIONE
 
 ---
 
-## 7. 待辦與未來
+## 7. 修正批次的回流路徑（Proposal C 的雲端側）
+
+[DQ_ARCHITECTURE-TW](./DQ_ARCHITECTURE-TW.md) 的 Proposal C（歷史值缺陷的批次修復，方向性設計、尚未實作）在雲端層有四件事要知道：
+
+### 7.1 watermark 永遠看不到修正列——上雲是主動步驟
+
+修正列保留原本的 `received_at`（落回舊分區），而方案 A 的 watermark 是 `MAX(partition_id)`、只往前看；例行增量抽取的 `received_at >= 最新分區` 條件永遠撈不到舊分區裡的新列。所以「推上 staging」必須是修復 runbook 的主動步驟（按 batch id 圈出修正列、呼叫既有 `load_to_staging()` append），不是等例行排程。watermark 機制從頭到尾不參與、也不需要動。
+
+### 7.2 遷移式形態：複用 append + dedup 通道，不需要 JOIN
+
+staging 是 append-only：修正列 append 後，同一 `raw_id` 會永遠存在兩列（錯的舊列 + 對的新列），且兩列的 `received_at` / `raw_id` / `order_id` 完全相同——「取最新」沒有現成的排序依據，`stg_` 去重必須以 `rebuild_batch_id DESC NULLS LAST` 決勝。batch id 因此是回流機制的功能性零件，不只是稽核欄位。額外紅利：若災區右邊界落在當天分區，例行抽取會把修正列再抽一次——無害，重複的兩列連 batch id 都相同，去重取誰都一樣（「寧可重抓不漏抓」的既有設計直接吸收）。BQ load job 整批原子，不會出現半批可見。
+
+### 7.3 補丁式形態：第二張表、另一份手維護宣告、一個重抽地雷
+
+corrections 若另成一張 BQ 表：需要自己的 `FIELDS` 宣告、抽取邏輯、與 `test_schema_bq_consistency` 同級的一致性守衛（§5.4 的精神同樣適用）；且任何 staging 全量重建（如 §5.3 的改分區情境）會把主表錯值原樣重抽上去——**重建步驟必須明文包含補推 corrections**，否則錯值復活。
+
+### 7.4 late-arriving：災區分區需 targeted refresh
+
+修正值落在舊分區，按 `received_at` 增量的 `stg_` 例行跑批看不到。runbook 最後一步必須對災區分區做 targeted refresh（insert_overwrite 該批分區，或對 `stg_` 單一模型一次性 full-refresh）。在 push 完成前搶跑的例行 dbt run 只是「尚未生效」，不是錯誤狀態。
+
+---
+
+## 8. 待辦與未來
 
 - 微批升級時：`get_watermark()` 換方案 B（+ `advance_watermark()`）。
 - 進 dbt 分層（`stg_` 起）。

@@ -271,17 +271,19 @@ WHERE
 Row Filter 過濾出的記錄：`Raw.status = "processed"` 且 `has_clean_error = TRUE`。  
 這些記錄**已在 ODS 中**，只是在 `int_*` 層被隔離，不流入 `dim_*/fct_*`。
 
-### Remediation：A + B 並用
+### Remediation：A + B + C 並用
 
-A 和 B 修的是**不同類型**的問題，需明確知道用哪個：
+A、B、C 修的是**不同類型**的問題，需明確知道用哪個：
 
 | | 修什麼 | 路徑 |
 |---|---|---|
 | **A：force=True** | `Raw.status = "error"` 或 `"duplicate"` 的記錄（從未成功寫入 ODS） | `POST /process_raw/{raw_id}?force=true` → 重跑 pipeline → 自然流入下游 |
 | **B：Airflow 重評估** | `Raw.status = "processed"` + `has_clean_error = TRUE` 的記錄（在 ODS，但被 quarantine） | 用新版規則重評估 → 寫 `quality_events` → 下次 dbt run 自然流入 `int_*` |
+| **C：批次修復（backfill）** | `Raw.status = "processed"` 但**值本身被洗壞**的記錄——值產製缺陷（`format_clean` / `from_nested` bug）造成，pipeline 沒失敗、規則也沒誤判 | 從 Raw 以修正後邏輯批次重產 → 兩種落地形態擇一（見下方〈Proposal C〉）→ 連動下游 refresh |
 
 > **注意**：`force=True` 對 quarantine 記錄無效（status="processed" → 回 400）。  
-> Quarantine 記錄的問題是**規則評估**，不是 pipeline 失敗，不需要重跑 pipeline。
+> Quarantine 記錄的問題是**規則評估**，不是 pipeline 失敗，不需要重跑 pipeline。  
+> 而值本身被產製缺陷洗壞時，A 和 B 都修不了：B 的輸入正是被汙染的 ODS 值，且 Bounded Writeback 禁止 B 寫值。那是 Proposal C 的領域。
 
 ### Proposal B：不重跑的重評估流程
 
@@ -344,6 +346,77 @@ quarantined
 promoted
   └── 規則變嚴後重評估失敗   → to_state: "re_quarantined"（邊緣情況）
 ```
+
+---
+
+## Proposal C：歷史值缺陷的批次修復（Q2 延伸，方向性設計）
+
+> **本節的定位**：A（`force=true`）與 B（規則重評）覆蓋不到一類問題——**值產製缺陷**汙染已 `processed` 的歷史值。例如 `format_clean` 的 sentinel 清單誤殺合法值（`"na"` = North America → NULL），把上千筆已 processed 記錄的欄位洗成 NULL。B 的輸入正是被汙染的 ODS 值，且 Bounded Writeback 禁止 B 寫值；A 對 `processed` 回 400。若此路徑在設計上不存在，Raw verbatim「可以重建」的承諾便永遠無法兌現。
+>
+> 因此這裡**預先定義修復路徑的形狀，而不預先做出選擇**。未來真的發生時，應依據災情規模、受影響欄位數、下游消費狀況、團隊對主表操作的風險偏好、修復時程與運維能量等多重因素，在兩種形態之間現場裁量——本節提供的是方向、各自的優缺點、與無論選哪條路都必須面對的注意事項。兩種形態不互斥：同一團隊可以在不同事故中選不同形態，甚至先補丁止損、後擇期重建。
+>
+> 無論選哪種形態，Proposal C 都以**離線、runbook 驅動的批次操作**執行（deliberate infra event）——刻意**不做成** HTTP endpoint，讓 `force=true` 維持唯一的 runtime 修復面、語意邊界不被稀釋。
+
+### C-1 兩種形態
+
+兩者的**重跑端完全相同**（從 Raw 用修正後邏輯重產值），分歧只在「修正值落在哪、如何生效」：
+
+| | 遷移式：範圍化重建（Scoped Rebuild） | 補丁式：修正覆蓋（Correction Overlay） |
+|---|---|---|
+| 核心語意 | 災區列在主 ODS **原位替換**（同 txn 退役舊列 + 寫回新列，帶 `rebuild_batch_id`） | 主 ODS **完全不動**；修正列寫入獨立 `ods_corrections` 表 |
+| 修復後真相 | 主表即單一真相；舊值在 `ods_retired_<batch>` 留檔稽核 | 真相分裂兩表；正確值 = 主表 + overlay 組合讀取 |
+| ODS 不可變契約 | 需重新詮釋：禁止的是「單筆、無版本、下游不知情」的改寫；批次、有版本、留退役副本、強制連動下游者為合法 escape hatch | 字面上完全遵守，契約零重新詮釋 |
+| BQ 落地 | 修正列 append 進**同一張 staging**（原 `received_at` 分區），`stg_` 去重以 `rebuild_batch_id DESC` 決勝 | corrections 另成一張 BQ 表，`stg_` JOIN / COALESCE 覆蓋 |
+| `stg_` 複雜度 | 既有去重邏輯 + 一個決勝鍵，不新增 JOIN 縫 | 新增一條常駐 JOIN 縫；每個讀 `stg_` 上游的人都必須知道 overlay 存在 |
+| 雲端成本 | ≈ 0（複用既有通道） | 金錢上同樣可忽略（BQ 按掃描量計費，小表 JOIN 趨近 0）——成本疑慮是假議題，真正的代價在語意面 |
+| 事故疊加（多次修復） | 每次多一批 append + 一個 batch_id，讀取邏輯不變 | 每次多一批 correction，overlay 需管理批次優先序，讀取路徑複雜度隨次數成長 |
+| 未來全量重抽 staging | 安全——主表已正確 | 主表錯值會被原樣重抽，必須記得補推 corrections（見 P3） |
+| PG 端其他消費者 | 自動拿到正確值 | 拿到錯值，除非自行實作 overlay |
+| 回滾 | 反向再做一個 batch（從 retired 表蓋回），同一機制自我支撐 | 撤銷／作廢該批 correction 即可，主表從未被碰過 |
+| 不可逆點 | PG commit 一刻（前置 dry-run diff + 人工閘門） | 無——天然低風險 |
+| 成本結構 | 操作較重，但**一次付清**，修復後架構回到原狀 | 操作極輕、見效快，但複雜度**常駐**於讀取路徑與未來運維 |
+| 傾向因素 | 災情大（多筆多欄位的系統性汙染）、預期主表還會被全量重抽、團隊在意長期單一真相、有足夠運維窗口執行重建 | 災情小而定點、不容許碰主表的風險偏好、需要快速止損、或團隊暫無執行遷移式操作的人力／窗口 |
+
+### C-2 兩案共同必須面對的注意事項（無論選哪條路都逃不掉）
+
+| # | 注意事項 | 內容 |
+|---|---|---|
+| 1 | 部署順序 | **先部署修正版止血**，災區右邊界才會凍結；先修復後部署會永遠追不完 |
+| 2 | 災區圈定 | 用 **`ODS.received_at`**（值的產製時刻）圈，不可用 `Raw.received_at`——scan 重撿的列其 Raw 時間可能在窗口外，會漏網 |
+| 3 | 重跑路徑 | 只能重用 `from_nested → clean_order` 純函數；**不可走 `process_raw_event`**（first-write-wins pre-check 會把要替換的自己判成 duplicate） |
+| 4 | 主動 push | 修正列 `received_at` 在舊分區，watermark（只往前看）永遠看不到——上雲是 runbook 的主動步驟，不是等例行排程（見 [CLOUD_LAYER-TW.md](./CLOUD_LAYER-TW.md) §7） |
+| 5 | 批次版本軸 | `DQ_RULE_VERSION` 只版本化評估語意——`format_clean` 的值缺陷可能**改了值卻不改 `has_clean_error`**，完全逃過 bump 判準；值產製語意需獨立的 batch id（`reprocess_batches` 表），它同時是 `stg_` 決勝／overlay 優先序的功能性零件，不只是稽核欄位 |
+| 6 | quality_events | 修正後重評 `business_clean`，append `re_evaluation` 事件（帶 batch id），否則 Row Filter 的有效狀態對不上帳 |
+| 7 | late-arriving | 修正值落在舊分區，按 `received_at` 增量的 `stg_` 例行跑批看不到——runbook 最後一步必須對災區分區 targeted refresh（見 [CLOUD_LAYER-TW.md](./CLOUD_LAYER-TW.md) §7） |
+| 8 | 分歧窗口 | PG 已新值、BQ 尚舊值的窗口與 Proposal B 的回流延遲同構（T+1 最終一致可接受），但 push + refresh 必須是綁死的 runbook 步驟，不可做一半收工 |
+
+### C-3 選擇遷移式時，額外的注意事項
+
+| # | 注意事項 | 內容 |
+|---|---|---|
+| M1 | 原子性 | retired 複製、主表 delete+insert、quality_events 事件**三者同一 transaction**——拆開會留下「值換了但狀態機沒記錄」的裂縫 |
+| M2 | statement_timeout | 全域 30s timeout 為線上短交易設計，會斬掉萬列級批次——rebuild 連線必須自行覆寫 |
+| M3 | 並行安全 | MVCC 下中間態不可見：並行 duplicate pre-check 讀舊列、TOCTOU INSERT 阻塞到 commit 後吃 IntegrityError，行為與平常一致（無需額外處理，但需理解並文件化） |
+
+### C-4 選擇補丁式時，額外的注意事項
+
+| # | 注意事項 | 內容 |
+|---|---|---|
+| P1 | 覆蓋優先序 | 同一 raw_id 被修正兩次時，overlay 需自行實作「取最新批次」邏輯（遷移式由主表天然解決） |
+| P2 | 第二條抽取路徑 | corrections 表需要自己的 FIELDS 宣告、抽取邏輯、與 `test_schema_bq_consistency` 同級的一致性守衛 |
+| P3 | 全量重抽 runbook | 任何 staging 重建（如改分區）後必須補推 corrections——需明文寫進重建步驟，否則錯值復活 |
+| P4 | 消費者契約 | 「讀 ODS 必須套 overlay」成為新的隱性契約，需要文件與守衛防止未來的人直讀主表 |
+
+### C-5 裁量時的考量面向（不預先給答案）
+
+事故當下建議至少過一遍以下面向，再決定形態：
+
+- **災情規模與形狀**：幾筆？幾個欄位？集中在一個時間窗口還是散落？
+- **下游消費狀況**：錯值已被哪些報表／模型消費？修復急迫性多高？
+- **風險偏好**：團隊能否接受對主表的批次操作？有沒有執行窗口與人力做 dry-run 審核？
+- **長期維護成本**：這條 overlay 縫由誰維護？團隊一年後還記得它的存在嗎？
+- **疊加可能性**：同類事故預期是一次性還是會再發生？（會再發生 → 常駐縫的複利成本要算進去）
+- **混合路徑**：兩形態不互斥——可先補丁快速止損，待運維窗口充裕時擇期以遷移式收斂回單一真相（補丁批次即遷移式的有效輸入，機制相容）
 
 ---
 
@@ -524,10 +597,11 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 
 ## 已知邊界與設計決策
 
-**A/B Remediation 的邊界必須明確**  
+**A/B/C Remediation 的邊界必須明確**  
 `force=True`（A）只能用於 `Raw.status = "error"` 或 `"duplicate"` 的記錄。  
 Quarantine 記錄（`has_clean_error=TRUE`，`status="processed"`）只能走 Proposal B 重評估路徑。  
-混用會導致 `force=True` 回 400 且無法診斷原因，需在操作文件中明確說明。
+值產製缺陷洗壞的歷史值（pipeline 成功、規則沒誤判、值本身錯了）A 與 B 皆無能為力——走 Proposal C 批次修復，以 runbook 驅動的 deliberate ops event 執行，永不做成 HTTP endpoint。  
+混用會導致 `force=True` 回 400 且無法診斷原因，這些邊界需在操作文件中明確說明。
 
 **ODS 與 BQ 品質狀態永久分歧**  
 ODS 永遠反映攝入當下的品質評估（以 `dq_rule_version` 記錄使用的規則版本）。  

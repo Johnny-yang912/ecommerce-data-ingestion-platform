@@ -271,17 +271,19 @@ WHERE
 Records filtered out by the Row Filter: `Raw.status = "processed"` and `has_clean_error = TRUE`.  
 These records **already exist in ODS** — they are not missing from the pipeline; they are simply isolated at the `int_*` layer and do not flow into `dim_*/fct_*`.
 
-### Remediation: A + B together
+### Remediation: A + B + C together
 
-A and B fix **different types of problems**. It is essential to know which path applies to which scenario:
+A, B and C fix **different types of problems**. It is essential to know which path applies to which scenario:
 
 | | What it fixes | Path |
 |---|---|---|
 | **A — force=True** | Records with `Raw.status = "error"` or `"duplicate"` (never successfully written to ODS) | `POST /process_raw/{raw_id}?force=true` → re-runs pipeline → flows downstream naturally |
 | **B — Airflow re-evaluation** | Records with `Raw.status = "processed"` + `has_clean_error = TRUE` (in ODS, but quarantined at BQ layer) | Re-evaluate against updated rules → write to `quality_events` → promoted on next dbt run |
+| **C — batch repair (backfill)** | Records with `Raw.status = "processed"` whose **values themselves were corrupted** by a value-production defect (`format_clean` / `from_nested` bug) — the pipeline did not fail and the rules did not misjudge | Batch re-derive from Raw under the fixed logic → land via one of two shapes (see *Proposal C* below) → cascade a downstream refresh |
 
 > **Important**: `force=True` does **not** work on quarantine records (`status = "processed"` → returns 400).  
-> Quarantine records have a **rule evaluation problem**, not a pipeline failure — re-running the pipeline cannot fix them.
+> Quarantine records have a **rule evaluation problem**, not a pipeline failure — re-running the pipeline cannot fix them.  
+> And when the values themselves were corrupted by a production defect, neither A nor B can help: B's input *is* the corrupted ODS values, and Bounded Writeback forbids B from writing values. That is Proposal C's territory.
 
 ### Proposal B: re-evaluation without re-running the pipeline
 
@@ -344,6 +346,77 @@ quarantined
 promoted
   └── stricter rules re-eval fails → to_state: "re_quarantined"  (edge case)
 ```
+
+---
+
+## Proposal C: Batch Repair of Historical Value Defects (Q2 Extension — Directional Design)
+
+> **Positioning.** A (`force=true`) and B (rule re-evaluation) cannot reach one class of problem: a **value-production defect** corrupting already-`processed` historical values — e.g. a `format_clean` sentinel list mistakenly treating a legitimate value as a fake null (`"na"` = North America → NULL), washing a field to NULL across thousands of `processed` records. B's input *is* the corrupted ODS values, and Bounded Writeback forbids B from writing values; A returns 400 on `processed`. If this path does not exist by design, the promise that Raw verbatim "enables rebuilding" can never be honored.
+>
+> This section therefore **pre-defines the shape of the repair path without pre-committing to a choice**. When an incident actually happens, the team should weigh blast-radius size, number of affected fields, downstream consumption, risk appetite toward operating on the anchor table, repair urgency, and operational capacity — and decide between the two shapes on the spot. This section provides direction, trade-offs, and the cautions that apply no matter which path is chosen. The two shapes are not mutually exclusive: different incidents may warrant different shapes, and a team may patch first to stop the bleeding, then rebuild later at leisure.
+>
+> Whichever shape is chosen, Proposal C is executed as an **offline, runbook-driven batch operation** (a deliberate infra event) — deliberately *not* an HTTP endpoint, so `force=true` remains the only runtime remediation surface and its semantic boundary stays undiluted.
+
+### C-1 The two shapes
+
+The **re-derivation side is identical** in both (re-produce values from Raw with the fixed logic); they diverge only in *where the corrected values land and how they take effect*:
+
+| | Migration shape: Scoped Rebuild | Patch shape: Correction Overlay |
+|---|---|---|
+| Core semantics | Affected rows **replaced in place** in main ODS (retire old rows + write back new rows in one txn, tagged `rebuild_batch_id`) | Main ODS **untouched**; corrected rows land in a separate `ods_corrections` table |
+| Post-repair truth | Main table is the single truth; old values retired into `ods_retired_<batch>` for audit | Truth split across two tables; correct value = main table + overlay, composed at read time |
+| ODS immutability contract | Requires re-interpretation: what is forbidden is "single-row, unversioned, downstream-unaware" rewriting; a batch, versioned, retired-copy-keeping, downstream-cascading replacement is the legitimate escape hatch | Literally fully honored, zero re-interpretation |
+| BQ landing | Corrected rows appended into the **same staging table** (original `received_at` partitions); `stg_` dedup tie-breaks on `rebuild_batch_id DESC` | Corrections become a second BQ table; `stg_` overlays via JOIN / COALESCE |
+| `stg_` complexity | Existing dedup logic + one tie-breaker; no new JOIN seam | Adds a permanent JOIN seam; every upstream reader of `stg_` must know the overlay exists |
+| Cloud cost | ≈ 0 (reuses the existing channel) | Also negligible in money (BQ bills by bytes scanned; a small-table JOIN rounds to zero) — the cost worry is a non-issue; the real price is semantic |
+| Incident stacking (repeat repairs) | Each repair is just another appended batch + batch id; read logic unchanged | Each repair adds another correction batch; overlay must manage batch precedence; read-path complexity grows per incident |
+| Future full re-extract of staging | Safe — main table already correct | Main-table wrong values get re-extracted verbatim; corrections must be re-pushed (see P3) |
+| Other PG-side consumers | Automatically get correct values | Get wrong values unless they implement the overlay themselves |
+| Rollback | A reverse batch (cover back from the retired table) — same mechanism, self-supporting | Simplest — void the correction batch; the main table was never touched |
+| Point of no return | The PG commit (gated by dry-run diff + human confirmation) | None — naturally low-risk |
+| Cost structure | Heavier operation, **paid once**; architecture returns to its original shape afterwards | Very light operation, fast to take effect, but complexity becomes **permanent** in the read path and future ops |
+| Leaning factors | Large blast radius (systemic, multi-row multi-field corruption); a future staging full re-extract is expected; team values long-term single truth; an ops window exists for a rebuild | Small, targeted blast radius; risk appetite forbids touching the anchor table; need to stop the bleeding fast; or no staffing / window for a migration-style operation |
+
+### C-2 Cautions both shapes must face (unavoidable either way)
+
+| # | Caution | Content |
+|---|---|---|
+| 1 | Deployment order | **Deploy the fix first** to stop the bleeding — only then is the blast window's right edge frozen; repairing before deploying chases a moving target forever |
+| 2 | Blast-window scoping | Scope by **`ODS.received_at`** (the moment values were produced), not `Raw.received_at` — records re-processed later by the recovery scan have Raw timestamps outside the window and would be missed |
+| 3 | Re-derivation path | Reuse only the pure functions `from_nested → clean_order`; **never go through `process_raw_event`** — its first-write-wins pre-check would see the very row being replaced and mark the whole batch `duplicate` |
+| 4 | Active push | Corrected rows carry old `received_at` values (old partitions); the watermark (forward-looking only) will never see them — pushing to the cloud is an explicit runbook step, not the scheduled extraction (see [CLOUD_LAYER.md](./CLOUD_LAYER.md) §7) |
+| 5 | Batch version axis | `DQ_RULE_VERSION` versions evaluation semantics only — a `format_clean` value bug may change values **without** changing `has_clean_error`, escaping the bump criterion entirely; value production needs its own batch id (a `reprocess_batches` registry), which doubles as the functional tie-breaker for `stg_` dedup / overlay precedence — not merely an audit column |
+| 6 | quality_events | Re-run `business_clean` on the corrected values and append a `re_evaluation` event (carrying the batch id), or the Row Filter's effective-state composition stops reconciling |
+| 7 | Late-arriving | Corrected values land in old partitions; a `received_at`-incremental `stg_` run won't see them — the runbook's final step must be a targeted refresh of the affected partitions (see [CLOUD_LAYER.md](./CLOUD_LAYER.md) §7) |
+| 8 | Divergence window | Between PG commit and BQ refresh, PG holds new values while BQ Gold still holds old ones — isomorphic to Proposal B's flow-back delay (acceptable under T+1 eventual consistency), but push + refresh must be bound runbook steps, never left half-done |
+
+### C-3 Additional cautions when choosing the migration shape
+
+| # | Caution | Content |
+|---|---|---|
+| M1 | Atomicity | Retired copy, main-table delete+insert, and the `quality_events` events go in **one transaction** — splitting them leaves a "values swapped but state machine unrecorded" crack |
+| M2 | statement_timeout | The global 30s timeout is designed for short online transactions and will kill a ten-thousand-row batch — the rebuild connection must override it |
+| M3 | Concurrency safety | Under MVCC the intermediate state is invisible: concurrent duplicate pre-checks read the old rows; a TOCTOU INSERT blocks until commit then hits `IntegrityError`, identical to normal behavior (no extra handling needed, but must be understood and documented) |
+
+### C-4 Additional cautions when choosing the patch shape
+
+| # | Caution | Content |
+|---|---|---|
+| P1 | Overlay precedence | When the same `raw_id` is corrected twice, the overlay must implement "latest batch wins" itself (the migration shape gets this for free from the main table) |
+| P2 | A second extraction path | The corrections table needs its own `FIELDS` declaration, extraction logic, and a consistency guard on par with `test_schema_bq_consistency` |
+| P3 | Full re-extract runbook | Any staging rebuild (e.g. repartitioning) must re-push corrections — write it into the rebuild steps explicitly, or the wrong values resurrect |
+| P4 | Consumer contract | "Reading ODS requires applying the overlay" becomes a new implicit contract, needing documentation and guards against future direct reads of the main table |
+
+### C-5 Factors to weigh at decision time (no pre-baked answer)
+
+When the incident happens, walk through at least the following before picking a shape:
+
+- **Blast radius and shape**: how many rows? how many fields? one contiguous window or scattered?
+- **Downstream consumption**: which reports / models have consumed the wrong values? how urgent is the repair?
+- **Risk appetite**: can the team accept a batch operation on the anchor table? is there a window and staffing for a dry-run review?
+- **Long-term maintenance**: who owns the overlay seam? will the team remember it exists a year from now?
+- **Recurrence**: is this class of incident one-off or expected to recur? (recurring → price in the compounding cost of a permanent seam)
+- **Hybrid path**: the shapes compose — patch first to stop the bleeding, then converge back to single truth with a scoped rebuild when an ops window opens (the patch batch is valid input to the rebuild; the mechanisms are compatible)
 
 ---
 
@@ -524,10 +597,11 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 
 ## Known Boundaries and Design Decisions
 
-**A/B remediation boundary must be explicit**  
+**A/B/C remediation boundaries must be explicit**  
 `force=True` (Proposal A) is only valid for `Raw.status = "error"` or `"duplicate"` records.  
 Quarantine records (`has_clean_error = TRUE`, `status = "processed"`) must go through Proposal B re-evaluation.  
-Misuse results in a 400 from `force=True` with no clear diagnostic message — this boundary must be documented in operational runbooks.
+Historical values corrupted by a value-production defect (pipeline succeeded, rules did not misjudge — the values themselves are wrong) are beyond both A and B; they go through Proposal C batch repair, a runbook-driven deliberate ops event, never an HTTP endpoint.  
+Misuse results in a 400 from `force=True` with no clear diagnostic message — these boundaries must be documented in operational runbooks.
 
 **ODS and BQ quality state permanently diverge**  
 ODS always reflects the quality assessment at ingestion time, with `dq_rule_version` recording which rule version was in effect.  

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Date, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Date, Boolean, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 from database import Base
@@ -30,7 +30,7 @@ class ODS(Base):
 
     id = Column(Integer, primary_key=True)
     received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    raw_id = Column(Integer, nullable=True, unique=True)
+    raw_id = Column(Integer, ForeignKey("raw.id", ondelete="NO ACTION"), nullable=False, unique=True)
 
     # 訂單主體
     order_id = Column(String(50), nullable=False, index=True, unique=True)

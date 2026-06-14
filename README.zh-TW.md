@@ -116,6 +116,16 @@ Raw 是 landing 層：**逐字保留原文**（直接存原始 request body，�
 **ODS 層 first-write-wins idempotency**
 同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
 
+**嚴格禁止繞過 Raw 直接落地 ODS（single-ingress invariant）**
+本服務是資料網格的攝取單元、呼叫者是少數且穩定的 machine-to-machine 上游、無人類使用者（見〈服務對服務驗證決策〉），新增來源是有計畫的基建事件。這個定位抽掉了「臨時人工直寫 DB」這類繞過的正當動機——因此本系統把「所有資料一律經 Raw 進入」立為硬不變式：**ODS 永遠是 pipeline 的產物，不接受任何繞過 Raw 的直落列**。
+理由不只「可行」，更是「必要」：① `source_client_id`（資料血緣起點）由驗證層解析，繞過 Raw 的列無從建立來源；② Raw 逐字保留是「可重建」承諾的根（Proposal C 從 Raw 重產值），無 Raw 錨點的列無法被重建；③ `has_clean_error` / schema drift / `quality_events` 初評全由 `process_raw_event` 產生，直寫 ODS 會讓品質狀態機出現無中生有的列。值得一提的是，連 schema 容忍的「手動 replay / backfill / 直接寫 DB」也是建模在 **Raw 層**（`Raw.source_client_id` 可為 NULL 代表來源未知的 Raw 列），而非 ODS——設計本就一致地把「直寫」收束在 Raw。
+此不變式已從「政策」升級為「DB 保證」：`ods.raw_id` 為 **NOT NULL** + **FK `ods.raw_id → raw.id`（`ON DELETE NO ACTION`）**。前者擋掉「無錨點的孤兒列」，後者擋掉「捏造一個不存在的 raw_id 直寫」，並保證 raw 不得先於其 ODS 子列被刪（連帶保護 Proposal C 的重建前提）。
+
+**raw_id 是物理身分、order_id 是業務身分——連帶下游去重鍵的選擇**
+ODS 兩把唯一鍵分工不同：**`raw_id` 是物理／代理身分**（landing 層發的代理鍵，與一筆物理落地記錄 1:1、immutable、血緣錨點）；**`order_id` 是業務自然鍵**（其唯一性是「當前的業務約束」，可能隨業務演進而變——訂單版本化、退貨拆列、SCD 等）。
+這個區分直接決定**下游去重鍵的選擇**：去重的本質是「把同一筆物理記錄的多份副本收斂成一份」，屬物理身分操作，故 dbt `stg_` 去重以 **`raw_id`** 為 grain，而非 `order_id`。BQ staging 是 append-only 鏡射，Proposal C 修正列與例行重抽都會產生同一筆記錄的物理重複，收斂它們的依據是「同一物理列」＝ raw_id；若改用 order_id，等於把物理去重耦合到一條可能放寬的業務約束上，一旦 order_id 唯一性鬆動就會默默吃掉本該並存的列。下游 `int_*` 合成「有效品質狀態」時 JOIN `quality_events` 也以 raw_id 為鍵，與去重 grain 一致。
+這也是 `raw_id` 必須 NOT NULL 的隱性理由：`UNIQUE` 在 PostgreSQL **不拒絕 NULL**（允許多筆 NULL 並存），`UNIQUE + nullable` 會讓「以 raw_id 為 grain 的去重」把多筆 NULL 列收斂成一列而靜默漏資料；收成 NOT NULL（+ FK）後此破口閉合。
+
 **`Raw.status` 與 `ODS.order_status` 無關**
 `Raw.status` 是 pipeline 狀態機（`pending → processing → processed / error / duplicate`），由 `try_claim_raw` 與 `_commit_raw_status` 驅動。`ODS.order_status` 是業務欄位，從進來的 payload 攤平而來，描述訂單在攝入當下的履約狀態（如 `"confirmed"`、`"pending_payment"`），與 pipeline 的處理進度無關。此 API 只負責接收訂單建立事件；後續狀態變更（付款、出貨、取消）來自其他系統，超出此 pipeline 的 scope，由 dbt 層 JOIN 其他來源表組合。
 

@@ -418,6 +418,28 @@ promoted
 - **疊加可能性**：同類事故預期是一次性還是會再發生？（會再發生 → 常駐縫的複利成本要算進去）
 - **混合路徑**：兩形態不互斥——可先補丁快速止損，待運維窗口充裕時擇期以遷移式收斂回單一真相（補丁批次即遷移式的有效輸入，機制相容）
 
+### C-6 raw_id FK 對 Proposal C 的影響（single-ingress invariant 的具現化）
+
+`ods.raw_id → raw.id`（`ON DELETE NO ACTION`，配 raw_id NOT NULL + UNIQUE = 1:1）不是 Proposal C 的對立面，而是它**隱含契約的強制化**：C 的核心前提就是「從 Raw 重產值」，這本就要求父列 raw 存在。FK 只是把「我們假設 raw 在」變成「DB 保證 raw 在」。
+
+**逐形態影響**
+
+| 形態 | 影響 |
+|---|---|
+| 遷移式（in-place 替換） | **天生 FK-safe**：重產列沿用既有 raw_id，raw 從不刪故必過；回滾（從 retired 蓋回）同理。額外紅利：C-2 #3 手動 INSERT 路若漏帶／捏造 raw_id，從靜默孤兒升級為當場 FK violation |
+| 補丁式（corrections 表） | 主 ODS 的 FK 對另表零干涉。一致性建議：未來建 `ods_corrections` 時，其 `raw_id` 比照加 FK 到 `raw.id` |
+
+**runbook 增補條目**
+
+| # | 註記 | 理由 |
+|---|---|---|
+| C-6.1 | `ods_retired_<batch>` / archive 表**不可繼承 FK**（plain table 或 `LIKE ... EXCLUDING CONSTRAINTS`） | 否則退役副本會 pin 住 raw 列或 archive 失敗 |
+| C-6.2 | dry-run 閘門**新增斷言**：災區每筆 ODS 的 raw_id 都能在 `raw` 解析到（摺進 C-1「不可逆點」既有的人工閘門） | FK 本就會擋，但在 dry-run 先抓，避免 runbook 做一半才爆 |
+| C-6.3 | FK lookup 成本併入既有 M2 的 `statement_timeout` 覆寫考量 | 每筆 INSERT 多一次 raw.id PK 索引查找，對萬列批次可忽略，無新動作 |
+| C-6.4 | 批次 INSERT 對 raw 取 `FOR KEY SHARE` 列鎖——與正常 pipeline **不衝突**（`try_claim_raw`/`_commit_raw_status` 改非 key 欄，取 `FOR NO KEY UPDATE`，相容）；災區 raw 列皆 `processed` 終態，實際競爭 ≈ 0 | 理解並文件化即可，比照 M3 精神 |
+
+**連帶前提（非 Proposal C 內部，但被 FK 形式化）**：Raw retention——FK 形式化了「raw 必須活得比它的 ods 列久」，這本就是 C 能重建的前提。若未來引入任何 Raw purge/TTL，必須尊重此序（NO ACTION 的 FK 會主動擋下「刪到仍被 ODS 引用的 raw」，行為正確，但會改變 purge 語意）。導入 FK 前應先盤點目前是否有任何流程在刪 raw。
+
 ---
 
 ## 版本號與 quality_events 表（Q2 延伸）

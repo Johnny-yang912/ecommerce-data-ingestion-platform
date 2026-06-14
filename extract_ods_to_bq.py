@@ -48,7 +48,7 @@ CLUSTERING_FIELDS = ["order_id", "has_clean_error"]
 FIELDS: list[tuple[str, str, str]] = [
     ("id", "INTEGER", "REQUIRED"),            # ODS PK，保留以維持 1:1 原樣鏡射
     ("received_at", "TIMESTAMP", "REQUIRED"),  # 分區欄位
-    ("raw_id", "INTEGER", "NULLABLE"),
+    ("raw_id", "INTEGER", "REQUIRED"),         # 與 ODS NOT NULL 鏡射；REQUIRED 兼作 fail-loud 護欄
     # 訂單主體
     ("order_id", "STRING", "REQUIRED"),        # 叢集欄位①
     ("order_date", "DATE", "NULLABLE"),

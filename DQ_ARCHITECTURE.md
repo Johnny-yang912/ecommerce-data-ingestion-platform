@@ -418,6 +418,28 @@ When the incident happens, walk through at least the following before picking a 
 - **Recurrence**: is this class of incident one-off or expected to recur? (recurring → price in the compounding cost of a permanent seam)
 - **Hybrid path**: the shapes compose — patch first to stop the bleeding, then converge back to single truth with a scoped rebuild when an ops window opens (the patch batch is valid input to the rebuild; the mechanisms are compatible)
 
+### C-6 Impact of the raw_id FK on Proposal C (materializing the single-ingress invariant)
+
+`ods.raw_id → raw.id` (`ON DELETE NO ACTION`, with raw_id NOT NULL + UNIQUE = 1:1) is not the opposite of Proposal C but the **enforcement of a contract it already relies on**: C's core premise is "re-derive values from Raw," which already requires the parent raw row to exist. The FK merely turns "we assume raw is there" into "the DB guarantees raw is there."
+
+**Per-shape impact**
+
+| Shape | Impact |
+|---|---|
+| Migration (in-place replace) | **FK-safe by construction**: the rebuilt row reuses the existing raw_id, and raw is never deleted, so the insert always passes; rollback (overwrite from retired) likewise. Bonus: if the C-2 #3 manual INSERT path drops/fabricates raw_id, it escalates from a silent orphan to an immediate FK violation |
+| Patch (corrections table) | The main-ODS FK does not touch the separate table at all. Consistency recommendation: when `ods_corrections` is eventually built, give its `raw_id` the same FK to `raw.id` |
+
+**Runbook additions**
+
+| # | Note | Why |
+|---|---|---|
+| C-6.1 | `ods_retired_<batch>` / archive tables **must not inherit the FK** (plain table, or `LIKE ... EXCLUDING CONSTRAINTS`) | otherwise the retired copy pins raw rows or archiving fails |
+| C-6.2 | The dry-run gate **adds an assertion**: every blast-window ODS row's raw_id still resolves in `raw` (folded into C-1's existing irreversible-point human gate) | the FK would block it anyway, but catching it at dry-run avoids a half-done runbook |
+| C-6.3 | FK lookup cost folds into M2's existing `statement_timeout` override | each INSERT adds one raw.id PK index lookup — negligible for a 万-row batch, no new action |
+| C-6.4 | The batch INSERT takes `FOR KEY SHARE` row locks on raw — **no conflict** with the normal pipeline (`try_claim_raw`/`_commit_raw_status` change non-key columns, taking `FOR NO KEY UPDATE`, which is compatible); blast-window raw rows are all `processed` terminal, so real contention ≈ 0 | understand and document, in the spirit of M3 |
+
+**Adjacent precondition (outside Proposal C, but formalized by the FK)**: Raw retention — the FK formalizes that "raw must outlive its ods row," which is already a precondition for C to rebuild. If any Raw purge/TTL is ever introduced, it must respect this ordering (the NO ACTION FK actively blocks "deleting a raw still referenced by ODS" — correct behavior, but it changes purge semantics). Inventory whether any process currently deletes raw before introducing the FK.
+
 ---
 
 ## Rule Versioning and the quality_events Table (Q2 Extension)

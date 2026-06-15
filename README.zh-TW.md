@@ -275,6 +275,15 @@ Periodic scan 與 startup scan 會撈出所有 `status='pending'` 的 Raw 記錄
 **未來換 Queue 時的修正方向**
 根本解法是讓「已排進 Queue」這件事對 DB 可見，具體做法是在狀態機中加入 `queued` 狀態（`pending → queued → processing → processed/error/duplicate`），並把入隊動作與狀態轉移綁在一起：寫入 Raw 後立刻以 CAS 原子性地將 `pending` 轉為 `queued`，成功才 push 進 Queue；scan 只撈 `pending`（即「從未成功入隊」的記錄），`queued` 的記錄一律跳過。Worker 的 CAS claim 對象也對應改為 `queued → processing`。唯一需要額外處理的邊界情況是：`pending → queued` 寫入 DB 成功、但 Queue push 失敗，此時記錄會卡在 `queued`——scan 需另外掃描超時的 stale `queued` 記錄並重設為 `pending`，讓它重新走一遍入隊流程。
 
+**字串內含 NUL（0x00）會導致 Raw 卡在 `processing`（已修）**
+在一次端對端測試中，以 `{"order_status": "ok\u0000bad"}` 這類 payload 打進 `/orders`，結果該筆 Raw 既沒成功寫入 ODS、也沒落到任何終態，而是一直卡在 `processing`，並被 scan recovery 每 10 分鐘撈回來重排一次（poison-pill）。
+
+問題的根本是「同一個 NUL 值在管線不同階段有不同的表示形式，而防護與危害落在不同的表示空間」。`main.py` 的攝取防護 `raw_body.replace("\x00", "")` 只清除 HTTP body 中**真實的 0x00 byte**；但 `\u0000` 在 body 裡是 6 個合法的 ASCII 字元（`\` `u` `0` `0` `0` `0`），裡面根本沒有 0x00，所以防護什麼都沒清、raw_payload 也正常落地。真正的 NUL 是後段 `process.py` 的 `json.loads` 把 `\u0000` **解碼**後才生出來的——此時 `order_status` 才變成含真實 0x00 的字串，寫入 ODS 文字欄時 PostgreSQL/psycopg2 拋出 `ValueError: A string literal cannot contain NUL (0x00) characters.`（NUL 在 TEXT 與 JSONB 都無法儲存）。更關鍵的是，這個 `ValueError` 發生在 success-path 的 commit loop，而該處原本只特判 `IntegrityError`（duplicate）與 `DataError`（欄位超限），`ValueError` 落入泛用的 `except Exception` 被當成「暫時性錯誤」一再重試——但它其實是 deterministic（重試必然再失敗），於是重試耗盡後卡在 `processing`、被 scan 反覆重排，形成 poison-pill。
+
+**目前的解法**：在 commit loop 的 `DataError` 之後補上 `except ValueError` 分支，把它比照 `DataError` 一樣 fast-fail 到終態 `error`（並可用 `POST /process_raw/{id}?force=true` replay）。這治的是「deterministic 錯誤被誤判為暫時性而無限重試」這一層：資料不再卡在 `processing`，poison-pill 消除。代價是這類資料**會被拒絕、不進 ODS**，語意與 `DataError` 一致。
+
+**未來考量**：目前是「拒絕」而非「接受後標記」。若希望這類訂單也能落地（符合本專案 `has_clean_error` 的非阻斷品質哲學），可改在 `clean.py` 於寫入前 sanitize 文字欄與 items 巢狀字串中的 NUL、標記成一個新的清洗錯誤碼（如 `nul_in_text`），讓資料帶標籤落地、由下游 quarantine 處理——做法可直接類比現有 items 的 NaN/Inf sanitize（建立「ODS 永不儲存 NUL」的不變量）。此變更會動到清洗規則，需 bump `DQ_RULE_VERSION`。
+
 ---
 
 ## API 端點

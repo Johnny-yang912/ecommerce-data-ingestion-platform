@@ -228,6 +228,15 @@ def process_raw_event(raw_id: int) -> None:
                 logger.error("ODS 寫入 DataError（如欄位長度超限），標記 error", error=str(e))
                 _commit_raw_status(db, raw_id, "error", f"DataError: {type(e).__name__}: {e}")
                 return
+            except ValueError as e:
+                # NUL（0x00）等「合法資料但儲存引擎不可存」的值：psycopg2 在參數轉換階段
+                # 拋 bare ValueError（非 DBAPI Error → SQLAlchemy 不包裝）。與 DataError 同屬
+                # deterministic（重試必敗），同樣 fast-fail 到終態 error，避免 poison-pill。
+                # 典型來源：上游送 JSON `\u0000` escape，json.loads 後成真實 NUL 字元落到文字/JSONB 欄。
+                db.rollback()
+                logger.error("ODS 寫入 ValueError（如字串含 NUL），標記 error", error=str(e))
+                _commit_raw_status(db, raw_id, "error", f"ValueError: {type(e).__name__}: {e}")
+                return
             except Exception as e:
                 db.rollback()
                 if status_attempt < MAX_STATUS_RETRIES - 1:

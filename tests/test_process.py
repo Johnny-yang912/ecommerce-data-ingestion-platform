@@ -383,6 +383,46 @@ class TestDataErrorFastFail:
         assert mock_error.called
 
 
+# ─── ValueError fast-fail（字串含 NUL 等儲存引擎不可存的值）──────────────────
+
+class TestValueErrorFastFail:
+
+    def test_value_error_on_ods_commit_marks_error_without_retry(self):
+        """
+        ODS 寫入觸發 ValueError（如字串含 NUL：上游送 JSON ` ` escape，
+        json.loads 後成真實 0x00 字元，psycopg2 在參數轉換階段拋 bare ValueError）
+        → fast-fail 終態 error，不重試。
+        驗證：此 deterministic 失敗不會卡在 processing 被反覆重排（poison-pill）。
+        """
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),   # pre-check
+                MagicMock(),       # UPDATE status（success commit，將 ValueError）
+                MagicMock(),       # _commit_raw_status：UPDATE error
+            ],
+            commit_effects=[
+                None,                                                       # claim
+                ValueError("A string literal cannot contain NUL (0x00) characters."),  # success commit
+                None,                                                       # _commit_raw_status
+            ],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch.object(process.logger, "error") as mock_error:
+            process_raw_event(1)
+
+        # claim + 失敗的 success commit + error status = 3 次 commit
+        assert mock_db.commit.call_count == 3
+        assert mock_db.rollback.call_count == 1
+        # ods + quality_event 各只 add 一次，ValueError 後不重試、不 re-add
+        assert mock_db.add.call_count == 2
+        assert mock_error.called
+
+
 # ─── Idempotency: first-write-wins ───────────────────────────────────────────
 
 class TestIdempotency:

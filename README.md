@@ -137,8 +137,14 @@ This is also the implicit reason `raw_id` must be NOT NULL: `UNIQUE` in PostgreS
 **Atomic claim logic (`try_claim_raw`)**
 Uses `UPDATE ... WHERE status = 'pending'` and checks `rowcount == 1` to prevent duplicate processing under concurrent workers without pessimistic locking.
 
-**Per-IP rate limiting only — no global cap**
-A global limit must be derived from "expected concurrent active IPs × per-IP limit" — without real traffic data this number is arbitrary and carries unclear semantics. More fundamentally, a `/minute` window cannot prevent instantaneous bursts, and pool exhaustion is already handled by `SATimeoutError → 503`. Rate limiting's responsibility is narrowed to defending against sustained single-IP abuse.
+**Per-client rate limiting (keyed on the authenticated `client_id`) — no global cap**
+The limiter keys on the `client_id` resolved by auth, not on the source IP. The subject we actually want to bound is "a single upstream source" (abnormal submission frequency / a client-side bug), and `client_id` *is* that subject — a stable identity established by the auth layer, immune to network topology. IP is only a proxy for it and distorts the moment topology gets involved: multiple upstreams behind one NAT share a counter (false-positive throttling), one upstream scaled across many IPs gets `N × limit` (the per-client cap silently bypassed), and behind an LB everyone collapses onto the proxy IP (per-IP degenerates into a global limit). Keying on `client_id` sidesteps all three.
+
+This is feasible because **auth runs before the limit check**: `@limiter.limit` wraps the endpoint and its check runs at the top of that wrapper — *after* FastAPI has resolved dependencies. So an unauthenticated request is rejected with `401` before the limiter ever counts it (it never enters a counter), and `verify_api_key` has already stashed `client_id` on `request.state` by the time the key function reads it. A side benefit of this ordering: only validated clients ever create counter entries, so a flood of spoofed source IPs can't grow the in-memory limiter storage.
+
+**Limit semantics**: because the key is `client_id`, each limit is now **per upstream, aggregated across all of its keys and all of its IPs** — not per IP. For the current few-stable-single-instance upstreams this is effectively the same number; if an upstream later scales horizontally, the limit must be re-calibrated to "the whole upstream's fair share." A future refinement for per-instance containment is a composite `client_id × IP` key (see the deployment note below).
+
+A global limit is deliberately omitted: it must be derived from "expected concurrent active clients × per-client limit" — without real traffic data this number is arbitrary and carries unclear semantics. More fundamentally, a `/minute` window cannot prevent instantaneous bursts, and pool exhaustion is already handled by `SATimeoutError → 503`. Rate limiting's responsibility is narrowed to defending against sustained single-client abuse; anonymous-flood DoS is delegated to the gateway/LB (the limiter sits after auth and never sees it).
 
 **Pool exhaustion → fast fail (503)**
 `POST /orders` separately catches `SATimeoutError` (pool failed to acquire a connection) and returns 503 Service Unavailable without entering the retry loop. Pool exhaustion is a resource contention issue, not a DB fault — retrying only makes it worse. Failing fast lets the client back off and retry.
@@ -193,18 +199,20 @@ Set via `connect_args={"options": "-c statement_timeout=30000"}` on each connect
 **`POST /process_raw/{raw_id}` converted to background task (`main.py`)**
 Changed from calling `process_raw_event(raw_id)` directly to `background_tasks.add_task`, consistent with `/orders` and no longer blocking the event loop.
 
-**Per-IP rate limiting (`slowapi`)**
+**Per-client rate limiting (`slowapi`)** — keyed on the authenticated `client_id`, with an IP fallback when no `client_id` is present (e.g. an unauthenticated path / a misconfiguration guard).
 
-| Endpoint | Per-IP limit | Reason |
+| Endpoint | Per-client limit | Reason |
 |---|---|---|
-| `POST /orders` | 60/minute | Guards against abnormal submission frequency from a single client; well above any legitimate order rate |
+| `POST /orders` | 60/minute | Guards against abnormal submission frequency from a single upstream; well above any legitimate order rate |
 | `POST /process_raw/{raw_id}` | 20/minute | Manual replay — inherently low frequency |
 | `GET /raw/{raw_id}` | 120/minute | Read-only, more lenient |
 
-Requests exceeding the limit receive `429 Too Many Requests`.
+Requests exceeding the limit receive `429 Too Many Requests`. The limit is per upstream (across all of that upstream's keys and IPs), not per IP — see *Limit semantics* under Design Decisions.
 
 **⚠️ Deployment note**
-Running directly under uvicorn, `request.client.host` is the real client IP and limiting behaves correctly. If deployed behind Nginx or a load balancer, `request.client.host` becomes the proxy IP — all requests share one counter and per-IP limiting breaks down. In that case, the key function must be updated to read the `X-Forwarded-For` header with appropriate trusted-proxy configuration.
+Keying on `client_id` makes the limiter **immune to the proxy-IP problem**: behind Nginx / an LB, `request.client.host` becomes the proxy IP and a per-IP limiter would collapse all callers onto one counter — but a per-`client_id` limiter is unaffected by network topology, because the key comes from the auth layer, not the transport. The IP fallback only engages when there is no authenticated `client_id`; if you ever rely on that path behind a proxy, the fallback's `get_remote_address` must be updated to read `X-Forwarded-For` with appropriate trusted-proxy configuration.
+
+**Future direction — composite `client_id × IP` key**: a pure `client_id` key bounds the upstream's *aggregate* fair share but cannot contain a single rogue instance of a multi-instance upstream (all its instances share one bucket). The faithful key for "isolate the tenant *and* contain a single misbehaving instance" is a composite `client_id × IP`, typically as two stacked limits (a per-`client_id` aggregate cap plus a per-`client_id × IP` per-instance cap). This is deferred until there is a concrete multi-instance upstream that warrants it (YAGNI); the current `_key_func` seam extends to it without structural change.
 
 Also, `X-API-Key` is sent in clear text in the header, so production **must run over HTTPS** (TLS terminated at the LB / reverse proxy is fine); otherwise the key travels in the clear.
 
@@ -335,7 +343,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 │   ├── test_process.py    # Points 2–4: Claim / Processing / Status commit retry; Idempotency; Quality Events
 │   ├── test_scan.py       # scan_and_recover, lifespan startup, periodic scan
 │   ├── test_timeout.py    # Pool exhaustion, /process_raw, GET /raw, DB settings
-│   ├── test_rate_limit.py # per-IP rate limiting
+│   ├── test_rate_limit.py # per-client rate limiting
 │   └── test_auth.py       # API Key auth, rotation, source_client_id persistence
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture (English)
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
@@ -467,7 +475,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Crash recovery scan — startup scan on restart + periodic scan every 5 minutes; stale `processing` (> 10 min) reset to `pending`; `WARNING` logged for potential duplicate ODS writes
 - [v] Timeout — DB statement timeout (30s) prevents lock-wait hangs; explicit pool settings; `POST /orders` catches pool exhaustion and returns 503; `/process_raw` converted to background task to avoid blocking the event loop
 - [v] Idempotency — `raw_id` column in ODS + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`; first-write-wins: pre-check before commit + `IntegrityError` backstop for TOCTOU races; duplicate Raw records written to `duplicate` terminal status
-- [v] Rate limiting — per-IP limits via slowapi: `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
+- [v] Rate limiting — per-client limits via slowapi (keyed on the authenticated `client_id`, IP fallback): `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
 - [v] Pytest — 91 tests, 100% coverage across all 8 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.

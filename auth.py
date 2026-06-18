@@ -13,7 +13,7 @@ Raw / ODS，回答「這筆資料是哪個上游送的」。
 import secrets
 
 import structlog
-from fastapi import HTTPException, Security
+from fastapi import HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 from config import settings
@@ -49,10 +49,15 @@ def _parse_api_keys(raw: str | None) -> dict[str, str]:
 API_KEYS: dict[str, str] = _parse_api_keys(settings.api_keys)
 
 
-def verify_api_key(api_key: str | None = Security(api_key_header)) -> str:
+def verify_api_key(request: Request, api_key: str | None = Security(api_key_header)) -> str:
     """驗證 X-API-Key，命中回傳對應的 client_id，否則回 401。
 
     比對使用 secrets.compare_digest（constant-time），避免逐字元 timing 洩漏。
+
+    命中後把 client_id 落到 request.state，作為限流的 key 來源：限流主體是「認證身分」
+    而非「網路位置」。此處是唯一能設定的時機——驗證屬依賴解析階段，早於 slowapi
+    wrapper 的限流檢查（限流檢查跑在 wrapper 最前面，比 endpoint 本體還早），
+    若改在 endpoint 本體設定就來不及被 key_func 讀到。
     """
     if not api_key:
         logger.warning("API key 缺失")
@@ -60,6 +65,7 @@ def verify_api_key(api_key: str | None = Security(api_key_header)) -> str:
 
     for key, client_id in API_KEYS.items():
         if secrets.compare_digest(api_key, key):
+            request.state.client_id = client_id
             return client_id
 
     # 只記前綴，絕不記完整 key

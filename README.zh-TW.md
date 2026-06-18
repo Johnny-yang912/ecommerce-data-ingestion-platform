@@ -137,8 +137,14 @@ ODS 兩把唯一鍵分工不同：**`raw_id` 是物理／代理身分**（landin
 **原子性 claim（`try_claim_raw`）**
 用 `UPDATE ... WHERE status = 'pending'` 再檢查 `rowcount == 1`，確保同一筆資料在多個 worker 並發時不會被重複處理，不需要悲觀鎖。
 
-**只做 per-IP 限流，不加全域上限**
-全域上限的數字必須從「預期同時活躍 IP 數 × per-IP 上限」推導，但這個數字在沒有真實流量資料時無從決定。更根本的問題是：`/minute` 視窗的 rate limit 無法防止瞬間 burst，而 pool 耗盡已由 `SATimeoutError → 503` 妥善處理。因此 rate limiting 的職責只保留在「防單一 IP 持續性濫用」，全域保護交給既有的 503 機制。
+**以認證身分（`client_id`）為 key 做 per-client 限流，不加全域上限**
+限流的 key 是 auth 解析出的 `client_id`，而非來源 IP。我們真正想框住的主體是「單一上游來源」（異常送單頻率 / client 端 bug），而 `client_id` 就是這個主體——由 auth 層建立的穩定身分，免疫網路拓樸。IP 只是它的代理，一旦牽涉拓樸就失真：多個上游共用同一 NAT 會共用計數器（誤殺）、單一上游散在多 IP 會拿到 `N × 上限`（單客戶上限被悄悄繞過）、在 LB 後面所有人縮成 proxy IP（per-IP 退化成全域上限）。改 key 在 `client_id` 上一次解掉這三個問題。
+
+這之所以可行，是因為 **auth 跑在限流檢查之前**：`@limiter.limit` 包住 endpoint，其檢查跑在 wrapper 最前面——也就是 FastAPI 解析完依賴*之後*。所以未認證請求會先以 `401` 被擋下、根本不進計數器；而 `verify_api_key` 早已把 `client_id` 落到 `request.state`，等 key_func 來讀時已就緒。這個順序還有個附帶好處：只有通過認證的 client 才會建立計數項，所以偽造大量來源 IP 的洪水無法撐爆 in-memory 的限流 storage。
+
+**限額語意**：因為 key 是 `client_id`，每條限額現在是**每個上游、跨它所有 key 與所有 IP 的合計**，而非每 IP。對目前「少數穩定、單實例」的上游而言數字實質相同；若某上游日後水平擴展,限額需重新校準為「該上游整體的公平份額」。針對單實例圍堵的進一步細化，是複合 `client_id × IP` key（見下方部署注意事項）。
+
+全域上限刻意不加：它的數字必須從「預期同時活躍 client 數 × per-client 上限」推導，沒有真實流量資料時無從決定。更根本地，`/minute` 視窗無法防瞬間 burst，而 pool 耗盡已由 `SATimeoutError → 503` 妥善處理。因此 rate limiting 的職責只保留在「防單一 client 持續性濫用」；匿名洪水 DoS 交給 gateway/LB（限流在 auth 之後，根本看不到它）。
 
 **Pool 耗盡快速失敗（503）**
 `POST /orders` 額外 catch `SATimeoutError`（pool 等不到連線），直接回傳 503 Service Unavailable，不走 retry loop。Pool 耗盡是資源競爭問題而非 DB 故障，retry 無法改善，應快速失敗讓 client 自行退讓。
@@ -193,18 +199,20 @@ DB 管理表（執行期發/撤 key）的需求來自「來源多又常變」的
 **`POST /process_raw/{raw_id}` 改為 background task（`main.py`）**
 從直接呼叫 `process_raw_event(raw_id)` 改為 `background_tasks.add_task`，與 `/orders` 設計一致，不再 block event loop。
 
-**per-IP 限流（`slowapi`）**
+**per-client 限流（`slowapi`）**——以認證的 `client_id` 為 key，無 `client_id` 時（如未認證路徑 / 設定漏失防呆）退回 IP。
 
-| Endpoint | per-IP 限制 | 理由 |
+| Endpoint | per-client 限制 | 理由 |
 |---|---|---|
-| `POST /orders` | 60/minute | 防單一 client 異常頻率，正常用戶下單行為遠不到此上限 |
+| `POST /orders` | 60/minute | 防單一上游異常頻率，正常下單行為遠不到此上限 |
 | `POST /process_raw/{raw_id}` | 20/minute | 人工 replay 操作，頻率天然低 |
 | `GET /raw/{raw_id}` | 120/minute | Read-only，較寬鬆 |
 
-超出限制時回傳 `429 Too Many Requests`。
+超出限制時回傳 `429 Too Many Requests`。限額是「每個上游（跨其所有 key 與 IP）合計」而非每 IP——見設計決策的*限額語意*。
 
 **⚠️ 部署注意事項**
-目前直接跑 uvicorn，`request.client.host` 是真實的 client IP，限流行為正確。若未來在 Nginx / Load Balancer 後面部署，`request.client.host` 會變成 proxy 的 IP，所有請求共用同一個計數器，per-IP 限流將失效。屆時需將 key_func 改為讀取 `X-Forwarded-For` header，並搭配適當的 trusted proxy 設定。
+以 `client_id` 為 key 讓限流**免疫 proxy-IP 問題**：在 Nginx / LB 後面 `request.client.host` 會變成 proxy IP，per-IP 限流會把所有呼叫者縮成同一個計數器——但 per-`client_id` 限流不受網路拓樸影響，因為 key 來自 auth 層而非傳輸層。IP fallback 只在沒有認證 `client_id` 時才啟動；若你在 proxy 後面會依賴這條 fallback 路徑，需將其 `get_remote_address` 改為讀取 `X-Forwarded-For` 並搭配適當的 trusted proxy 設定。
+
+**未來方向——複合 `client_id × IP` key**：純 `client_id` key 框住的是上游的*合計*份額，無法圍堵多實例上游中單一抓狂的實例（它所有實例共用一桶）。「既隔離租戶、又圍堵單一失控實例」最忠實的 key 是複合 `client_id × IP`，通常做成兩道疊加限流（一道 per-`client_id` 合計上限 + 一道 per-`client_id × IP` 單實例上限）。此項延後到真的出現需要它的多實例上游再做（YAGNI）；目前的 `_key_func` 接縫可無結構性改動地擴充過去。
 
 此外，`X-API-Key` 以明文置於 header，正式環境**必須走 HTTPS**（TLS 終結於 LB / reverse proxy 亦可），否則 key 會在傳輸中裸奔。
 
@@ -335,7 +343,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 │   ├── test_process.py    # Point 2–4：Claim / Processing / Status retry；Idempotency；Quality Events
 │   ├── test_scan.py       # scan_and_recover、lifespan startup、periodic scan
 │   ├── test_timeout.py    # Pool 耗盡、/process_raw、GET /raw、DB 設定
-│   ├── test_rate_limit.py # per-IP 限流
+│   ├── test_rate_limit.py # per-client 限流
 │   └── test_auth.py       # API Key 驗證、輪替、source_client_id 落地
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture（English）
@@ -467,7 +475,7 @@ Looker Studio（直連 BigQuery）
 - [v] 掃描 Recovery — 啟動時掃描一次 + 每 5 分鐘 periodic scan；stale `processing`（>10分鐘）重設為 pending；potential duplicate ODS 記 `WARNING`
 - [v] Timeout — DB statement timeout（30s）防 lock wait 掛住 thread；pool 設定明確化；`POST /orders` catch pool 耗盡回 503；`/process_raw` 改為 background task 不 block event loop
 - [v] Idempotency — ODS 加 `raw_id` 欄位 + `UNIQUE(ods.raw_id)` + `UNIQUE(ods.order_id)`；first-write-wins 策略：pre-check + IntegrityError 兜底；重複記錄標為 `duplicate` 終態
-- [v] Rate Limiting — per-IP 限流（slowapi），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
+- [v] Rate Limiting — per-client 限流（slowapi，以認證 `client_id` 為 key、IP fallback），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
 - [v] Pytest — 91 個測試，8 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。

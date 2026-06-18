@@ -23,7 +23,19 @@ from config import settings
 configure_logging()
 logger = structlog.get_logger()
 
-_key_func = get_remote_address  # 間接層：測試可替換此變數模擬不同 IP
+def _client_id_key(request: Request) -> str:
+    # 限流主體 = 認證身分（client_id，由 verify_api_key 落到 request.state），
+    # 而非網路位置（IP）。client_id 是穩定的上游身分，免疫 NAT / proxy / 多 IP。
+    # 取不到時（無認證路徑 / 設定漏失防呆）退回 IP。
+    # 注意語意：以 client_id 為 key，限額是「每個上游（跨所有 key、所有 IP）合計」，
+    # 非「每 IP」；上游若水平擴展成多實例，需重新校準限額（見 README）。
+    client_id = getattr(request.state, "client_id", None)
+    if client_id:
+        return client_id
+    return get_remote_address(request)
+
+
+_key_func = _client_id_key  # 間接層：測試可替換此變數模擬不同 client_id
 
 def _limiter_key(request: Request) -> str:
     return _key_func(request)

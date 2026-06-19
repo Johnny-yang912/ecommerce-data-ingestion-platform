@@ -114,7 +114,40 @@ first, quarantine records are already format-cleaned and queryable by business f
 second, Proposal B re-evaluation requires dirty records to exist in ODS — blocking at ingestion would make rule evolution apply only to new data, with no path to promote historical records.
 
 **ODS-layer first-write-wins idempotency**
-Only the first submission for a given `order_id` is written to ODS, enforced by two guards: a pre-check (query ODS for the `order_id` before committing) and `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` constraints as a backstop against TOCTOU races. Subsequent duplicate Raw records are not rejected — they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
+Only the first submission for a given `order_id` is written to ODS, enforced by **two guards** — the point is that each handles a **different source of duplicates**, not the same job done twice:
+
+- **The UNIQUE constraints (`UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)`) — responsible for *correctness***: this is the ultimate idempotency guarantee and **cannot be omitted**. Between the pre-check's `SELECT` and the subsequent `INSERT` there is an unavoidable TOCTOU window in which two concurrent workers both clear the pre-check. The pre-check inherently cannot close that window on its own, for two reasons: ① the project runs at the default **READ COMMITTED** isolation level, which has **no predicate locking** — there is no way to lock a *condition* to stop someone inserting a new row that matches it (a phantom); ② even `SELECT ... FOR UPDATE` cannot lock a row that *does not yet exist* — with no row, there is nothing to lock. Only a DB-level UNIQUE constraint can close this window.
+- **The pre-check (query ODS for the `order_id` before committing) — responsible for *the efficiency and semantics of the common case***: for correctness this guard is redundant, but it handles the duplicate source that **dominates in practice and is non-concurrent** — chiefly `scan_and_recover` re-running a stale `processing` record after resetting it, or the scan re-queuing a record already sitting in the queue (see "Known Issues"). These are time-separated duplicates that are *expected* to recur.
+
+Why not rely on UNIQUE alone? Because the success path commits **ODS + quality_event + the Raw `status` together in a single transaction**. Without the pre-check, every duplicate would have to "build the entire ODS object → attempt the commit → hit UNIQUE → abort the whole transaction → roll back → re-issue the status update separately." For the high-frequency scan re-runs, the pre-check intercepts the duplicate with a cheap `SELECT` *before* the object is even built — **taking the fast path instead of triggering a doomed-to-abort transaction every time** — and avoids using the `IntegrityError` exception as normal control flow, since `duplicate` is an *expected, meaningful monitoring signal* in this design, not an error.
+
+The two guards are complementary — **fast path (pre-check) + backstop (UNIQUE)** — not an either/or. Subsequent duplicate Raw records are never rejected; they are written to a `duplicate` terminal status so monitoring can distinguish normal processing from intercepted duplicates.
+
+**How the two guards relay under a TOCTOU race** (two workers concurrently processing the same `order_id`):
+
+```
+        Worker A (raw_id=1)              Worker B (raw_id=2)
+          │                                │
+ t1       │ SELECT order_id → not found    │
+          │                                │
+ t2       │                                │ SELECT order_id → not found
+          │                                │   ← READ COMMITTED can't see
+          │                                │     A's not-yet-committed row
+          │ ── both clear the pre-check (the window) ──
+          │                                │
+ t3       │ INSERT ODS                     │
+          │ commit ✔ (first write wins)    │
+          │                                │
+ t4       │                                │ INSERT ODS → hits unique index
+          │                                │   blocks, waits for A's outcome
+          │                                │
+ t5       │                                │ A committed → IntegrityError
+          │                                │   rollback → mark duplicate ✔
+          ▼                                ▼
+   exactly one row for that order_id in ODS; raw_id=2 → duplicate terminal
+```
+
+Note: the window stretches from t1 until A actually commits at t3 — any worker that runs its pre-check before then finds nothing and clears it, which is precisely why the UNIQUE backstop cannot be omitted. (If A rolls back at t5 instead of committing, B's INSERT succeeds and takes its place, still honoring first-write-wins.)
 
 **Bypassing Raw to land directly in ODS is strictly forbidden (single-ingress invariant)**
 This service is the ingestion unit of a data mesh; its callers are a few stable machine-to-machine upstreams with no human users (see *Service-to-service authentication decisions*), and onboarding a new source is a planned infrastructure event. That positioning removes the legitimate motive for ad-hoc "write straight to the DB" bypasses — so the system makes "all data enters through Raw" a hard invariant: **ODS is always a product of the pipeline and accepts no row that bypassed Raw**.

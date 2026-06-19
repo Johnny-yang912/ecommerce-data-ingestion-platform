@@ -114,7 +114,40 @@ Raw 是 landing 層：**逐字保留原文**（直接存原始 request body，�
 二、支援規則演進後的 Proposal B 重評估——當規則升版，ODS 中的 quarantine 記錄才有對象可以重評估並 promote，若在攝入時就攔截，規則演進只能對新資料有效。
 
 **ODS 層 first-write-wins idempotency**
-同一 `order_id` 只有第一筆能寫入 ODS，透過兩道防線實現：pre-check（commit 前查 ODS 是否已有此 order_id）和 `UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)` 約束作為 TOCTOU race 的兜底。後進的重複 Raw 不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
+同一 `order_id` 只有第一筆能寫入 ODS，由**兩道防線**共同實現——關鍵是它們各自負責**不同來源的重複**，不是同一件事做兩遍：
+
+- **UNIQUE 約束（`UNIQUE(ods.order_id)` + `UNIQUE(ods.raw_id)`）—— 負責「正確性」**：這是冪等性的最終保證，**不可省**。因為 pre-check 的 `SELECT` 與後續 `INSERT` 之間必然存在一個 TOCTOU 窗口，讓並發的兩個 worker 同時通過 pre-check。pre-check 先天無法靠自己關掉這個窗口，根因有二：① 本專案用預設的 **READ COMMITTED** 隔離級，**沒有謂詞鎖（predicate lock）**，無法對「條件」上鎖去阻止別人插入符合條件的新列（phantom）；② 就算改用 `SELECT ... FOR UPDATE`，也鎖不到「尚不存在的列」——沒有列就沒有東西可鎖。唯有 DB 層的 UNIQUE 約束能關上這個窗口。
+- **pre-check（commit 前先查 ODS 是否已有此 order_id）—— 負責「常見情況的效率與語意」**：就正確性而言這道是多餘的，但它處理的是系統裡**占多數、且非並發**的重複來源——主要是 `scan_and_recover` 把 stale `processing` 重設後重跑、或 scan 把已在佇列中的記錄又排一次（見「Known Issues」）。這些是時序錯開、預期會反覆發生的重複。
+
+為什麼不只靠 UNIQUE？因為 success path 是把 **ODS + quality_event + Raw `status` 綁在同一個 transaction 一起 commit**。若沒有 pre-check，每一筆重複都得「建好整個 ODS 物件 → 嘗試 commit → 撞 UNIQUE → 整個交易 abort → rollback → 再單獨補一次 status」。對高頻的 scan 重跑而言，pre-check 用一個便宜的 `SELECT` 就在建物件前攔下，**走快路、不必每次觸發一次注定 abort 的交易**，也避免拿 `IntegrityError` 這個 exception 當正常控制流——畢竟 `duplicate` 在本設計裡是**預期且有意義的監控訊號**，不是錯誤。
+
+兩道防線是 **快路（pre-check）+ 兜底（UNIQUE）** 的互補關係，不是二選一。後進的重複 Raw 一律不報錯，而是寫入 `duplicate` 終態，讓監控能明確區分正常處理與重複攔截。
+
+**TOCTOU race 下兩道防線如何接力**（兩個 worker 並發處理同一 order_id）：
+
+```
+        Worker A (raw_id=1)              Worker B (raw_id=2)
+          │                                │
+ t1       │ SELECT order_id → 查無          │
+          │                                │
+ t2       │                                │ SELECT order_id → 查無
+          │                                │   ← READ COMMITTED 看不到
+          │                                │     A 尚未 commit 的列
+          │ ── pre-check 兩邊皆通過（空窗）──│
+          │                                │
+ t3       │ INSERT ODS                     │
+          │ commit ✔ (first write wins)    │
+          │                                │
+ t4       │                                │ INSERT ODS → 撞 unique index
+          │                                │   被阻塞，等 A 的結局
+          │                                │
+ t5       │                                │ A 已 commit → IntegrityError
+          │                                │   rollback → 標記 duplicate ✔
+          ▼                                ▼
+       ODS 內該 order_id 僅一列；raw_id=2 進入 duplicate 終態
+```
+
+註：空窗從 t1 一直延續到 A 在 t3 真正 commit 為止；在那之前進來做 pre-check 的 worker 全都查無、全都會通過——這正是 UNIQUE 兜底不可省的原因。（若 A 在 t5 是 rollback 而非 commit，B 的 INSERT 會改為成功遞補，仍符合 first-write-wins。）
 
 **嚴格禁止繞過 Raw 直接落地 ODS（single-ingress invariant）**
 本服務是資料網格的攝取單元、呼叫者是少數且穩定的 machine-to-machine 上游、無人類使用者（見〈服務對服務驗證決策〉），新增來源是有計畫的基建事件。這個定位抽掉了「臨時人工直寫 DB」這類繞過的正當動機——因此本系統把「所有資料一律經 Raw 進入」立為硬不變式：**ODS 永遠是 pipeline 的產物，不接受任何繞過 Raw 的直落列**。

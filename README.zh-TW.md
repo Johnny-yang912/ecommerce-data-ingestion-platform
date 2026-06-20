@@ -168,7 +168,12 @@ ODS 兩把唯一鍵分工不同：**`raw_id` 是物理／代理身分**（landin
 ### 攝取層可靠性決策
 
 **原子性 claim（`try_claim_raw`）**
-用 `UPDATE ... WHERE status = 'pending'` 再檢查 `rowcount == 1`，確保同一筆資料在多個 worker 並發時不會被重複處理，不需要悲觀鎖。
+用 `UPDATE ... WHERE status = 'pending'` 再檢查 `rowcount == 1`，確保同一筆 `raw_id` 在多個 worker 並發時只有一個能搶到，不需要悲觀鎖。要注意它與下方 ODS 冪等性守的是**正交的兩個維度**：冪等守護（pre-check + `UNIQUE(order_id)`）key 在 **order_id（業務身分）**上，攔的是「不同 raw_id、相同訂單」的業務重複；CAS key 在 **raw_id + status（物理身分）**上，攔的是「**同一筆 raw_id** 被排給多個 worker」——這正是 Known Issues 裡 scan 看不到 BackgroundTasks 佇列、可能把已排隊記錄重複排程所製造的重複來源。它的價值有兩面：
+
+- **效率——最早、最便宜的退出點**：敗者拿到 `rowcount=0` 後在 `process_raw_event` 一開頭就直接 return，發生在任何 JSON parse / flatten / clean / 建 ODS 物件**之前**。這比 order_id 的 pre-check 還早（pre-check 要先把整個 ODS 物件建好才查 order_id），所以對「同 raw_id 被重複排程」這個高頻情境，CAS 是成本最低的攔截點，省下的是整段 pipeline 的白工與 DB round-trip。
+- **正確性——避免 Raw.status 被競寫、避免「自我標記 duplicate」**：冪等守護只保證 **ODS 表**裡 order_id 唯一，它**管不到 Raw.status 狀態機**。若沒有 CAS，兩個 worker 同時處理 `raw_id=1`：A 寫入 ODS 並設 `processed`，B 撞到 `UNIQUE(raw_id)` 後進 duplicate 分支、用 order_id 反查卻發現 existing_raw_id 正是自己，於是把**自己標成「duplicate of 自己」**——`processed` 與 `duplicate` 兩個寫入互相競爭，最終狀態不可決定。ODS 那一列是對的（UNIQUE 擋住了），但狀態語意是壞的。CAS 讓「一個 raw_id 只有一個擁有者」，狀態轉換因此確定且有意義。
+
+單就「ODS 不會有兩列」而言，`UNIQUE(raw_id)` 已是足夠的 backstop；CAS 不可取代的價值在**狀態機正確性**與**效率**這兩個維度。這恰好對稱於 pre-check 之於 `UNIQUE(order_id)`——CAS 之於 raw_id，就是「快路徑 + 狀態語意」，背後一樣有一道 DB 層 UNIQUE 兜底。
 
 **以認證身分（`client_id`）為 key 做 per-client 限流，不加全域上限**
 限流的 key 是 auth 解析出的 `client_id`，而非來源 IP。我們真正想框住的主體是「單一上游來源」（異常送單頻率 / client 端 bug），而 `client_id` 就是這個主體——由 auth 層建立的穩定身分，免疫網路拓樸。IP 只是它的代理，一旦牽涉拓樸就失真：多個上游共用同一 NAT 會共用計數器（誤殺）、單一上游散在多 IP 會拿到 `N × 上限`（單客戶上限被悄悄繞過）、在 LB 後面所有人縮成 proxy IP（per-IP 退化成全域上限）。改 key 在 `client_id` 上一次解掉這三個問題。

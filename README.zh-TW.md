@@ -330,10 +330,11 @@ CI 自動驗證的是**程式邏輯與型別契約**。**DB 層契約**——`tr
 
 - `load_test.py`：吞吐量、真實併發下的 CAS claim（`--cas-test`）與 `order_id` 去重（`--duplicate`），打真 server → 真 Postgres。
 - `restart_test.sh`：`SIGKILL` 模擬 crash，驗證 pending 記錄的 recovery 行為。
+- `check_migration_drift.py`：`alembic upgrade head` + `compare_metadata`，一鍵比對「migration 產生的 schema」與 `models.py` 是否漂移；偵測到不一致即以非零 exit code 報錯。
 
-**為何個人專案階段先不把資料庫接進 CI**：本專案目前定位為單人練習/作品，無真實流量與併發；上述 DB 邏輯的價值只有在真實併發下才會兌現。此時導入真連資料庫的整合測試，需付出撰寫成本與容器啟動的 flake 維護，**其成本高於「不自動化」在現階段的風險**。因此採「**邏輯層進 CI 自動把關、DB 層靠手動腳本佐證可靠性**」的分工，待有真實流量、第二位協作者、或需展示工程深度時，再把 DB 整合測試正式納入 CI。
+**為何個人專案階段先不把資料庫接進 CI**：本專案目前定位為單人練習/作品，無真實流量與併發；CAS / recovery 等 DB 邏輯的價值只有在真實併發下才會兌現，導入真連資料庫的併發整合測試需付出撰寫成本與容器啟動的 flake 維護，**其成本高於「不自動化」在現階段的風險**。其中 `check_migration_drift.py` 屬例外——它確定性、無併發、低 flake，本可進 CI；目前仍維持手動，是基於單人開發、schema 已趨穩、漂移發生機率低的權衡，並已預留 exit code 介面，待有真實流量、第二位協作者、或需展示工程深度時即可直接升級進 CI。
 
-> ⚠️ **不要把綠燈當成「全部沒問題」**：CI 通過僅代表**邏輯層**無回歸，**不代表去重 / CAS / migration 等 DB 契約已被自動驗證**。這些目前靠手動腳本佐證、需人工判讀，且 migration 漂移尚未涵蓋。修改相關邏輯時，仍須以 `load_test.py` / `restart_test.sh` 重新佐證。
+> ⚠️ **不要把綠燈當成「全部沒問題」**：CI 通過僅代表**邏輯層**無回歸，**不代表去重 / CAS / migration 等 DB 契約已被自動驗證**。這些目前靠手動腳本佐證、需人工判讀（migration 漂移已有 `check_migration_drift.py` 可一鍵檢查，但同樣未進 CI）。修改相關邏輯時，仍須以 `load_test.py` / `restart_test.sh` / `check_migration_drift.py` 重新佐證。
 
 ---
 

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false              # 一個版本紅不擋另一個版本繼續跑
+      matrix:
+        python-version: ["3.10", "3.12"]
+    env:
+      DB_URL: postgresql://u:p@localhost:5432/test   # 假值，僅滿足 config fail-fast，不連線
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest          # coverage 設定已在 pytest.ini 的 addopts

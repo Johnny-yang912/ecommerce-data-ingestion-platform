@@ -11,6 +11,7 @@ restart_test.sh
 *:Zone.Identifier
 .coverage
 htmlcov/
+.vscode/
 ecommerce_dbt/logs/
 ecommerce_dbt/target/
 logs/

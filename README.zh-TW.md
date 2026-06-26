@@ -3,6 +3,8 @@
 
 [English](./README.md) | **繁體中文**
 
+[![CI](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml)
+
 以資料生命週期管理為核心，設計一條電商訂單資料管線——在可能發生故障與重複提交的高併發環境中，確保資料盡可能可靠地進入管線作為源頭基礎，透過各層品質合約讓資料從不可信的原始輸入逐步轉化為可信的分析資料，並以規則版本化與品質事件追蹤，實現跨 pipeline 的資料品質治理與完整的生命週期可追溯性。
 
 此專案以資料工程為主軸，後端工程為地基。攝取層的容錯設計（多層 retry、crash recovery、CAS claim）確保資料進得來；資料架構的分層品質合約（Raw → ODS → dbt stg/int/dim/fct）確保資料流得正確；規則版本化與 append-only 的 `quality_events` 狀態機，確保品質評估的演進有跡可查。
@@ -313,6 +315,28 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 ---
 
+## 持續整合（CI）
+
+每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（248 個測試，原始碼 100% 覆蓋）。
+
+- 測試全為單元/整合層（mock DB），不需真實資料庫即可執行，數秒內完成。
+- 測試依賴集中於 `requirements-dev.txt`（`-r requirements.txt` + pytest 等）。
+
+### CI 的涵蓋範圍與盲區（刻意的取捨）
+
+CI 自動驗證的是**程式邏輯與型別契約**。**DB 層契約**——`try_claim_raw` 的 CAS claim、重複 `order_id` 的 UNIQUE 去重、crash 後的 recovery，以及 Alembic migration 與 `models.py` 的漂移——因 CI 內測試以 mock 取代資料庫，**不在 CI 的自動驗證範圍內**。
+
+這些 DB 邏輯目前改以**手動腳本**驗證可靠性：
+
+- `load_test.py`：吞吐量、真實併發下的 CAS claim（`--cas-test`）與 `order_id` 去重（`--duplicate`），打真 server → 真 Postgres。
+- `restart_test.sh`：`SIGKILL` 模擬 crash，驗證 pending 記錄的 recovery 行為。
+
+**為何個人專案階段先不把資料庫接進 CI**：本專案目前定位為單人練習/作品，無真實流量與併發；上述 DB 邏輯的價值只有在真實併發下才會兌現。此時導入真連資料庫的整合測試，需付出撰寫成本與容器啟動的 flake 維護，**其成本高於「不自動化」在現階段的風險**。因此採「**邏輯層進 CI 自動把關、DB 層靠手動腳本佐證可靠性**」的分工，待有真實流量、第二位協作者、或需展示工程深度時，再把 DB 整合測試正式納入 CI。
+
+> ⚠️ **不要把綠燈當成「全部沒問題」**：CI 通過僅代表**邏輯層**無回歸，**不代表去重 / CAS / migration 等 DB 契約已被自動驗證**。這些目前靠手動腳本佐證、需人工判讀，且 migration 漂移尚未涵蓋。修改相關邏輯時，仍須以 `load_test.py` / `restart_test.sh` 重新佐證。
+
+---
+
 ## 已知問題
 
 **Scan 可能對已排程的任務重複排程**
@@ -414,9 +438,8 @@ cd ecommerce-data-ingestion-platform
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
-# 3. 裝套件
-pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi alembic
-pip install pytest pytest-asyncio pytest-cov  # 測試依賴
+# 3. 裝套件（含測試依賴）
+pip install -r requirements-dev.txt
 
 # 4. 設定環境變數
 cp .env.example .env
@@ -430,7 +453,7 @@ alembic upgrade head
 # 6. 啟動
 uvicorn main:app --reload
 
-# 7. 執行測試（需先設定 .env）
+# 7. 執行測試（需先設定 .env，或設一個假的 DB_URL）
 pytest
 ```
 
@@ -516,7 +539,7 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-client 限流（slowapi，以認證 `client_id` 為 key、IP fallback），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 91 個測試，8 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] Pytest — 248 個測試，8 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）待 Phase 4 實作
 
 **Phase 3 — 工程化**

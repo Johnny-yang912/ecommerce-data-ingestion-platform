@@ -3,6 +3,8 @@
 
 **English** | [繁體中文](./README.zh-TW.md)
 
+[![CI](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml)
+
 A data pipeline for e-commerce orders, built around data lifecycle management as its core — ensuring data enters the pipeline as reliably as possible under high concurrency with potential failures and duplicate submissions, progressively transforming untrusted inbound data into trustworthy analytical data through per-layer quality contracts, and achieving cross-pipeline data quality governance and complete lifecycle traceability through rule versioning and quality event tracking.
 
 This project is data engineering first, backend engineering second. The ingestion layer's fault-tolerant design (multi-point retry, crash recovery, CAS claim) ensures data gets in; the layered quality contracts (Raw → ODS → dbt stg/int/dim/fct) ensure data flows correctly; rule versioning and an append-only `quality_events` state machine ensure that the evolution of quality assessments is always auditable.
@@ -313,6 +315,28 @@ Result: ODS always contains exactly one record per `order_id`; all subsequent du
 
 ---
 
+## Continuous Integration (CI)
+
+Every push to `main` and every Pull Request automatically triggers GitHub Actions (`.github/workflows/ci.yml`), which installs dependencies and runs the full test suite (248 tests, 100% source coverage) across a **Python 3.10 and 3.12** matrix.
+
+- All tests are unit/integration level (mock DB) — no real database is required, and they finish in seconds.
+- Test dependencies are pinned in `requirements-dev.txt` (`-r requirements.txt` + pytest, etc.).
+
+### What CI covers and where it is blind (a deliberate trade-off)
+
+CI automatically verifies **application logic and type contracts**. The **DB-layer contracts** — the CAS claim in `try_claim_raw`, UNIQUE deduplication of repeated `order_id`, post-crash recovery, and drift between Alembic migrations and `models.py` — are **outside CI's automated scope**, because the in-CI tests substitute a mock for the database.
+
+These DB behaviors are currently exercised for reliability via **manual scripts**:
+
+- `load_test.py`: throughput, CAS claim under real concurrency (`--cas-test`), and `order_id` deduplication (`--duplicate`), hitting a real server → real Postgres.
+- `restart_test.sh`: `SIGKILL` to simulate a crash, verifying recovery of `pending` records.
+
+**Why the database is not wired into CI at this personal-project stage**: the project is currently a solo practice/portfolio piece with no real traffic or concurrency, and the value of the DB logic above only materializes under genuine concurrency. Introducing real-database integration tests now would cost test-authoring effort plus container-startup flake maintenance — **a cost higher than the present risk of not automating it**. Hence the split: **the logic layer is gated automatically by CI, while the DB layer is corroborated by manual scripts.** DB integration tests will be promoted into CI once there is real traffic, a second contributor, or a need to showcase engineering depth.
+
+> ⚠️ **Do not read a green check as "everything is fine"**: a passing CI run only means there is no regression in the **logic layer** — it does **not** mean the dedup / CAS / migration DB contracts have been verified automatically. Those are corroborated by manual scripts requiring human inspection, and migration drift is not yet covered at all. When changing this logic, re-corroborate with `load_test.py` / `restart_test.sh`.
+
+---
+
 ## Known Issues
 
 **Scan may re-schedule tasks that are already queued**
@@ -414,9 +438,8 @@ cd ecommerce-data-ingestion-platform
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies
-pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv pytz slowapi alembic
-pip install pytest pytest-asyncio pytest-cov  # test dependencies
+# 3. Install dependencies (including test dependencies)
+pip install -r requirements-dev.txt
 
 # 4. Configure environment
 cp .env.example .env
@@ -430,7 +453,7 @@ alembic upgrade head
 # 6. Run
 uvicorn main:app --reload
 
-# 7. Run tests (requires .env to be configured)
+# 7. Run tests (requires .env to be configured, or a dummy DB_URL)
 pytest
 ```
 
@@ -516,7 +539,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Rate limiting — per-client limits via slowapi (keyed on the authenticated `client_id`, IP fallback): `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
-- [v] Pytest — 91 tests, 100% coverage across all 8 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
+- [v] Pytest — 248 tests, 100% coverage across all 8 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
 - [v] Data quality control architecture (ODS layer) — full design document (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md)); ODS layer implemented: `DQ_RULE_VERSION` rule version constant, `dq_rule_version` column (ODS), `quality_events` table (append-only quality event log, state machine anchor), structlog `quality_metric` event; BQ Analytics layer (Hard Gate, Row Filter, `int_orders_quarantine`, Airflow re-evaluation, `rpt_quality_*`) deferred to Phase 4
 
 **Phase 3 — Operability**

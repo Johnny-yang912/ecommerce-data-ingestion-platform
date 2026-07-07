@@ -13,6 +13,14 @@
 --
 -- copy_partitions=true：以 copy job（非 DML、免費）覆寫分區，取代預設的 MERGE。
 --   BQ sandbox（未啟用帳單）禁止 DML，此選項讓 insert_overwrite 仍可運作。
+--
+-- on_schema_change='append_new_columns'：加欄走 ALTER ADD COLUMN（metadata、免費、
+--   既有列自動 NULL），只覆寫回看窗分區，避開大表 --full-refresh 的全表掃＋全分區重寫成本。
+--   成本 ∝ 近期資料，是 staging 端 ALLOW_FIELD_ADDITION 的鏡像（CLOUD_LAYER-TW §5.2）。
+--   觸發閘門＝下方顯式欄位清單：staging 靠 ALLOW_FIELD_ADDITION 長的欄，未加進 SELECT 前
+--   偵測不到、不會自己 ALTER——只在刻意改清單（進 git、被 review）時才觸發，不吃 drift。
+--   刻意不用 sync_all_columns：它會 DROP 欄，牴觸「staging 只做加法、刪欄留 legacy」（§5.2/§5.3）。
+--   改型別/改分區/歷史回填仍走 --full-refresh / targeted refresh（見 README §4.7、§6）。
 
 {{
     config(
@@ -25,6 +33,7 @@
             'copy_partitions': true,
         },
         cluster_by=['raw_id'],
+        on_schema_change='append_new_columns',
     )
 }}
 

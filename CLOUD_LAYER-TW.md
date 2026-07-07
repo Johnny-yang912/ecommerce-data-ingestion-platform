@@ -111,6 +111,92 @@ WHERE table_name = 'orders' AND partition_id NOT IN ('__NULL__', '__UNPARTITIONE
 
 `extract_ods_to_bq.FIELDS` 是 ODS schema 繼 `schema.py`、`models.py` 之後的第三份手維護宣告，且漂移時最糟是「靜默漏抽資料」。以 `tests/test_schema_bq_consistency.py` 把它和 `models.py` 的一致性（欄位齊備、型別、可空性）變成會紅的測試——延伸 DQ 文件機制 1 的精神到抽取層。`FIELDS` 同時驅動 BQ schema、序列化、與這份測試（單一真相來源）。
 
+### 5.5 端到端範例：加欄 / 刪欄（含後續 NULL 處理）⭐
+
+§5.2 的對照表是「哪種 ODS 變更、BQ 能不能就地」的靜態矩陣；本節是它的**逐步走查版**，把兩個最常見的變更從 ODS 一路追到 dbt `stg_`，並接上各自產生的 NULL 該怎麼處理。
+
+前提：這裡的「加/刪欄」＝工程師**刻意**經 Alembic 改 ODS（§5.1 的刻意演進），**不是上游 drift**（drift 不動 ODS 結構）。`stg_orders` 已設 `on_schema_change='append_new_columns'`（見 [ecommerce_dbt/README.zh-TW §4.7](./ecommerce_dbt/README.zh-TW.md)）。
+
+兩例產生的 NULL 在時間軸上是**鏡像**，處理哲學因此相反：
+
+| | NULL 長在哪 | 語意 |
+|---|---|---|
+| 加欄 | 過去（歷史分區） | 這欄在那段歷史**根本不存在** |
+| 刪欄 | 未來（停收後往後長） | 這欄之後**不再被填** |
+
+**共同第一步永遠是先判斷 NULL 屬於哪一種**，再決定接受 / 回填 / 補值——判錯就會用錯工具。
+
+#### 5.5.1 加欄：流程
+
+| # | 關卡 | 動作 |
+|---|---|---|
+| 1 | ODS | Alembic 加一個 **nullable** 欄（NOT NULL 加欄無法走 `ALLOW_FIELD_ADDITION`，既有列會違反）|
+| 2 | 一致性測試 | `test_no_ods_column_missing_from_fields` 變紅——「ODS 有、`FIELDS` 沒有」被擋下（否則靜默漏抽）|
+| 3 | `FIELDS` | 補上該欄（型別/mode 對齊，否則型別/mode 測試也紅），測試轉綠＝三份宣告重新對齊 |
+| 4 | 抽取＋載入 | `ALLOW_FIELD_ADDITION` 自動把新欄加進 staging 實體表；舊分區歷史列 NULL、新列有值 |
+| 5 | `stg_orders`（未改清單）| `source` 的 `select *` 撈進來，但**最終顯式 SELECT 不列它 → 丟掉**；模型產出不變、下游看不到，只是「靜默搭車」躺在 staging |
+| 6 | `stg_orders`（改清單顯現）| 把欄加進顯式 SELECT（進 git、被 review）→ 下次**一般增量跑批**即可：dbt 自動 `ALTER ADD COLUMN`（metadata、免費、舊分區 NULL）+ copy job 只覆寫回看窗分區。**免 `--full-refresh`、免全表重寫**，成本 ∝ 近期資料 |
+
+#### 5.5.2 加欄：歷史大量 NULL 的後續處理
+
+先分岔關鍵判斷：**這欄的歷史是「不存在」還是「漏抽」？**
+
+| 處理 | 適用 | 做法 | Why |
+|---|---|---|---|
+| A. 接受 NULL（預設）| 值真的從現在才開始收集（新制上線）| 不填；下游按時間切或 `WHERE col IS NOT NULL` | NULL 誠實反映「過去沒有」，硬填＝製造假資料。成本 0 |
+| B. Proposal C 回填 | 值其實一直在 Raw 裡，只是 ODS 之前沒對映（漏抽）| 從 Raw 用新對映批次重產 → push 修正列 → 災區分區 targeted refresh（見 §7、DQ Proposal C）| 「值缺漏」類，A/B remediation 管不到，正是 Proposal C 領域。重、但一次付清 |
+| C. 下游補值 | 分析需要非 NULL（SUM/AVG 不想被稀釋、報表要顯示 0）| `int_/dim_` 層 `COALESCE(col, <default>)`，model description 記錄語意 | `stg_` 保持忠實（NULL），補值屬分析層業務決策（DQ 機制三：SQL 即審計）|
+| D. 攝入時給 default | 業務上必然有值（如 `dq_rule_version`）| ODS migration 就設 default/NOT NULL，歷史列當下填滿 | 把「要不要 NULL」推到最上游最便宜的時點；代價是 NOT NULL 加欄需 migration 內填值，不走 `ALLOW_FIELD_ADDITION` |
+
+⚠️ **`append_new_columns` 的盲區**：`ALTER ADD COLUMN` 把**所有**舊分區設 NULL，但一般增量只回填**回看窗**那幾天。若這欄在 staging 已存在一陣子（欄位引入時點 ≪ 加進 `stg_` SELECT 的時點），中間「staging 有真值、但在回看窗外」的分區，`stg_` 會**錯誤停在 NULL**。補救＝對那段區間一次性 targeted refresh、臨時放大 `stg_orders_lookback_days`、或該欄首次上線單獨 `--full-refresh` 一次。故「免 full-refresh」精確講是**免「未來每次」全表重寫**，首次若有歷史落差仍要一次性補。
+
+#### 5.5.3 刪欄：流程
+
+| # | 關卡 | 動作 |
+|---|---|---|
+| 1 | ODS | Alembic drop 欄，`models.py` 不再有它 |
+| 2 | 一致性測試 | `test_no_stale_field_without_ods_column` 變紅——「`FIELDS` 有、ODS 沒有」的殘欄被擋下 |
+| 3 | `FIELDS` | 移除該欄，測試轉綠；`_to_bq_dict` 不再吐它 |
+| 4 | 抽取＋載入 | staging 實體欄**不刪、留著**（§5.2）；load schema 少該欄 → 新列 NULL、歷史列保留原值 |
+| 5 | `stg_orders` | 顯式清單仍含該欄 → 照常查（staging 還在，新列讀 NULL、舊列讀原值）、**不 breaking**，變成 legacy 欄 |
+| 6 | 要從模型移除 | **預設：留 legacy、不動**——`append_new_columns` 只加不刪，**刻意不介入 DROP**（對齊「staging 只做加法、刪欄留 legacy」§5.2/§5.3）。真要拿掉才 `--full-refresh` 重建（罕見、刻意的 escape hatch；若下游 `int_/dim_` 仍引用它，會在那次 `dbt run` 報錯，於 DAG 內被抓）|
+
+#### 5.5.4 刪欄：未來大量 NULL（legacy 欄的 NULL 尾）的後續處理
+
+這欄有真實歷史、未來 NULL 越長越長；問題從「怎麼填」變成「怎麼**不被誤用**」。
+
+| 處理 | 適用 | 做法 | Why |
+|---|---|---|---|
+| A. 凍結留存（預設）| 大多數情況 | 讓它躺著：歷史可查、未來 NULL；要用就限歷史區間 | 對齊 §5.2/§5.3「不刪、留著保歷史」；BQ 儲存極廉，NULL 尾成本 ≈ 0 |
+| B. 標記有效期，防誤用 | 有下游會碰它 | model description / 註記「X 日後停填」，或 `int_/dim_` 明確 `WHERE order_date < 停用日` 才引用 | 防止未來的人對半死欄做 `AVG` 被 NULL 尾稀釋（消費者契約問題，呼應 DQ Proposal C-4 P4）|
+| C. 真的清掉 | 確定不需要、可接受丟歷史 | 從 `stg_` 顯式清單移除 + `--full-refresh` 重建（`append_new_columns` 不 DROP，故必須 full-refresh）| 唯一能讓欄「消失」的路。罕見、刻意 |
+| D. 歸檔後移除 | 要主線乾淨又要留稽核 | 先把含該欄的歷史快照另存 archive 表，再從主線移除 | 兼顧「主線乾淨」與「歷史可稽核」，類比遷移式 `ods_retired_<batch>`。中成本、多一張表 |
+
+#### 5.5.5 NULL 處理該落在哪一層（`int_` vs `dim_/fct_`）
+
+先分兩種 NULL 處理：**(a) 消費者無關的正規化**（對所有下游客觀正確、答案唯一）與 **(b) 消費者相關的分析/呈現決定**（NULL→0 好聚合／保留 NULL 以計缺漏率／NULL→'unknown' 當維度桶——答案隨問題而變）。上面兩個結構性 NULL 幾乎都是 (b)。
+
+核心語意原則：**NULL 帶資訊（「不存在 / 停止收集」），`COALESCE` 是有損且單向**——一旦在 `int_` 把 NULL 壓成 0，全下游再也分不出「沒收集」與「真的是 0」，想算涵蓋率的 `fct_` 就永遠算不出來。故：**保留 NULL 越久越好，只在「那個具體問題讓 collapse 變正確」的那層才 collapse**；填預設值是業務/呈現決定，屬 dim/fct/rpt 的高度，不是 int_ 管線（呼應「品質責任往下游收緊」）。
+
+| 面向 | 放 `int_`（早、共享）| 放 `dim_/fct_`（晚、貼近消費者）|
+|---|---|---|
+| 可逆性 | 差：NULL 資訊在此消失、下游救不回 | 好：局部決定、爆炸半徑小 |
+| 一致性 | 全下游同一解 → 只有 (a) 受惠 | 各取所需 → (b) 的天然歸屬 |
+| 語意 | 對 (b) 是「替所有人做了不該替他做的決定」| 每個問題自己決定 |
+
+文件既有樣板：DQ 機制三的場景補值**已放 int_**，但用**新欄**（`customer_rating_cleaned`，不覆寫原欄）＋**場景專用模型**（不污染正典 `int_orders`）＋**description 留痕**。照抄這套。
+
+**建議**：這兩個結構性 NULL **預設不要在 `int_` collapse**，保留穿過 int_、在 `dim_/fct_/rpt_` 依問題處理（聚合本就忽略 NULL，常常不用填；刪欄的 NULL 尾用 `WHERE order_date < 停用日` 限有效期即可）。**例外**：某填值被證明 (a) 消費者無關且被多下游共用 → 才移進 int_，且**加新欄、不覆寫正典欄**（機制三那套）。**鐵律：永不在 `int_orders` 正典欄就地 `COALESCE` 掉 NULL**——那是在最共享的層、對最多消費者、做有損不可逆的決定。
+
+#### 5.5.6 兩例都會踩的橫向陷阱
+
+1. **別把結構性 NULL 當成品質錯誤**。DQ 的 `has_clean_error`/quarantine/Hard Gate 是給「值有業務問題」用的；欄位存在期外的 NULL 不是髒資料，不進 quarantine。Hard Gate 的 `error_rate_below` 看 `has_clean_error` 比率，結構 NULL 不會灌進去——**但**若在該欄掛了 `not_null` 測試，NULL 尾會讓測試爆。這類欄的測試要按「有效期」設計（只對有效區間斷言 not_null），或不掛 not_null。
+2. **null-rate 監控會誤報**。Phase 4「少欄位由 null-rate 監控」會看到這兩例的 NULL 暴增。要**事先把它標為「預期的結構性 NULL」**（migration/上線 note、或監控 baseline 例外），否則每次假警報。
+
+#### 5.5.7 判準
+
+一句話收束：**先分辨 NULL 是「不存在 / 漏抽 / 停止收集」**——不存在→接受（5.5.2 A）、漏抽→Proposal C 回填（5.5.2 B）、停止收集→凍結留存+防誤用（5.5.4 A/B）；而**填值決定往 DAG 邊緣（dim/fct/rpt）推、正典欄永不覆寫**（5.5.5）。
+
 ---
 
 ## 6. 實機驗證記錄（2026-06）

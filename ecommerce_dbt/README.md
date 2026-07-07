@@ -121,6 +121,30 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 2. **source freshness** underneath is `SELECT MAX(received_at)`, blocked by the fuse → bypass via the source's `freshness.filter` (a recent-window filter).
 3. `stg_orders` itself **does not set** `require_partition_filter`, so downstream `int_` and Hard Gate tests query freely.
 
+### 4.7 `on_schema_change: append_new_columns` ⭐ (add a column without a full rebuild)
+
+**Problem**: `stg_orders`'s final projection is an explicit column list (§4.5, the "rename seam"), so adding a downstream column means editing the list. But under the default `on_schema_change='ignore'`, incremental runs won't add the new column to the existing table — the only way is `--full-refresh`, which on a large table is a full scan + full-partition rewrite, billed by bytes scanned. Paying a full-table cost to add one column isn't worth it.
+
+**Fix**: use `append_new_columns`. On a column add, dbt first `ALTER TABLE ADD COLUMN` (metadata, free, existing rows auto-NULL), then overwrites only the lookback-window partitions — old partitions stay put at NULL. Cost is ∝ recent data. This mirrors staging's `ALLOW_FIELD_ADDITION` ([CLOUD_LAYER §5.2](../CLOUD_LAYER.md)): both layers symmetrically "add a nullable column, old data NULL, extend in place".
+
+**Compatible with `insert_overwrite` + `copy_partitions`** (verified against dbt-bigquery 1.11 source): before running the copy job, the materialization builds a tmp table for `process_schema_changes`; on detecting the new column it ALTERs the target, then uses **the same** tmp table for the copy_partitions overwrite of the lookback-window partitions. copy_partitions already builds a tmp table every run, so the steady-state overhead of enabling this option is ≈ one metadata column comparison, negligible; no ALTER happens when the schema is unchanged.
+
+**Why `append_new_columns` and not `sync_all_columns`**:
+
+| | `append_new_columns` (chosen) | `sync_all_columns` |
+|---|---|---|
+| Add column | ✅ `ALTER ADD` | ✅ `ALTER ADD` |
+| Drop column | Left alone, column kept | **`DROP` column** |
+| Type change | Left alone | `ALTER` type |
+
+`sync_all_columns`'s DROP conflicts with "staging is additive-only; drops keep the legacy column to preserve history" (§5.2/§5.3). `append_new_columns` is add-only by nature, which aligns exactly.
+
+**The trigger gate is the explicit list, so it doesn't absorb drift**: `check_for_schema_changes` compares the model's produced columns (the explicit list), not the underlying staging. A column staging grew via `ALLOW_FIELD_ADDITION` is invisible until you add it to the explicit SELECT → no auto-ALTER. This option **fires only when you deliberately edit the list (into git, reviewed)**, leaving the explicit-list discipline intact.
+
+**Boundaries** (what it can't solve — still go through the §6 runbook):
+- **Historical backfill** (values needed in old partitions too, e.g. a Proposal C rebuild): it only NULL-fills old partitions and writes the lookback window → the true values in old partitions still need a targeted refresh.
+- **Type change / rename / partition change**: still `--full-refresh` / table rebuild.
+
 ## 5. Testing Strategy
 
 | Test | Target | Severity | Notes |

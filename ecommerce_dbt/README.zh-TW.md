@@ -121,6 +121,30 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 2. **source freshness** 底層是 `SELECT MAX(received_at)`，會被保險絲擋 → source 的 `freshness.filter` 用近窗過濾繞過。
 3. `stg_orders` 本身**不設** `require_partition_filter`，下游 `int_` 與 Hard Gate 測試可自由查詢。
 
+### 4.7 `on_schema_change: append_new_columns` ⭐（加欄免全量重抽）
+
+**問題**：`stg_orders` 最終投影是顯式清單（§4.5「改名接縫」），新增一個下游欄位得改清單。但預設 `on_schema_change='ignore'` 下，增量跑批不會把新欄加進既有表——唯一辦法是 `--full-refresh`，在大表上就是全表掃 + 全分區重寫、按掃描量計費。加一欄付一次全表的錢，不划算。
+
+**解法**：改用 `append_new_columns`。加欄時 dbt 先 `ALTER TABLE ADD COLUMN`（metadata、免費、既有列自動 NULL），再只覆寫回看窗分區——舊分區原地不動、停在 NULL。成本 ∝ 近期資料。這是 staging 端 `ALLOW_FIELD_ADDITION`（[CLOUD_LAYER-TW §5.2](../CLOUD_LAYER-TW.md)）的鏡像：兩層對稱地「加 nullable 欄、舊資料 NULL、原地擴充」。
+
+**與 `insert_overwrite` + `copy_partitions` 相容**（已對 dbt-bigquery 1.11 原始碼查證）：materialization 在跑 copy job 前先建 tmp table 做 `process_schema_changes`，偵測到新欄即 ALTER 目標表，再用**同一張** tmp table 走 copy_partitions 覆寫回看窗分區。copy_partitions 本來每次就要建 tmp table，故啟用此選項的穩態額外成本 ≈ 一次 metadata 欄位比對，可忽略；無 schema 變動時不 ALTER。
+
+**為何 `append_new_columns` 而非 `sync_all_columns`**：
+
+| | `append_new_columns`（本專案選用） | `sync_all_columns` |
+|---|---|---|
+| 加欄 | ✅ `ALTER ADD` | ✅ `ALTER ADD` |
+| 刪欄 | 不動，欄留著 | **`DROP` 欄** |
+| 改型別 | 不動 | `ALTER` 型別 |
+
+`sync_all_columns` 的 DROP 會牴觸「staging 只做加法、刪欄留 legacy 欄保歷史」（§5.2/§5.3）。`append_new_columns` 天生只加不刪，正好對齊。
+
+**觸發閘門＝顯式清單，故不吃 drift**：`check_for_schema_changes` 比對的是 model 產出的欄位（顯式清單），不是底層 staging。staging 靠 `ALLOW_FIELD_ADDITION` 自動長的欄，在你把它加進顯式 SELECT 前偵測不到 → 不會自己 ALTER。此選項**只在刻意改清單（進 git、被 review）時觸發**，顯式紀律原封不動。
+
+**界線**（救不了的，仍走 §6 runbook）：
+- **歷史回填**（值要連舊分區一起有，如 Proposal C 重建）：它只 NULL 補舊分區、只寫回看窗 → 舊分區真值仍需 targeted refresh。
+- **改型別 / 改名 / 改分區**：仍 `--full-refresh` / 重建表。
+
 ## 5. 測試策略
 
 | 測試 | 對象 | severity | 說明 |

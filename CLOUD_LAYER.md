@@ -111,6 +111,92 @@ Even though BigQuery can DROP/RENAME, staging **deliberately** stays additive-on
 
 `extract_ods_to_bq.FIELDS` is the third hand-maintained declaration of the ODS schema, after `schema.py` and `models.py`, and its worst drift mode is "silently dropping data from extraction." `tests/test_schema_bq_consistency.py` turns its consistency with `models.py` (column coverage, type, nullability) into a failing test — extending the spirit of DQ mechanism 1 to the extraction layer. `FIELDS` drives the BQ schema, the serialization, and this test alike (single source of truth).
 
+### 5.5 End-to-End Examples: Add / Drop a Column (with the NULL follow-up) ⭐
+
+§5.2's table is the static matrix of "which ODS change, can BQ do it in place"; this section is its **step-by-step walkthrough**, tracing the two most common changes from ODS all the way to dbt `stg_`, and then wiring in how to handle the NULLs each one produces.
+
+Premise: "add/drop a column" here means an engineer **deliberately** changing ODS via Alembic (§5.1's deliberate evolution), **not upstream drift** (drift doesn't change ODS structure). `stg_orders` already sets `on_schema_change='append_new_columns'` (see [ecommerce_dbt/README §4.7](./ecommerce_dbt/README.md)).
+
+The NULLs the two cases produce are **mirror images** on the time axis, so the handling philosophies are opposite:
+
+| | Where the NULL grows | Meaning |
+|---|---|---|
+| Add | The past (historical partitions) | The column **simply didn't exist** in that history |
+| Drop | The future (grows after collection stops) | The column is **no longer filled** from here on |
+
+**The shared first step is always to decide which kind of NULL it is**, then choose accept / backfill / impute — get this wrong and you'll reach for the wrong tool.
+
+#### 5.5.1 Add: the flow
+
+| # | Checkpoint | Action |
+|---|---|---|
+| 1 | ODS | Alembic adds a **nullable** column (a NOT NULL add can't use `ALLOW_FIELD_ADDITION` — existing rows would violate it) |
+| 2 | Consistency test | `test_no_ods_column_missing_from_fields` goes red — "ODS has it, `FIELDS` doesn't" is caught (else silent under-extraction) |
+| 3 | `FIELDS` | Add the column (type/mode aligned, else the type/mode tests also go red); green = the three declarations realign |
+| 4 | Extract + load | `ALLOW_FIELD_ADDITION` auto-adds the new column to the staging table; historical rows in old partitions are NULL, new rows have values |
+| 5 | `stg_orders` (list not edited) | `source`'s `select *` pulls it in, but the **final explicit SELECT doesn't list it → dropped**; model output is unchanged, downstream can't see it — it just "rides along" in staging |
+| 6 | `stg_orders` (surface via the list) | Add the column to the explicit SELECT (into git, reviewed) → the next **ordinary incremental run** suffices: dbt auto `ALTER ADD COLUMN` (metadata, free, old partitions NULL) + a copy job overwrites only the lookback-window partitions. **No `--full-refresh`, no full-table rewrite**; cost ∝ recent data |
+
+#### 5.5.2 Add: handling the large historical NULL
+
+First, a key fork: **is the column's history "nonexistent" or "under-extracted"?**
+
+| Handling | Applies when | How | Why |
+|---|---|---|---|
+| A. Accept the NULL (default) | The value genuinely starts being collected now (a new program) | Don't fill; downstream slices by time or `WHERE col IS NOT NULL` | NULL honestly reflects "it didn't exist before"; force-filling = fabricating data. Cost 0 |
+| B. Proposal C backfill | The value was always in Raw, ODS just never mapped it (under-extracted) | Re-produce from Raw with the new mapping → push corrected rows → targeted refresh of the affected partitions (see §7, DQ Proposal C) | A "missing value" class that A/B remediation can't touch — exactly Proposal C's domain. Heavy, but paid once |
+| C. Downstream imputation | Analysis needs non-NULL (SUM/AVG shouldn't be diluted, a report must show 0) | `COALESCE(col, <default>)` in `int_/dim_`, record the semantics in the model description | `stg_` stays faithful (NULL); imputation is an analytics-layer business decision (DQ mechanism 3: SQL is the audit trail) |
+| D. Default at ingestion | The value must always exist (e.g. `dq_rule_version`) | Set default/NOT NULL right in the ODS migration; historical rows are filled at migration time | Push the "NULL or not" decision to the cheapest, most upstream point; the cost is that a NOT NULL add must fill values in the migration, not via `ALLOW_FIELD_ADDITION` |
+
+⚠️ **A blind spot of `append_new_columns`**: `ALTER ADD COLUMN` sets **all** old partitions to NULL, but an ordinary incremental only backfills the **lookback window**. If the column has existed in staging for a while (introduced ≪ the moment you add it to the `stg_` SELECT), the partitions in between — "staging has real values but they're outside the lookback window" — will **wrongly stay NULL** in `stg_`. The fix is a one-time targeted refresh of that range, temporarily widening `stg_orders_lookback_days`, or a single `--full-refresh` when the column first launches. So "no full-refresh" precisely means **no full-table rewrite on every future run**; a one-time backfill is still needed if there's a historical gap at first surfacing.
+
+#### 5.5.3 Drop: the flow
+
+| # | Checkpoint | Action |
+|---|---|---|
+| 1 | ODS | Alembic drops the column; `models.py` no longer has it |
+| 2 | Consistency test | `test_no_stale_field_without_ods_column` goes red — the stale "`FIELDS` has it, ODS doesn't" is caught |
+| 3 | `FIELDS` | Remove the column; green; `_to_bq_dict` no longer emits it |
+| 4 | Extract + load | The staging physical column is **not dropped, kept** (§5.2); the load schema omits it → new rows NULL, historical rows keep their values |
+| 5 | `stg_orders` | The explicit list still has the column → queries fine (staging still has it; new rows read NULL, old rows read values), **non-breaking**, becomes a legacy column |
+| 6 | To remove it from the model | **Default: leave it as legacy, do nothing** — `append_new_columns` is add-only and **deliberately does not DROP** (aligning with "staging is additive-only; drops keep the legacy column" §5.2/§5.3). Only if you truly must remove it, `--full-refresh` rebuilds (rare, deliberate escape hatch; if downstream `int_/dim_` still references it, that run errors and is caught inside the DAG) |
+
+#### 5.5.4 Drop: handling the large future NULL (the legacy column's NULL tail)
+
+This column has real history but a NULL future that keeps growing; the question shifts from "how to fill" to "how to **not misuse** it".
+
+| Handling | Applies when | How | Why |
+|---|---|---|---|
+| A. Freeze and keep (default) | Most cases | Let it sit: history queryable, future NULL; restrict to the historical range to use it | Aligns with §5.2/§5.3 "don't drop, keep for history"; BQ storage is dirt cheap, the NULL tail costs ≈ 0 |
+| B. Mark the validity window, prevent misuse | A downstream will touch it | Model description / a note "stops being filled after X", or `int_/dim_` explicitly `WHERE order_date < cutoff` before referencing it | Prevents a future reader from `AVG`-ing a half-dead column and getting it diluted by the NULL tail (a consumer-contract issue, echoing DQ Proposal C-4 P4) |
+| C. Actually remove it | Certain it's unneeded and history can be lost | Remove from the `stg_` explicit list + `--full-refresh` rebuild (`append_new_columns` won't DROP, so full-refresh is mandatory) | The only path that makes the column disappear. Rare, deliberate |
+| D. Archive then remove | Want a clean mainline and retained audit | First snapshot the column (or history containing it) into an archive table, then remove it from the mainline | Balances "clean mainline" with "auditable history", analogous to the migration-form `ods_retired_<batch>`. Medium cost, one extra table |
+
+#### 5.5.5 Which layer should NULL handling live in (`int_` vs `dim_/fct_`)
+
+First split NULL handling into two kinds: **(a) consumer-invariant normalization** (objectively correct for all downstream, one answer) and **(b) consumer-specific analytical/presentation decisions** (NULL→0 for aggregation / keep NULL to count the miss-rate / NULL→'unknown' as a dimension bucket — the answer varies by question). The two structural NULLs above are almost always (b).
+
+Core semantic principle: **NULL carries information ("didn't exist / stopped being collected"), and `COALESCE` is lossy and one-way** — once you collapse NULL→0 in `int_`, no downstream can tell "not collected" from "genuinely 0", and a `fct_` wanting a coverage rate can never compute it. Hence: **preserve NULL as long as possible; collapse only at the layer where the specific question makes the collapse correct**; filling a default is a business/presentation decision that belongs at the altitude of dim/fct/rpt, not the int_ plumbing (echoing "quality responsibility tightens downstream").
+
+| Aspect | In `int_` (early, shared) | In `dim_/fct_` (late, close to the consumer) |
+|---|---|---|
+| Reversibility | Poor: NULL info dies here, downstream can't recover it | Good: local decision, small blast radius |
+| Consistency | One answer for all downstream → only (a) benefits | Each takes what it needs → the natural home of (b) |
+| Semantics | For (b), it "makes a decision for everyone that shouldn't be made for them" | Each question decides for itself |
+
+An existing template in the docs: DQ mechanism 3's scenario imputation **does live in int_**, but via a **new column** (`customer_rating_cleaned`, not overwriting the original) + a **scenario-specific model** (not polluting the canonical `int_orders`) + **an audit trail in the description**. Copy that pattern.
+
+**Recommendation**: for these two structural NULLs, **by default do not collapse them in `int_`** — carry them through int_ and handle them in `dim_/fct_/rpt_` per the question (aggregations already ignore NULL, so often no fill is needed; the drop-case NULL tail is best handled with `WHERE order_date < cutoff`). **Exception**: if a fill is proven (a) consumer-invariant and shared by many downstream, then move it into int_ — but **as a new column, never overwriting the canonical one** (the mechanism-3 pattern). **Iron rule: never `COALESCE` NULL away in place on a canonical `int_orders` column** — that makes a lossy, irreversible decision at the most-shared layer for the most consumers.
+
+#### 5.5.6 Cross-cutting traps both cases hit
+
+1. **Don't treat a structural NULL as a quality error.** DQ's `has_clean_error`/quarantine/Hard Gate are for "values with a business problem"; a NULL outside a column's existence window is not dirty data and does not go to quarantine. Hard Gate's `error_rate_below` looks at the `has_clean_error` ratio, so structural NULLs never feed it — **but** a `not_null` test on that column will blow up on the NULL tail. Design such tests around the validity window (assert not_null only over the valid range), or don't attach not_null at all.
+2. **The null-rate monitor will false-alarm.** Phase 4's "missing fields via null-rate monitoring" will see the NULL spike from both cases. **Mark it as an expected structural NULL beforehand** (a migration/launch note, or a monitoring baseline exception), else you get a false alert every run.
+
+#### 5.5.7 The decision rule
+
+In one line: **first tell whether the NULL is "nonexistent / under-extracted / stopped-collecting"** — nonexistent → accept (5.5.2 A), under-extracted → Proposal C backfill (5.5.2 B), stopped-collecting → freeze-and-keep + prevent-misuse (5.5.4 A/B); and **push the fill decision to the DAG edge (dim/fct/rpt), never overwriting a canonical column** (5.5.5).
+
 ---
 
 ## 6. Live Verification Record (2026-06)

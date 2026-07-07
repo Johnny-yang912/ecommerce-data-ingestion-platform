@@ -25,12 +25,9 @@ clean-targets:         # directories to be removed by `dbt clean`
 
 # Configuring models
 # Full documentation: https://docs.getdbt.com/docs/configuring-models
-
-# In this example config, we tell dbt to build all models in the example/
-# directory as views. These settings can be overridden in the individual model
-# files using the `{{ config(...) }}` macro.
 models:
   ecommerce_dbt:
-    # Config indicated by + and applies to all files under models/example/
-    example:
-      +materialized: view
+    staging:
+      # staging 層預設物化 table；stg_orders 於模型內 config 覆寫為 incremental
+      # （insert_overwrite + received_at 分區 + 回看窗，見該檔頭註與 CLOUD_LAYER-TW §1.2）。
+      +materialized: table

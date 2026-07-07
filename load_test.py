@@ -172,7 +172,7 @@ def print_report(results: list, total_elapsed: float) -> None:
 
 # ── 主程式（吞吐量測試）────────────────────────────────────────────────────────
 
-async def main(url: str, n: int, concurrency: int, duplicate: bool) -> None:
+async def main(url: str, n: int, concurrency: int, duplicate: bool, api_key: str | None = None) -> None:
     print(f"目標：{url}")
     print(f"請求數：{n}　並發上限：{concurrency}　重複資料：{'是' if duplicate else '否'}")
     if duplicate:
@@ -183,8 +183,10 @@ async def main(url: str, n: int, concurrency: int, duplicate: bool) -> None:
     results = []
     progress_counter = [0]
 
+    # /orders 需 X-API-Key 認證；帶了才不會被 401 擋下（見 auth.py）。
+    headers = {"X-API-Key": api_key} if api_key else {}
     limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
-    async with httpx.AsyncClient(limits=limits) as client:
+    async with httpx.AsyncClient(limits=limits, headers=headers) as client:
         t0 = time.perf_counter()
         await asyncio.gather(*[
             send_order(client, sem, i, url, results, progress_counter, n, duplicate)
@@ -263,9 +265,10 @@ if __name__ == "__main__":
     parser.add_argument("--concurrency", type=int, default=50,                   help="同時發出的最大請求數")
     parser.add_argument("--duplicate",   action="store_true",                    help="所有請求送同一份 payload（相同 order_id）")
     parser.add_argument("--cas-test",    action="store_true",                    help="CAS lock 測試：n 個 worker 同時搶同一個 raw_id")
+    parser.add_argument("--api-key",     default=None,                           help="X-API-Key header 值（/orders 需認證）")
     args = parser.parse_args()
 
     if args.cas_test:
         asyncio.run(run_cas_test(args.base_url, args.n))
     else:
-        asyncio.run(main(args.url, args.n, args.concurrency, args.duplicate))
+        asyncio.run(main(args.url, args.n, args.concurrency, args.duplicate, args.api_key))

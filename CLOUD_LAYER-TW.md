@@ -150,4 +150,4 @@ corrections 若另成一張 BQ 表：需要自己的 `FIELDS` 宣告、抽取邏
 ## 8. 待辦與未來
 
 - 微批升級時：`get_watermark()` 換方案 B（+ `advance_watermark()`）。
-- 進 dbt 分層（`stg_` 起）。
+- 進 dbt 分層（`stg_` 起）：已起，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md)。

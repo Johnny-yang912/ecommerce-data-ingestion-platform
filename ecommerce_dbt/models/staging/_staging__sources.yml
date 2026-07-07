@@ -1,0 +1,21 @@
+version: 2
+
+sources:
+  - name: ecommerce_staging
+    # BQ 專案 ID 隨部署環境而異（dev/prod 不同專案），故不寫死：
+    # 由 profile 的 target project 決定（database 省略時 dbt 用 profile 的 project）。
+    schema: staging
+    description: >
+      ODS（PostgreSQL）由 extract_ods_to_bq.py 增量 append 上來的 BQ 鏡射。
+      append-only、有重複列（`>=` watermark 重抽最新分區），去重交給 stg_orders。
+    tables:
+      - name: orders
+        description: ODS.orders 的 1:1 鏡射（分區 received_at(DAY)、require_partition_filter=True）。
+        config:
+          loaded_at_field: received_at
+          freshness:
+            warn_after: {count: 26, period: hour}
+            error_after: {count: 50, period: hour}
+            # 保險絲：freshness 底層是 SELECT MAX(received_at)，無過濾會被 400 擋下
+            # （見 CLOUD_LAYER-TW §1.4）。用近窗過濾繞過，仍能反映最新載入時間。
+            filter: received_at > timestamp_sub(current_timestamp(), interval 30 day)

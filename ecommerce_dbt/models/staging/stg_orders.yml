@@ -1,0 +1,50 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: >
+      ODS.orders 的 Silver 入口：去重還原 ODS 粒度、保留所有資料（含 has_clean_error=TRUE）。
+      攔截不在此層——由 int_ 的 Row Filter 逐筆隔離。此處掛 Hard Gate（run-level）測試。
+    tests:
+      # --- Hard Gate（DQ 機制一，run-level）：失敗 → 整個 dbt run 中止，下游保留上次乾淨狀態 ---
+      # 用自訂 generic test error_rate_below（聚合斷言，非逐列）。見 macros/error_rate_below.sql
+      # 嚴重：整批錯誤率 >= 10% → 疑似 source 系統異常，直接擋
+      - error_rate_below:
+          arguments:
+            threshold: 0.1
+          config:
+            severity: error
+      # 警告：錯誤率 >= 5% 但尚可接受 → 繼續跑但告警
+      - error_rate_below:
+          arguments:
+            threshold: 0.05
+          config:
+            severity: warn
+    columns:
+      - name: raw_id
+        description: ODS.raw_id（1:1 血緣鍵）；去重後應唯一——unique 測試即去重驗證。
+        tests:
+          - not_null
+          - unique
+      - name: id
+        description: ODS 主鍵。
+        tests:
+          - not_null
+          - unique
+      - name: order_id
+        description: 訂單唯一鍵；唯一硬閘門欄位，缺失代表整批無意義。
+        tests:
+          - not_null
+          - unique
+      - name: received_at
+        description: 攝入時間（staging 分區欄位）。
+        tests:
+          - not_null
+      - name: has_clean_error
+        description: 業務值品質標籤（此層保留、不攔截）。
+        tests:
+          - not_null
+      - name: has_schema_drift
+        description: 上游契約漂移標籤（非阻斷監控訊號）。
+        tests:
+          - not_null

@@ -150,4 +150,4 @@ Corrected values land in old partitions; a `received_at`-incremental `stg_` run 
 ## 8. Open Items and Future
 
 - On micro-batch upgrade: swap `get_watermark()` to Approach B (+ `advance_watermark()`).
-- Move into dbt layering (starting at `stg_`).
+- Move into dbt layering (starting at `stg_`): started, see [ecommerce_dbt/README](./ecommerce_dbt/README.md).

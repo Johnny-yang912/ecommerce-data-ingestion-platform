@@ -412,6 +412,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── CLOUD_LAYER.md         # Cloud Layer Architecture: ODS → BigQuery (English)
 ├── CLOUD_LAYER-TW.md      # 雲端層架構：ODS → BigQuery（繁體中文）
+├── ecommerce_dbt/         # dbt transformation layer (stg_/int_/dim_/fct_/rpt_); ops & decisions in its README
 ├── .env           # DB_URL, API_KEYS (not committed)
 ├── .env.example   # Environment variable template (committed)
 └── .gitignore
@@ -425,6 +426,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 |---|---|
 | [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), scenario repair strategy, quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
 | [Cloud Layer Architecture](./CLOUD_LAYER.md) | ODS → BigQuery extraction and staging: partition/clustering/fuse design, watermark strategy (Approach A + the `get_watermark()` seam), batch-load and JSON landing decisions, and the ODS schema evolution strategy (additive staging + dbt absorption + `FIELDS` consistency test) |
+| [Transformation Layer (dbt)](./ecommerce_dbt/README.md) | dbt transformation ops & implementation decisions: layering/naming conventions, materialization (table vs view, incremental + insert_overwrite + `copy_partitions` to bypass the sandbox DML ban), lookback window, dedup key & invariant, Hard Gate custom generic test, freshness fuse bypass. Layer contracts in DQ_ARCHITECTURE, staging infra in CLOUD_LAYER |
 
 ---
 
@@ -551,7 +553,8 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 
 **Phase 4 — Analytics Pipeline**
 - [v] ODS → BigQuery extraction script (`extract_ods_to_bq.py`) — incremental by `received_at` watermark (Approach A, derived from `INFORMATION_SCHEMA.PARTITIONS`, wrapped in `get_watermark()` as the seam for a future micro-batch Approach B); partitioned (`received_at` DAY) + clustered (`order_id`, `has_clean_error`) staging table with `require_partition_filter` fuse; batch load only (no streaming), JSON columns landed as native objects, `ALLOW_FIELD_ADDITION` for additive schema evolution; `FIELDS` single source of truth guarded by `tests/test_schema_bq_consistency.py` (see [CLOUD_LAYER.md](./CLOUD_LAYER.md))
-- [ ] dbt Core: stg_* → int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Hard Gate tests, Row Filter, `int_orders_quarantine`, scenario-specific `int_orders_*` models, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
+- [v] dbt Core `stg_` layer (`stg_orders`: `raw_id` dedup + Hard Gate + source freshness; incremental + `insert_overwrite` + `copy_partitions`) — see [ecommerce_dbt/README.md](./ecommerce_dbt/README.md)
+- [ ] dbt Core: int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Row Filter, `int_orders_quarantine`, scenario-specific `int_orders_*` models, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — Automation + Queue Upgrade**

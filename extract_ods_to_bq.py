@@ -6,15 +6,21 @@
 關鍵設計（已與設計文件對齊）：
 - staging 維持「1:1 原樣落地」：不清洗、不改名、不轉型（那是 dbt stg_ 的責任）。
 - 載入一律 batch load job（免費），絕不用 streaming insert（§5-①）。
-- 增量切片：watermark by received_at，邊界用 `>=`（寧可重抓不漏抓，去重交給 dbt stg_）。
+- 增量切片：watermark by spec.time_col，邊界用 `>=`（寧可重抓不漏抓，去重交給 dbt stg_）。
 - watermark 採「方案 A」：從 INFORMATION_SCHEMA.PARTITIONS 推導（免費 metadata，
   且不受 require_partition_filter 限制）。讀取邏輯全部封裝在 get_watermark()——
   這是將來改「方案 B（獨立 watermark 表，精確到 timestamp，供分鐘級微批）」的唯一接縫。
 - 本腳本沒有 advance_watermark()：方案 A 的 watermark 由 staging 自身推導，
   load 完下次呼叫 get_watermark() 即自然反映新資料。換 B 時才需新增 advance 步驟。
+
+多表（每張表一份 TableSpec）：orders 與 quality_events 各自獨立抽取、獨立 watermark、
+獨立 load job。跨表無 BQ 交易（load job 只保證單表原子），故一致性靠：
+  ① 各表 watermark 獨立、失敗不推進 → 下輪 `>=` 自動補抽（append-only + dbt stg_ 去重）；
+  ② main() 的 gate：任一張失敗即整體失敗（非零 exit），下游 dbt(T) 不得在半套資料上開跑。
 """
 
 import time
+from dataclasses import dataclass
 
 import structlog
 from google.cloud import bigquery
@@ -22,30 +28,44 @@ from google.cloud import bigquery
 from bq import get_bq_client
 from config import settings
 from database import SessionLocal
-from models import ODS
+from models import ODS, QualityEvent
 
 logger = structlog.get_logger()
 
-# --- BQ 目的地 ---
+# --- BQ 目的地（跨表共用）---
 # PROJECT 隨部署環境而異（dev/prod 可能是不同專案），且是會曝光的基礎設施座標，
 # 故由 settings 注入（BQ_PROJECT），真實 ID 不寫死進版控。
-# DATASET / TABLE / LOCATION 是結構性、穩定的架構決定（US 見 §4），留模組常數。
+# DATASET / LOCATION 是結構性、穩定的架構決定（US 見 §4），留模組常數。
 PROJECT = settings.bq_project
 DATASET = "staging"
-TABLE = "orders"
 LOCATION = "US"  # 所有 dataset 一致建在 US（§4，避免跨 location 查詢報錯）
-STAGING_TABLE = f"{PROJECT}.{DATASET}.{TABLE}"
-
-# 分區與叢集（已定）
-PARTITION_FIELD = "received_at"
-CLUSTERING_FIELDS = ["order_id", "has_clean_error"]
 
 
-# --- 欄位單一真相來源（決定 2）---------------------------------------------
-# (ODS 欄位名, BQ 型別, mode)；1:1 鏡射 models.py 的 ODS。
-# ensure_staging_table() 由此建 schema，_to_bq_dict() 由此決定序列化方式，
-# 兩處共用同一份清單，避免 schema 與列轉換漂移。
-FIELDS: list[tuple[str, str, str]] = [
+# --- 每張表的抽取契約（單一真相來源，決定 2）--------------------------------
+@dataclass(frozen=True)
+class TableSpec:
+    """一張 ODS→staging 表的完整抽取契約。
+
+    fields：(ODS 欄位名, BQ 型別, mode)，1:1 鏡射 models.py。
+      ensure_staging_table() 由此建 schema、_to_bq_dict() 由此決定序列化、
+      test_schema_bq_consistency 由此守一致性——三處共用同一份，避免漂移。
+    """
+
+    table: str                                 # BQ staging 表名 + INFORMATION_SCHEMA 過濾
+    model: type                                # SQLAlchemy model（讀 ODS 增量用）
+    time_col: str                              # watermark 與增量切片欄位
+    fields: list[tuple[str, str, str]]
+    partition_field: str
+    clustering_fields: list[str]
+    require_partition_filter: bool
+
+    @property
+    def staging_table(self) -> str:
+        return f"{PROJECT}.{DATASET}.{self.table}"
+
+
+# orders：1:1 鏡射 models.ODS
+ORDERS_FIELDS: list[tuple[str, str, str]] = [
     ("id", "INTEGER", "REQUIRED"),            # ODS PK，保留以維持 1:1 原樣鏡射
     ("received_at", "TIMESTAMP", "REQUIRED"),  # 分區欄位
     ("raw_id", "INTEGER", "REQUIRED"),         # 與 ODS NOT NULL 鏡射；REQUIRED 兼作 fail-loud 護欄
@@ -95,48 +115,88 @@ FIELDS: list[tuple[str, str, str]] = [
     ("source_client_id", "STRING", "NULLABLE"),
 ]
 
+# quality_events：1:1 鏡射 models.QualityEvent（append-only 品質事件日誌）
+# NOT NULL 欄一律 REQUIRED，兼作 fail-loud 護欄；reason(JSONB)→JSON、event_at→TIMESTAMP。
+QUALITY_EVENTS_FIELDS: list[tuple[str, str, str]] = [
+    ("id", "INTEGER", "REQUIRED"),           # PK
+    ("raw_id", "INTEGER", "REQUIRED"),       # 叢集欄位①：下游 int_* 以 raw_id 取最新狀態
+    ("order_id", "STRING", "REQUIRED"),
+    ("event_type", "STRING", "REQUIRED"),    # initial_evaluation | promotion | rejection
+    ("from_state", "STRING", "NULLABLE"),
+    ("to_state", "STRING", "REQUIRED"),      # 叢集欄位②：clean|quarantined|promoted|permanently_rejected
+    ("rule_version", "STRING", "REQUIRED"),
+    ("event_at", "TIMESTAMP", "REQUIRED"),   # 分區欄位（watermark 依此推導）
+    ("reason", "JSON", "NULLABLE"),
+]
 
-def _bq_schema() -> list[bigquery.SchemaField]:
-    """由 FIELDS 推出 BQ schema；建表與 load job 共用同一份（單一真相來源）。"""
-    return [bigquery.SchemaField(name, bq_type, mode=mode) for name, bq_type, mode in FIELDS]
+
+ORDERS_SPEC = TableSpec(
+    table="orders",
+    model=ODS,
+    time_col="received_at",
+    fields=ORDERS_FIELDS,
+    partition_field="received_at",
+    clustering_fields=["order_id", "has_clean_error"],
+    require_partition_filter=True,   # access 永遠帶 received_at 過濾 → 保險絲合理
+)
+
+QUALITY_EVENTS_SPEC = TableSpec(
+    table="quality_events",
+    model=QualityEvent,
+    time_col="event_at",
+    fields=QUALITY_EVENTS_FIELDS,
+    partition_field="event_at",
+    clustering_fields=["raw_id", "to_state"],
+    # 保險絲關閉：下游 int_* 合成有效狀態要「跨全歷史按 raw_id 取最新」，
+    # 本質是非分區過濾的全掃描；開保險絲會擋掉這個必然查詢（見盤點 B）。
+    require_partition_filter=False,
+)
+
+SPECS = [ORDERS_SPEC, QUALITY_EVENTS_SPEC]
 
 
-def ensure_staging_table(client: bigquery.Client) -> None:
+def _bq_schema(fields: list[tuple[str, str, str]]) -> list[bigquery.SchemaField]:
+    """由 fields 推出 BQ schema；建表與 load job 共用同一份（單一真相來源）。"""
+    return [bigquery.SchemaField(name, bq_type, mode=mode) for name, bq_type, mode in fields]
+
+
+def ensure_staging_table(client: bigquery.Client, spec: TableSpec) -> None:
     """建立 dataset（US）與 staging 實體表（分區+叢集+保險絲）。冪等。"""
     # dataset 明確指定 location，不靠預設（§4）
     dataset = bigquery.Dataset(f"{PROJECT}.{DATASET}")
     dataset.location = LOCATION
     client.create_dataset(dataset, exists_ok=True)
 
-    table = bigquery.Table(STAGING_TABLE, schema=_bq_schema())
+    table = bigquery.Table(spec.staging_table, schema=_bq_schema(spec.fields))
 
-    # 分區：received_at 每天一塊 + 強制分區過濾（保險絲：沒帶 received_at 過濾的查詢直接報錯）
+    # 分區：spec.partition_field 每天一塊；保險絲（require_partition_filter）由 spec 決定——
+    # orders 開（access 永遠帶時間過濾），quality_events 關（下游需跨全歷史取最新）。
     table.time_partitioning = bigquery.TimePartitioning(
         type_=bigquery.TimePartitioningType.DAY,
-        field=PARTITION_FIELD,
-        require_partition_filter=True,
+        field=spec.partition_field,
+        require_partition_filter=spec.require_partition_filter,
     )
-    table.clustering_fields = CLUSTERING_FIELDS
+    table.clustering_fields = spec.clustering_fields
 
     client.create_table(table, exists_ok=True)
 
 
-def get_watermark(client: bigquery.Client):
+def get_watermark(client: bigquery.Client, table: str):
     """方案 A：從 INFORMATION_SCHEMA.PARTITIONS 取最新分區（天粒度）。
 
     回傳最新分區當天 00:00:00 UTC 的 timestamp；表空/不存在 → None（觸發首次全量抽取）。
 
     - 免費(近似):查 INFORMATION_SCHEMA 是 metadata 操作,不掃 staging 本體;on-demand 下每次有 10 MB 最低計費門檻,金額可忽略,且通常在免費額度內。
-    - 不受 require_partition_filter 限制：查的是 metadata view，非 staging 表本體。
+    - 不受 require_partition_filter 限制：查的是 metadata view，非表本體。
     - 天粒度：每次抽取會重抽「最新分區整天」，配 `>=` 邊界與 dbt stg_ 去重 → 不漏不錯。
 
     ★ 換方案 B 的唯一接縫：屆時改為讀獨立 watermark 表（精確 timestamp），
-      並在 load 成功後新增 advance_watermark()；main() 的呼叫不變。
+      並在 load 成功後新增 advance_watermark()；呼叫端不變。
     """
     sql = f"""
         SELECT PARSE_TIMESTAMP('%Y%m%d', MAX(partition_id)) AS wm
         FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.PARTITIONS`
-        WHERE table_name = '{TABLE}'
+        WHERE table_name = '{table}'
           AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
     """
     row = next(iter(client.query(sql).result()), None)
@@ -144,7 +204,7 @@ def get_watermark(client: bigquery.Client):
 
 
 def _json_field(value):
-    """JSON 型別欄位（items / *_message / unmapped_fields）的序列化。
+    """JSON 型別欄位（items / *_message / unmapped_fields / reason）的序列化。
 
     實機驗證結論（2026-06）：BQ JSON 欄位經 load_table_from_json 載入時，
     要傳「原生 Python 物件」。值來自 psycopg2 對 JSONB 的解析，本就是 list/dict，
@@ -165,41 +225,62 @@ def _serialize(value, bq_type: str):
     return value  # STRING / INTEGER / FLOAT / BOOL 直接傳
 
 
-def _to_bq_dict(ods_row) -> dict:
-    """ODS ORM 物件 → BQ NDJSON 列。欄位與序列化方式皆由 FIELDS 決定。"""
-    return {name: _serialize(getattr(ods_row, name), bq_type) for name, bq_type, _ in FIELDS}
+def _to_bq_dict(row, fields: list[tuple[str, str, str]]) -> dict:
+    """ODS ORM 物件 → BQ NDJSON 列。欄位與序列化方式皆由 fields 決定。"""
+    return {name: _serialize(getattr(row, name), bq_type) for name, bq_type, _ in fields}
 
 
-def extract_from_ods(watermark) -> list[dict]:
+def extract_from_ods(spec: TableSpec, watermark) -> list[dict]:
     """讀 ODS 增量。watermark=None → 全量首抽。
 
     staging 維持 1:1 原樣：只查、不清洗/改名/轉型。
     """
+    time_col = getattr(spec.model, spec.time_col)
     session = SessionLocal()
     try:
-        q = session.query(ODS)
+        q = session.query(spec.model)
         if watermark is not None:
-            q = q.filter(ODS.received_at >= watermark)  # 邊界用 >=
-        rows = q.order_by(ODS.received_at).all()
-        return [_to_bq_dict(r) for r in rows]
+            q = q.filter(time_col >= watermark)  # 邊界用 >=
+        rows = q.order_by(time_col).all()
+        return [_to_bq_dict(r, spec.fields) for r in rows]
     finally:
         session.close()  # 沿用專案手動 session 慣例
 
 
-def load_to_staging(client: bigquery.Client, rows: list[dict]) -> int:
+def load_to_staging(client: bigquery.Client, spec: TableSpec, rows: list[dict]) -> int:
     """batch load（免費）、只 append。表已預建好分區/叢集，load 自動沿用。回傳實際載入列數。"""
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         # 冪等靠 append + dbt stg_ 去重，不在 E/L 做 MERGE（保持原樣落地）
-        schema=_bq_schema(),
-        # additive evolution：ODS 加 nullable 欄並更新 FIELDS 後，新欄由 load job
+        schema=_bq_schema(spec.fields),
+        # additive evolution：ODS 加 nullable 欄並更新 fields 後，新欄由 load job
         # 自動補進既有表（ensure_staging_table 的 create 只建不改）。改名/改型別/改分區
         # 不在此處理——交給 dbt stg_ 或重建表（見「ODS schema 演進」策略）。
         schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
-    job = client.load_table_from_json(rows, STAGING_TABLE, job_config=job_config)
+    job = client.load_table_from_json(rows, spec.staging_table, job_config=job_config)
     job.result()  # 等完成；失敗則拋出，由呼叫端決定重跑
     return job.output_rows
+
+
+def extract_and_load_one(client: bigquery.Client, spec: TableSpec) -> int:
+    """單張表一條龍：建表 → watermark → 抽取 → load。回傳載入列數（0＝無新資料）。
+    失敗直接往上拋，交由 main() 的 gate 彙整。"""
+    ensure_staging_table(client, spec)
+    watermark = get_watermark(client, spec.table)
+    rows = extract_from_ods(spec, watermark)
+    if not rows:
+        logger.info("extract_skip", table=spec.table, watermark=str(watermark), reason="no_new_rows")
+        return 0
+    loaded = load_to_staging(client, spec, rows)
+    logger.info(
+        "extract_table_done",
+        table=spec.table,
+        watermark=str(watermark),
+        extracted=len(rows),
+        loaded=loaded,
+    )
+    return loaded
 
 
 def main() -> None:
@@ -209,20 +290,27 @@ def main() -> None:
     t0 = time.monotonic()
     client = get_bq_client()
 
-    ensure_staging_table(client)
-    watermark = get_watermark(client)
-    rows = extract_from_ods(watermark)
+    # 盡力兩張都試（一張失敗不擋另一張各自推進 watermark），失敗彙整後最後 gate。
+    failures: list[tuple[str, Exception]] = []
+    for spec in SPECS:
+        try:
+            extract_and_load_one(client, spec)
+        except Exception as e:  # noqa: BLE001 — 逐表隔離失敗，最後統一 gate
+            failures.append((spec.table, e))
+            logger.error("extract_table_failed", table=spec.table, error=str(e))
 
-    if not rows:
-        logger.info("extract_skip", watermark=str(watermark), reason="no_new_rows")
-        return
+    # ── GATE ────────────────────────────────────────────────────────────────
+    # 任一表失敗即整體失敗（非零 exit）→ 下游 dbt(T) 不得在半套資料上開跑。
+    # 失敗那張的 watermark 未推進（方案 A），下輪 `>=` 自動補抽（append-only + stg_ 去重）。
+    if failures:
+        raise RuntimeError(
+            "E/L gate 未通過，dbt 不應開跑；失敗表："
+            + ", ".join(f"{t}({type(e).__name__})" for t, e in failures)
+        )
 
-    loaded = load_to_staging(client, rows)
     logger.info(
-        "extract_done",
-        watermark=str(watermark),
-        extracted=len(rows),
-        loaded=loaded,
+        "extract_all_done",
+        tables=[s.table for s in SPECS],
         elapsed_s=round(time.monotonic() - t0, 2),
     )
     # 方案 A：無 advance_watermark —— staging 本身即 watermark

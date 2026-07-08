@@ -540,7 +540,7 @@ logger.info("quality_metric",
 
 ### 層次二：批次分析指標（日/週）
 
-`quality_events` 由 Airflow 與 ODS 一起抽取進 BQ，dbt 建立 `rpt_quality_*` 模型：
+`quality_events` 已由 `extract_ods_to_bq.py` 與 ODS 一起抽取進 BQ（E/L 已實作；現手動觸發，Phase 5 交 Airflow 排程），dbt 之後在其上建 `rpt_quality_*` 模型：
 
 ```
 rpt_quality_daily

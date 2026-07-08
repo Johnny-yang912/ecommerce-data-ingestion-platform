@@ -169,6 +169,6 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 ## 8. 現況與待辦
 
 - ✅ `stg_orders`（去重 + Hard Gate + freshness，增量）
-- ⬜ `stg_quality_events`（需先把 `quality_events` 納入 E/L 抽取到 BQ）
+- ⬜ `stg_quality_events`（E/L 已把 `quality_events` 抽上 BQ；前置已解除，此 dbt model 待建）
 - ⬜ `int_orders` + Row Filter、`int_orders_quarantine`、場景專用 `int_orders_*`
 - ⬜ `dim_/fct_`、`rpt_quality_*`

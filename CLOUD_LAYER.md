@@ -40,6 +40,22 @@ Any query against staging without a `received_at` filter errors out immediately,
 
 Each BigQuery dataset binds its location at creation time and cannot change it; a cross-location query errors out. All datasets (staging, dbt_dev, future dim/fct) are created in `US`, specified explicitly at dataset creation rather than relying on a default.
 
+### 1.6 A Second Staging Table: `quality_events` (Deliberate Divergence from orders) ⭐
+
+Besides `orders`, the extraction script also lands `quality_events` (the append-only quality-event log) to staging. **Why extract it**: when downstream `int_*` composes the "effective quality state," it JOINs the ODS snapshot with the latest `quality_events` event (a record promoted by Proposal B still reads `has_clean_error=TRUE` in ODS, so only the event lets it flow back to Gold) — without this table, the flow-back mechanism has no right-hand side (see [DQ_ARCHITECTURE §Mechanism 2: Row Filter](./DQ_ARCHITECTURE.md)).
+
+Its table design **does not copy orders**, because the access pattern is the opposite. Every decision in §1.2–1.4 must be re-asked:
+
+| Decision | orders | `quality_events` | Why different |
+|---|---|---|---|
+| Partition | `received_at` (DAY) | `event_at` (DAY) | Each table uses its own ingestion time axis; `event_at` also feeds the watermark (Approach A reads the latest partition) |
+| Clustering | `order_id` + `has_clean_error` | `raw_id` + `to_state` | Downstream takes "the latest state per record" at **`raw_id`** grain (same key as dbt `stg_` dedup); `to_state` for state filtering |
+| Cost fuse | ✅ on | ❌ **off** | **The key difference**: orders queries always carry a `received_at` filter, but `quality_events`'s main consumer is "latest per `raw_id` across all history" — inherently a non-partition-filtered full scan, which the fuse would block |
+
+> **Cleaner flow-back than orders**: Proposal B's promotion events carry `event_at = now()`, landing in **today's** partition, so routine incremental `event_at >= watermark` picks them up naturally — unlike orders corrections that land back in **old** partitions and need an explicit runbook push (see §7.1). The append-only time semantics make `quality_events`'s E/L simpler.
+
+> **Cross-table consistency: see §3.2** — the two tables extract independently, with independent watermarks and independent load jobs; how "orders landed but `quality_events` didn't" is prevented is covered there.
+
 ---
 
 ## 2. Watermark Strategy
@@ -70,9 +86,22 @@ Rule: **batch interval ≈ partition granularity → A; batch interval ≪ parti
 
 ## 3. Loading Strategy
 
+### 3.1 Single-table landing semantics
+
 - **WRITE_APPEND**: idempotency comes from append + dbt `stg_` dedup, with no MERGE at the E/L stage (preserving verbatim landing).
 - **JSON columns pass native objects, not `json.dumps`** (verified empirically): psycopg2 parses JSONB into native list/dict, so passing it directly lets the client embed native JSON in the NDJSON, and BigQuery stores `JSON_TYPE=array/object`. Using `json.dumps` makes BigQuery store a JSON string scalar, breaking downstream `[0]` indexing.
 - **`ALLOW_FIELD_ADDITION`**: supports additive evolution, see §5.
+
+### 3.2 Cross-table consistency: per-table load job + gate (no cross-table transaction) ⭐
+
+Multi-table extraction (orders + `quality_events`) raises a problem that doesn't exist on-prem: **a BigQuery load job is atomic only within a single table; there is no cross-table transaction** — you cannot wrap two tables' writes in one commit as you would on-prem Postgres. So we must guard against "orders landed but `quality_events` didn't," leaving dbt to build on a half-loaded pair.
+
+Not by atomic landing, but by **two lines of defense**:
+
+1. **Per-table watermark, not advanced on failure**: each table's watermark is derived from its own staging partitions (Approach A, §2). If one load fails, its watermark doesn't advance, and the next run re-extracts that batch via `event_at/received_at >= watermark` (append-only + `>=` + dbt `stg_` dedup). Whether orders succeeds has no bearing on `quality_events`'s watermark — that independence is the source of self-healing.
+2. **The `main()` gate**: extract each table best-effort (one failure doesn't block the other from advancing), then reconcile — **any failure makes the whole run `raise` (non-zero exit)**, so downstream dbt (T) must not start. In the current manual phase this is "run dbt only if all succeeded"; in Phase 5 Airflow it becomes "the dbt task's upstream dependency = both extract tasks succeeded," the same gate semantics.
+
+**The consistency model is eventual, not transactional**: skew (one table landed, the other not) causes only **delay** (a record due for flow-back is one dbt run late), never wrong data — provided downstream `int_*` composes its JOIN defensively (event absent → fall back to the ODS snapshot: clean flows, dirty stays quarantined). This is also the reason to keep "two independent load jobs" rather than forcing cross-table atomicity: independence is what makes each self-heal and retry.
 
 ---
 
@@ -107,9 +136,11 @@ Even though BigQuery can DROP/RENAME, staging **deliberately** stays additive-on
 
 > **The asymmetry**: ODS has Alembic, a real migration framework; staging has **no equivalent** (dbt only takes over from `stg_` and does not own staging itself). In practice `ALLOW_FIELD_ADDITION` covers added columns and dbt absorbs the rest as the substitute. The one genuinely "must rebuild" case (changing partitioning) is cheap under Approach A: `drop + recreate + re-extract`, and the watermark resets itself.
 
-### 5.4 Governance: `FIELDS` Is the Third Schema Declaration
+### 5.4 Governance: One `FIELDS` per Table (the Third Schema Declaration)
 
-`extract_ods_to_bq.FIELDS` is the third hand-maintained declaration of the ODS schema, after `schema.py` and `models.py`, and its worst drift mode is "silently dropping data from extraction." `tests/test_schema_bq_consistency.py` turns its consistency with `models.py` (column coverage, type, nullability) into a failing test — extending the spirit of DQ mechanism 1 to the extraction layer. `FIELDS` drives the BQ schema, the serialization, and this test alike (single source of truth).
+Each staging table's `FIELDS` is the third hand-maintained declaration of that table's schema, after `schema.py` and `models.py`, and its worst drift mode is "silently dropping data from extraction." The extraction script folds each table's extraction contract into one `TableSpec` object — `table` / `model` / `time_col` / `fields` / partition / clustering / fuse — and there are two today: `ORDERS_SPEC` (mirroring `ODS`) and `QUALITY_EVENTS_SPEC` (mirroring `QualityEvent`, see §1.6).
+
+Each `fields` drives three places (single source of truth): the BQ schema (`ensure_staging_table`), row serialization (`_to_bq_dict`), and the consistency test. `tests/test_schema_bq_consistency.py` parametrizes over `SPECS` per table, turning "changed `models.py` but forgot `fields`" into a failing test (column coverage, type, nullability). **Each new table only needs a spec added to `SPECS`; the consistency guard covers it automatically**, with no extra test to write.
 
 ### 5.5 End-to-End Examples: Add / Drop a Column (with the NULL follow-up) ⭐
 

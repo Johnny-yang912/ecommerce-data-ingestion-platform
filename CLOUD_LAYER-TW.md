@@ -40,6 +40,22 @@ staging 由抽取腳本以 batch load job 灌入。BQ 的 streaming insert 按�
 
 BQ 每個 dataset 建立當下綁定 location 不可改；跨 location 查詢會直接報錯。所有 dataset（staging、dbt_dev、未來 dim/fct）統一建在 `US`，建 dataset 時明確指定、不靠預設。
 
+### 1.6 第二張 staging 表：`quality_events`（與 orders 的刻意差異）⭐
+
+`orders` 之外，抽取腳本同時把 `quality_events`（append-only 品質事件日誌）抽上 staging。**為什麼要抽**：下游 `int_*` 合成「有效品質狀態」時，要把 ODS 快照與 `quality_events` 最新事件 JOIN 起來（Proposal B promote 的記錄在 ODS 仍是 `has_clean_error=TRUE`，靠事件才流得回 Gold）——沒有這張表，回流機制的右表就不存在（見 [DQ_ARCHITECTURE-TW〈機制二：Row Filter〉](./DQ_ARCHITECTURE-TW.md)）。
+
+它的表設計**不照抄 orders**，因為 access pattern 相反。§1.2–1.4 的每個決定都要重問一次：
+
+| 決策 | orders | `quality_events` | 為什麼不同 |
+|---|---|---|---|
+| 分區 | `received_at`（DAY） | `event_at`（DAY） | 各表用自己的攝入時間軸；`event_at` 同時餵 watermark（方案 A 讀最新分區）|
+| 叢集 | `order_id` + `has_clean_error` | `raw_id` + `to_state` | 下游以 **`raw_id`** 為 grain 取「每筆記錄的最新狀態」（與 dbt `stg_` 去重同鍵）；`to_state` 供狀態過濾 |
+| 保險絲 | ✅ 開 | ❌ **關** | **關鍵差異**：orders 的查詢永遠帶 `received_at` 過濾；但 `quality_events` 的主消費者是「跨全歷史按 `raw_id` 取最新」，本質是**非分區過濾的全掃描**，開保險絲會直接擋掉這個必然查詢 |
+
+> **回流比 orders 乾淨**：Proposal B 補的 promotion 事件 `event_at = now()`，落**當天**分區，例行增量 `event_at >= watermark` 自然撈得到；不像 orders 修正列落回**舊**分區、需要修復 runbook 主動補推（見 §7.1）。append-only 的時間語意讓 `quality_events` 的 E/L 反而更單純。
+
+> **跨表一致性見 §3.2**：兩張表獨立抽取、獨立 watermark、獨立 load job；「orders 上了但 `quality_events` 沒上」怎麼防，見〈跨表一致性〉。
+
 ---
 
 ## 2. Watermark 策略
@@ -70,9 +86,22 @@ WHERE table_name = 'orders' AND partition_id NOT IN ('__NULL__', '__UNPARTITIONE
 
 ## 3. 載入策略
 
+### 3.1 單表落地語意
+
 - **WRITE_APPEND**：冪等靠 append + dbt `stg_` 去重，不在 E/L 做 MERGE（保持原樣落地）。
 - **JSON 欄位傳原生物件，非 `json.dumps`**（實機驗證結論）：psycopg2 解 JSONB 本就是 list/dict，直接傳，client 寫 NDJSON 時嵌成原生 JSON，BQ 存成 `JSON_TYPE=array/object`。若用 `json.dumps` → BQ 存成 JSON 字串純量，下游 `[0]` 索引失效。
 - **`ALLOW_FIELD_ADDITION`**：支援 additive evolution，見 §5。
+
+### 3.2 跨表一致性：per-table load job + gate（無跨表交易）⭐
+
+多表抽取（orders + `quality_events`）帶出一個地端沒有的問題：**BQ 的 load job 只保證「單表」原子，跨表沒有交易**——無法像地端 Postgres 把兩張表的寫入包進同一個 commit。於是要防「orders 上去了、`quality_events` 沒上」導致 dbt 建在半套資料上。
+
+不靠原子落地，靠**兩層防線**：
+
+1. **各表獨立 watermark、失敗不推進**：每張表的 watermark 由自己的 staging 分區推導（方案 A，§2）。一張 load 失敗，它的 watermark 就沒前進，下輪 `event_at/received_at >= watermark` 自動把那批補抽（append-only + `>=` + dbt `stg_` 去重）。orders 成不成功，完全不影響 `quality_events` 的 watermark——這個獨立性正是自癒的來源。
+2. **`main()` 的 gate**：逐表盡力抽取（一張失敗不擋另一張各自推進），最後彙整——**任一張失敗即整體 `raise`（非零 exit）**，下游 dbt(T) 不得開跑。現在手動階段是「全成功才接著跑 dbt」；Phase 5 Airflow 則落成「dbt task 的上游依賴＝兩個 extract task 都 success」，同一條 gate 語意。
+
+**一致性模型是「最終一致」，非交易**：skew（一張到、一張沒到）只會造成**延遲**（某筆該回流的髒單晚一個 dbt run），不會造成髒資料——前提是下游 `int_*` 的 JOIN 寫成保守合成（事件缺席 → fall back 到 ODS 快照：乾淨照流、髒的續留 quarantine）。這也是維持「兩張獨立 load job」而非硬湊跨表原子的理由：獨立才好各自自癒、各自重試。
 
 ---
 
@@ -107,9 +136,11 @@ WHERE table_name = 'orders' AND partition_id NOT IN ('__NULL__', '__UNPARTITIONE
 
 > **不對稱**：ODS 有 Alembic 這個正式 migration 框架；staging **沒有對應框架**（dbt 從 `stg_` 才接手，不管 staging 本身）。實務上以 `ALLOW_FIELD_ADDITION` 補加欄、其餘交 dbt 作為替代。唯一「必須重建」的情況（改分區）在方案 A 下成本很低：`drop + recreate + 重抽`，watermark 自動歸零。
 
-### 5.4 治理：`FIELDS` 是 schema 的第三份宣告
+### 5.4 治理：每張表一份 `FIELDS`（schema 的第三份宣告）
 
-`extract_ods_to_bq.FIELDS` 是 ODS schema 繼 `schema.py`、`models.py` 之後的第三份手維護宣告，且漂移時最糟是「靜默漏抽資料」。以 `tests/test_schema_bq_consistency.py` 把它和 `models.py` 的一致性（欄位齊備、型別、可空性）變成會紅的測試——延伸 DQ 文件機制 1 的精神到抽取層。`FIELDS` 同時驅動 BQ schema、序列化、與這份測試（單一真相來源）。
+每張 staging 表的 `FIELDS` 是該表 schema 繼 `schema.py`、`models.py` 之後的第三份手維護宣告，且漂移時最糟是「靜默漏抽資料」。抽取腳本用一個 `TableSpec` 把每張表的抽取契約收成一份物件——`table` / `model` / `time_col` / `fields` / 分區 / 叢集 / 保險絲——目前有兩份：`ORDERS_SPEC`（鏡射 `ODS`）與 `QUALITY_EVENTS_SPEC`（鏡射 `QualityEvent`，見 §1.6）。
+
+每份 `fields` 同時驅動三處（單一真相來源）：BQ schema（`ensure_staging_table`）、列序列化（`_to_bq_dict`）、與一致性測試。`tests/test_schema_bq_consistency.py` 以 `SPECS` 逐表參數化，把「改了 `models.py` 卻忘了改 `fields`」變成會紅的測試（欄位齊備、型別、可空性四類）——延伸 DQ 文件機制 1 的精神到抽取層。**每加一張表只需在 `SPECS` 掛一份 spec，一致性守衛自動涵蓋**，不必另寫測試。
 
 ### 5.5 端到端範例：加欄 / 刪欄（含後續 NULL 處理）⭐
 

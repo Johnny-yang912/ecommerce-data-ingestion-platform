@@ -540,7 +540,7 @@ No new components required — structlog infrastructure already exists.
 
 ### Tier 2: Batch analytical metrics (daily / weekly)
 
-`quality_events` is extracted to BQ by Airflow alongside ODS. dbt builds `rpt_quality_*` models on top:
+`quality_events` is extracted to BQ by `extract_ods_to_bq.py` alongside ODS (E/L implemented; manually triggered for now, scheduled by Airflow in Phase 5). dbt then builds `rpt_quality_*` models on top:
 
 ```
 rpt_quality_daily

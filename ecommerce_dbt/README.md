@@ -169,6 +169,6 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 ## 8. Status & TODO
 
 - ✅ `stg_orders` (dedup + Hard Gate + freshness, incremental)
-- ⬜ `stg_quality_events` (requires adding `quality_events` to E/L extraction into BQ first)
+- ⬜ `stg_quality_events` (`quality_events` is now in E/L extraction to BQ; prerequisite cleared, this dbt model still pending)
 - ⬜ `int_orders` + Row Filter, `int_orders_quarantine`, scenario-specific `int_orders_*`
 - ⬜ `dim_/fct_`, `rpt_quality_*`

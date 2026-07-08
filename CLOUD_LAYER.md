@@ -56,6 +56,8 @@ Its table design **does not copy orders**, because the access pattern is the opp
 
 > **Cross-table consistency: see §3.2** — the two tables extract independently, with independent watermarks and independent load jobs; how "orders landed but `quality_events` didn't" is prevented is covered there.
 
+> **60-day expiration cap (sandbox limit)**: because this is a practice project with billing disabled, it runs on a BQ sandbox, which forces a 60-day partition + table expiration on the dataset that `quality_events` inherits; so the "latest across all history" assumption is in practice capped at 60 days on the sandbox — an account-level limit (setting `expiration=None` in the script is ignored by the sandbox), lifted only once billing is enabled.
+
 ---
 
 ## 2. Watermark Strategy

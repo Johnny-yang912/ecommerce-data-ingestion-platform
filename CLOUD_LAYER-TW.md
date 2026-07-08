@@ -56,6 +56,8 @@ BQ 每個 dataset 建立當下綁定 location 不可改；跨 location 查詢會
 
 > **跨表一致性見 §3.2**：兩張表獨立抽取、獨立 watermark、獨立 load job；「orders 上了但 `quality_events` 沒上」怎麼防，見〈跨表一致性〉。
 
+> **60 天過期上限（sandbox 限制）**：因本專案為練習用途、不啟用帳單，跑在 BQ sandbox，dataset 被強制套 60 天分區＋表過期，`quality_events` 也繼承此設定；故「跨全歷史取最新」的假設在 sandbox 下實際上限為 60 天——這是帳號層限制（腳本設 `expiration=None` 也會被 sandbox 忽略），啟用帳單後才解除。
+
 ---
 
 ## 2. Watermark 策略

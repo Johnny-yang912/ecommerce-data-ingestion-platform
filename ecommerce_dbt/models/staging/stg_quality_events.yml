@@ -1,0 +1,45 @@
+version: 2
+
+models:
+  - name: stg_quality_events
+    description: >
+      ODS.quality_events 的 Silver 入口：append-only 品質事件日誌，1:1 保留每個事件。
+      去重鍵＝id（事件 PK），非 raw_id——保留每筆記錄的完整狀態機歷史。
+      「按 raw_id 取最新狀態」的收斂在下游 int_，不在此層。
+    columns:
+      - name: id
+        description: 事件 PK；去重後應唯一——unique 測試即去重驗證。
+        tests:
+          - not_null
+          - unique
+      - name: raw_id
+        description: ODS 血緣鍵；一個 raw_id 有多個事件，故【不】測 unique。
+        tests:
+          - not_null
+      - name: order_id
+        description: 訂單鍵；同一訂單多事件，不測 unique。
+        tests:
+          - not_null
+      - name: event_type
+        description: 事件類型（狀態機邊）。severity=warn：promotion/rejection 路徑尚未實作，
+          不該讓預期外新值阻斷整個 run；Proposal B 落地後可收緊為 error。
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['initial_evaluation', 'promotion', 'rejection']
+              config:
+                severity: warn
+      - name: to_state
+        description: 事件後狀態。含 re_quarantined（狀態圖邊緣情況）以免未來誤紅。severity=warn 同上。
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['clean', 'quarantined', 'promoted', 'permanently_rejected', 're_quarantined']
+              config:
+                severity: warn
+      - name: event_at
+        description: 事件時間（staging 分區欄位）。
+        tests:
+          - not_null

@@ -19,3 +19,13 @@ sources:
             # 保險絲：freshness 底層是 SELECT MAX(received_at)，無過濾會被 400 擋下
             # （見 CLOUD_LAYER-TW §1.4）。用近窗過濾繞過，仍能反映最新載入時間。
             filter: received_at > timestamp_sub(current_timestamp(), interval 30 day)
+      - name: quality_events
+        description: ODS.quality_events 的 1:1 鏡射（append-only 品質事件日誌；分區 event_at(DAY)、require_partition_filter=False）。
+        config:
+          loaded_at_field: event_at
+          freshness:
+            warn_after: {count: 26, period: hour}
+            error_after: {count: 50, period: hour}
+            # quality_events 保險絲關閉，freshness 的 SELECT MAX(event_at) 不會被擋；
+            # 仍加近窗過濾與 orders 一致、並裁切掃描量。
+            filter: event_at > timestamp_sub(current_timestamp(), interval 30 day)

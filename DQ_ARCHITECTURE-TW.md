@@ -469,7 +469,7 @@ quality_events
 ├── order_id:     String
 ├── event_type:   String     "initial_evaluation" | "promotion" | "rejection"
 ├── from_state:   String?    null | "quarantined" | "promoted"
-├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected"
+├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected" | "re_quarantined"
 ├── rule_version: String     "v1" | "v2" | ...
 ├── event_at:     DateTime
 └── reason:       JSONB?     list[dict] {code, field, value, ...}，與 ODS.clean_error_message 相同格式

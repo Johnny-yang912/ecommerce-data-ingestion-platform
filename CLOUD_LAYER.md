@@ -181,9 +181,43 @@ Three direct corollaries:
 
 2. **Once staging empties, extraction silently degrades to "full ODS scan every run" — and reports success.** The watermark stays `None`, so every run is a full extract; the load job reports `output_rows = <all ODS rows>`, and **the E/L gate only checks whether the load job raised, with no post-load `SELECT COUNT(*)` verification** (§3.2). The result is a **lying green light**: "loaded N rows successfully" every run while the table stays empty. Guarding against this needs a post-load row-count check in the gate (not implemented today).
 
-3. **`dbt source freshness` goes red before anything else does.** With `error_after: 50 hours`, it is ERROR STALE roughly two days after ingestion stops — long before partitions start being reaped. It is not part of `dbt build` today (it's a separate command), so `build` can be fully green while freshness has been red for weeks — **and when Phase 5 wires it into the Airflow DAG as a pre-gate, that turns into a blocked DAG.** At that point either keep ingesting continuously, or downgrade it to warn.
+3. **`dbt source freshness` goes red before anything else does — and it does not measure what you think it measures.**
+
+   `loaded_at_field` points at `received_at`, which is **ODS ingestion time**; `ORDERS_FIELDS` contains **no extraction-time column at all** (the whole thing is a 1:1 mirror of ODS). So this check answers "how long ago did the newest order **enter ODS**", **not** "how long since the extraction job last ran."
+
+   The consequence is that two completely different failures look identical:
+
+   | Failure | Symptom |
+   |---|---|
+   | (a) Upstream stopped sending orders (business flow broke) | `max(received_at)` stops advancing → ERROR STALE |
+   | (b) The extraction job died (pipeline broke) | `max(received_at)` stops advancing → ERROR STALE |
+
+   **This also means: scheduling extraction in Airflow in Phase 5 will not turn it green.** What gets scheduled is the mover, not the producer — with no new orders in ODS there is no new `received_at`. The only way to keep it green is continuous ingestion (a batch at least every 26h). Telling (a) from (b) apart requires a second signal (e.g. an `_extracted_at` column added via §5.2's `ALLOW_FIELD_ADDITION`), which is post-Phase-5 work — extraction is manual today, so (b) cannot happen at all.
+
+   **NULL degrades gracefully; it is not a hard error**: the `filter: received_at > now - 30 days` window becomes empty 30 days after ingestion stops, so `max()` returns NULL. dbt guards against this (`_create_freshness_response` in `dbt/adapters/base/impl.py`: `if last_modified is None → datetime(1,1,1)`, commented "Interpret missing value as infinitely long ago"), and the `loaded_at_field` path shares that same code, so it **does not crash** — `max_loaded_at` just renders as `0001-01-01` and the result is still ERROR STALE.
 
 > Contrast with Proposal C in §7: there the problem is "corrected rows land in old partitions the watermark cannot see, so they must be pushed deliberately." Here it is one degree stronger — on the sandbox, **the old partition does not exist as a push target at all**. §7.1's conclusion ("pushing to the cloud is an explicit step") still holds, but on the sandbox its reachable range is compressed to 60 days.
+
+#### 1.7.7 This project's stance: a red freshness check is the expected state ⭐
+
+Ingestion in this project is **manual** (loaded through the API; `load_test.py` is a load-testing tool only), not a continuous stream. So between two loads, `dbt source freshness` is **necessarily ERROR STALE** — measured on 2026-08-03 it was 625 hours stale, 12.5× over the `error_after: 50h` threshold.
+
+**This is an accepted state, not a defect awaiting a fix**, for two reasons:
+
+1. **The threshold describes the SLA of the *simulated system*, not the habits of the *simulator*.** 26h/50h is a reasonable SLA for a real e-commerce system taking continuous orders; loosening it to 30 days would only make this configuration lie about how quickly the system is supposed to be fed. **Better a signal that is honestly red than a threshold slackened to look good.**
+2. **It blocks nothing.** `dbt build` does not include freshness (`build` = run + test + snapshot + seed; freshness is a separate command), and the watermark reads partitions rather than freshness results — so the "load data → extract → `dbt build`" path is entirely unaffected.
+
+⚠️ **But point 2 is a precondition, not a guarantee.** This stance holds precisely because freshness is **not wired as a blocking gate**. Therefore:
+
+| Rule | Why |
+|---|---|
+| **Phase 5's Airflow DAG must not place `dbt source freshness` ahead of extraction / `dbt build` as a pre-check** | The very same red instantly turns from "an acceptable alert" into "a permanently blocked DAG" — while all it reflects is "you haven't hand-loaded data for a few days" |
+| If it goes into the DAG at all, it must be a **side-channel observability task** (its failure must not affect downstream), or have its `severity` lowered first | Keeps the signal visible without granting it blocking authority |
+| If ingestion ever becomes **continuous** (e.g. a seeding task at the head of the DAG posting a small batch of orders periodically), this stance lapses and freshness should be restored as a meaningful gate | Only then does red genuinely mean "broken" rather than "unfed" |
+
+> This is isomorphic to how the DQ architecture treats `has_schema_drift`: **a signal's value is not the same as the authority it should hold.** Drift may alert but never intercept; under the "manual ingestion" premise, freshness likewise may only alert. Authority comes from "is it actually broken when it goes red", not from "is this metric important."
+
+Aside: continuous ingestion is simultaneously the fix for §1.7.6's "rolling 60-day ingestion window" problem — the two share **the same root cause** (no continuous ingestion), so a future decision to add seeding resolves both at once.
 
 ---
 

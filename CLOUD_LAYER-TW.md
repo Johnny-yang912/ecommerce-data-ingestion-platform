@@ -181,9 +181,43 @@ ODS 在 PostgreSQL 仍是永久且完整的錨點（`raw`/`ods`/`quality_events`
 
 2. **staging 清空後，抽取會靜默降級成「每次全掃 ODS」，而且回報成功**。watermark 恆為 `None` → 每輪都是全量；load job 回報 `output_rows = <ODS 全部列數>`，而 **E/L gate 只檢查 load job 有沒有拋例外，沒有事後 `SELECT COUNT(*)` 驗證**（§3.2）——於是會出現「每次跑批都成功載入 N 筆、表卻永遠是空的」這種**綠燈說謊**的狀態。要防它，gate 需補一個載入後的實際列數檢查（目前未實作）。
 
-3. **`dbt source freshness` 會先於一切變紅**。`error_after: 50 hours`，所以停止攝入約兩天後它就是 ERROR STALE，遠早於分區開始被回收。目前它不在 `dbt build` 的範圍內（是獨立指令），所以 build 全綠而 freshness 早已紅——**Phase 5 用 Airflow 把它接成 DAG 前置 gate 時，這件事會變成 DAG 卡住**。屆時要嘛確保持續攝入、要嘛把它降級為 warn。
+3. **`dbt source freshness` 會先於一切變紅，而且它量的不是你以為的東西。**
+
+   `loaded_at_field` 指向 `received_at`，那是 **ODS 的攝入時間**；`ORDERS_FIELDS` 裡**沒有任何抽取時間欄位**（整份是 ODS 的 1:1 鏡射）。所以這支檢查回答的是「最新一筆訂單多久以前**進到 ODS**」，**不是**「抽取工作多久沒跑」。
+
+   後果是兩種完全不同的失敗長得一模一樣：
+
+   | 失敗 | 症狀 |
+   |---|---|
+   | (a) 上游停止送訂單（業務流斷了）| `max(received_at)` 不前進 → ERROR STALE |
+   | (b) 抽取工作掛掉（管線斷了）| `max(received_at)` 不前進 → ERROR STALE |
+
+   **這也意味著：Phase 5 把抽取排進 Airflow 並不會讓它變綠。** 排程的是搬運工不是產生器——ODS 沒有新訂單，就沒有新的 `received_at`。要它綠只有持續攝入一途（≤26h 一批）。想分辨 (a)/(b) 則需要另一個訊號（例如加一個 `_extracted_at` 欄位，走 §5.2 的 `ALLOW_FIELD_ADDITION`），屬 Phase 5 之後的事——目前抽取是手動的，(b) 根本不存在。
+
+   **NULL 時優雅降級，不是硬錯誤**：`filter: received_at > now - 30 天` 這個窗在停止攝入 30 天後會變空，`max()` 回 NULL。dbt 對此有守衛（`dbt/adapters/base/impl.py` 的 `_create_freshness_response`：`if last_modified is None → datetime(1,1,1)`，註解為 "Interpret missing value as infinitely long ago"），`loaded_at_field` 路徑共用同一段，**不會 crash**，只是 `max_loaded_at` 顯示成 `0001-01-01`、結果仍是 ERROR STALE。
 
 > 對比 §7 的 Proposal C：那裡談的是「修正列落在舊分區、watermark 看不到，所以要主動推」。這裡更強一階——在 sandbox 上，**舊分區根本不存在可推的目標**。§7.1「上雲是主動步驟」的結論不變，但 sandbox 下它的可行範圍被壓縮到 60 天內。
+
+#### 1.7.7 本專案的立場：freshness 紅是預期狀態 ⭐
+
+本專案的攝入是**手動的**（用 API 灌，`load_test.py` 只作壓測），不是持續流量。所以在兩次灌資料之間，`dbt source freshness` **必然是 ERROR STALE**——實測 2026-08-03 時已 stale 625 小時，對 `error_after: 50h` 超標 12.5 倍。
+
+**這是接受的狀態，不是待修的缺陷**，理由有二：
+
+1. **閾值描述的是被模擬系統的服務等級，不是模擬者的操作習慣。** 26h/50h 對一個真實持續收單的電商是合理的 SLA；把它放寬到 30 天只會讓這份設定對「這個系統該多快被餵」說謊。**寧可讓訊號誠實地紅，也不要為了好看而調鬆閾值。**
+2. **它不阻礙任何運作。** `dbt build` 不含 freshness（`build` = run + test + snapshot + seed，freshness 是獨立指令），watermark 讀的是分區而非 freshness 結果，所以「灌資料 → 抽取 → `dbt build`」這條路徑完全不受影響。
+
+⚠️ **但第 2 點是一個前提，不是一個保證。** 這個立場能成立，完全因為 freshness **沒有被接成阻斷式 gate**。所以：
+
+| 規則 | 為什麼 |
+|---|---|
+| **Phase 5 的 Airflow DAG 不得把 `dbt source freshness` 放在抽取／`dbt build` 之前當前置檢查** | 同一個紅會立刻從「可接受的告警」變成「DAG 永久卡死」，而它反映的只是「你這幾天沒手動灌資料」 |
+| 要納入 DAG 的話，只能是**旁路的觀測 task**（失敗不影響下游），或先降 `severity` | 保留訊號可見性，但不給它阻斷權限 |
+| 若日後改成**持續攝入**（例如 DAG 前面加 seeding task 定期打一小批訂單進 API），本立場即失效，freshness 應恢復為有意義的 gate | 那時紅才真的代表「壞了」而非「沒餵」 |
+
+> 這與 DQ 架構對 `has_schema_drift` 的處理同構：**訊號的價值不等於它該有的權限**。drift 只能告警不能攔截；freshness 在「手動攝入」這個前提下同樣只能告警。權限來自「紅的時候是不是真的壞了」，而不是來自「這個指標重不重要」。
+
+附帶：持續攝入同時也是 §1.7.6 那個「滾動 60 天攝入視窗」問題的解方——兩者**根因相同**（沒有持續攝入），所以未來若決定加 seeding，一次解決兩件事。
 
 ---
 

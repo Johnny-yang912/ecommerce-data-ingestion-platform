@@ -41,17 +41,21 @@ POST /orders
     ├── first-write-wins idempotency check
     └── [ODS] + [quality_events]  ← 不可變錨點，含品質標記與事件日誌
 
-【Phase 4–5 目標】
-
-[ODS] → Airflow 增量抽取 → BigQuery staging
+[ODS] → 增量抽取（現手動，Phase 5 交 Airflow）→ BigQuery staging
     ↓
 dbt stg_*   Hard Gate tests                 ← Silver 入口，仍含全部資料
     ↓
-dbt int_*   Row Filter + 場景專用模型        ← Gold 入口，攔截在這裡
-    ├── has_clean_error = FALSE → int_orders → dim_*/fct_*
-    ├── has_clean_error = TRUE  → int_orders_quarantine
-    └── 場景專用 int_orders_*  → 特定場景 dim_*/fct_*
+dbt int_*   Row Filter                      ← Gold 入口，攔截在這裡
+    ├── 有效品質狀態＝乾淨 → int_orders → int_order_items
+    └── 有效品質狀態≠乾淨 → int_orders_quarantine
+        （有效狀態＝ODS 快照 ⊕ quality_events 最新事件，非 has_clean_error 字面值）
+
+【Phase 4–5 目標】
+
+dbt int_*   場景專用 int_orders_*            ← 設計已備妥，待真實場景才啟用
                                   （接受場景無關的欄位錯誤，補值後流入）
+    ↓
+dbt dim_*/fct_*/rpt_*
     ↓
 Looker Studio（接 BigQuery dim_*/fct_*/rpt_*）
 ```
@@ -426,7 +430,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 |---|---|
 | [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、場景補值策略、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
 | [雲端層架構](./CLOUD_LAYER-TW.md) | ODS → BigQuery 抽取與 staging：分區/叢集/保險絲設計、watermark 策略（方案 A 與 `get_watermark()` 接縫）、批次載入與 JSON 落地決策、ODS schema 演進策略（staging 只做加法 + dbt 吸收 + `FIELDS` 一致性測試）|
-| [轉換層（dbt）](./ecommerce_dbt/README.zh-TW.md) | dbt 轉換層的操作與實作決策：分層與命名慣例、物化策略（table vs view、incremental + insert_overwrite + `copy_partitions` 繞過 sandbox 禁 DML）、回看窗、去重鍵與不變式、Hard Gate 自訂 generic test、freshness 繞保險絲。層契約見 DQ_ARCHITECTURE、staging 基建見 CLOUD_LAYER |
+| [轉換層（dbt）](./ecommerce_dbt/README.zh-TW.md) | dbt 轉換層的操作與實作決策：分層與命名慣例、物化策略（table vs view、incremental + insert_overwrite + `copy_partitions` 繞過 sandbox 禁 DML）、回看窗、去重鍵與不變式、Hard Gate 自訂 generic test、freshness 繞保險絲；`int_` 層的有效品質狀態合成（刻意複製 + 對齊清單）、全量重建的必要性、劃分不變式測試、`int_order_items` 的 `safe_cast` 與嚴格 NULL 傳播。層契約見 DQ_ARCHITECTURE、staging 基建見 CLOUD_LAYER |
 
 ---
 
@@ -553,8 +557,9 @@ Looker Studio（直連 BigQuery）
 
 **Phase 4 — 分析層 Pipeline**
 - [v] ODS → BigQuery 抽取腳本（`extract_ods_to_bq.py`）— 以 `received_at` 為 watermark 做增量抽取（方案 A，由 `INFORMATION_SCHEMA.PARTITIONS` 推導，封裝在 `get_watermark()` 作為未來微批方案 B 的接縫）；staging 表分區（`received_at` DAY）+ 叢集（`order_id`、`has_clean_error`）+ `require_partition_filter` 保險絲；只走 batch load（不串流）、JSON 欄位以原生物件落地、`ALLOW_FIELD_ADDITION` 支援 additive schema 演進；`FIELDS` 單一真相來源由 `tests/test_schema_bq_consistency.py` 把關（見 [CLOUD_LAYER-TW.md](./CLOUD_LAYER-TW.md)）
-- [v] dbt Core `stg_` 層（`stg_orders`：`raw_id` 去重 + Hard Gate + source freshness；incremental + `insert_overwrite` + `copy_partitions`）— 見 [ecommerce_dbt/README.zh-TW.md](./ecommerce_dbt/README.zh-TW.md)
-- [ ] dbt Core：int_* → dim_*/fct_* → rpt_*；含 DQ BQ 層（Row Filter、`int_orders_quarantine`、場景專用 `int_orders_*` 模型、`rpt_quality_*`）（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）
+- [v] dbt Core `stg_` 層（`stg_orders`：`raw_id` 去重 + Hard Gate + source freshness；`stg_quality_events`：以 `id` 為 grain 去重、保留完整狀態機歷史；incremental + `insert_overwrite` + `copy_partitions`）— 見 [ecommerce_dbt/README.zh-TW.md](./ecommerce_dbt/README.zh-TW.md)
+- [v] dbt Core `int_` 層（Gold 入口，攔截發生於此）：`int_orders`（Row Filter，判定基準為「ODS 快照 ⊕ `quality_events` 最新事件」合成的**有效品質狀態**，非 `has_clean_error` 字面值）、`int_orders_quarantine`（含 `error_codes` 攤平、`quarantined_at` 取事件時間）、`int_order_items`（items 攤平到 item 粒度）。**劃分不變式**（兩表對 `stg_orders` 互斥 + 窮盡）由 singular test 把關；物化刻意採 `table` 全量重建而非 `received_at` 增量——Proposal B 的 promotion 事件落當天分區、受影響訂單卻在舊分區，增量會靜默切斷回流路徑
+- [ ] dbt Core：dim_*/fct_* → rpt_*；含 `rpt_quality_*`（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）。場景專用 `int_orders_*` 模型設計已備妥，待真實分析場景出現才啟用
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — 自動化 + Queue 升級**

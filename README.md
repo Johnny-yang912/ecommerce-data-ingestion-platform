@@ -41,17 +41,21 @@ POST /orders
     ├── first-write-wins idempotency check
     └── [ODS] + [quality_events]  ← immutable anchor, with quality flag and event log
 
-[Phase 4–5 target]
-
-[ODS] → Airflow incremental extraction → BigQuery staging
+[ODS] → incremental extraction (manual today, Airflow in Phase 5) → BigQuery staging
     ↓
 dbt stg_*   Hard Gate tests                 ← Silver entry, all records retained
     ↓
-dbt int_*   Row Filter + scenario models    ← Gold entry, blocking happens here
-    ├── has_clean_error = FALSE → int_orders → dim_*/fct_*
-    ├── has_clean_error = TRUE  → int_orders_quarantine
-    └── scenario-specific int_orders_* → scenario dim_*/fct_*
+dbt int_*   Row Filter                      ← Gold entry, blocking happens here
+    ├── effective quality state = clean  → int_orders → int_order_items
+    └── effective quality state ≠ clean  → int_orders_quarantine
+        (effective state = ODS snapshot ⊕ latest quality_events event, not literal has_clean_error)
+
+[Phase 4–5 target]
+
+dbt int_*   scenario-specific int_orders_*  ← designed; enabled only when a real scenario appears
                                            (accepts errors irrelevant to the scenario, with imputation)
+    ↓
+dbt dim_*/fct_*/rpt_*
     ↓
 Looker Studio (connected to BigQuery dim_*/fct_*/rpt_*)
 ```
@@ -426,7 +430,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 |---|---|
 | [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), scenario repair strategy, quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
 | [Cloud Layer Architecture](./CLOUD_LAYER.md) | ODS → BigQuery extraction and staging: partition/clustering/fuse design, watermark strategy (Approach A + the `get_watermark()` seam), batch-load and JSON landing decisions, and the ODS schema evolution strategy (additive staging + dbt absorption + `FIELDS` consistency test) |
-| [Transformation Layer (dbt)](./ecommerce_dbt/README.md) | dbt transformation ops & implementation decisions: layering/naming conventions, materialization (table vs view, incremental + insert_overwrite + `copy_partitions` to bypass the sandbox DML ban), lookback window, dedup key & invariant, Hard Gate custom generic test, freshness fuse bypass. Layer contracts in DQ_ARCHITECTURE, staging infra in CLOUD_LAYER |
+| [Transformation Layer (dbt)](./ecommerce_dbt/README.md) | dbt transformation ops & implementation decisions: layering/naming conventions, materialization (table vs view, incremental + insert_overwrite + `copy_partitions` to bypass the sandbox DML ban), lookback window, dedup key & invariant, Hard Gate custom generic test, freshness fuse bypass; the `int_` layer's effective-quality-state composition (deliberate duplication + alignment checklist), why full rebuilds are required, the partition invariant test, and `int_order_items`'s `safe_cast` + strict NULL propagation. Layer contracts in DQ_ARCHITECTURE, staging infra in CLOUD_LAYER |
 
 ---
 
@@ -553,8 +557,9 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 
 **Phase 4 — Analytics Pipeline**
 - [v] ODS → BigQuery extraction script (`extract_ods_to_bq.py`) — incremental by `received_at` watermark (Approach A, derived from `INFORMATION_SCHEMA.PARTITIONS`, wrapped in `get_watermark()` as the seam for a future micro-batch Approach B); partitioned (`received_at` DAY) + clustered (`order_id`, `has_clean_error`) staging table with `require_partition_filter` fuse; batch load only (no streaming), JSON columns landed as native objects, `ALLOW_FIELD_ADDITION` for additive schema evolution; `FIELDS` single source of truth guarded by `tests/test_schema_bq_consistency.py` (see [CLOUD_LAYER.md](./CLOUD_LAYER.md))
-- [v] dbt Core `stg_` layer (`stg_orders`: `raw_id` dedup + Hard Gate + source freshness; incremental + `insert_overwrite` + `copy_partitions`) — see [ecommerce_dbt/README.md](./ecommerce_dbt/README.md)
-- [ ] dbt Core: int_* → dim_*/fct_* → rpt_*; includes DQ BQ layer (Row Filter, `int_orders_quarantine`, scenario-specific `int_orders_*` models, `rpt_quality_*`) (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md))
+- [v] dbt Core `stg_` layer (`stg_orders`: `raw_id` dedup + Hard Gate + source freshness; `stg_quality_events`: deduped at `id` grain, full state-machine history preserved; incremental + `insert_overwrite` + `copy_partitions`) — see [ecommerce_dbt/README.md](./ecommerce_dbt/README.md)
+- [v] dbt Core `int_` layer (Gold entry, where blocking happens): `int_orders` (Row Filter keyed on the **effective quality state** composed from "ODS snapshot ⊕ latest `quality_events` event", not literal `has_clean_error`), `int_orders_quarantine` (with flattened `error_codes` and `quarantined_at` taken from the event time), `int_order_items` (items flattened to item grain). The **partition invariant** (the two tables are mutually exclusive and exhaustive over `stg_orders`) is guarded by a singular test; materialization is deliberately a `table` full rebuild rather than `received_at` incremental — a Proposal B promotion event lands in today's partition while the order it rescues sits in an old one, so incremental would silently sever the flow-back path
+- [ ] dbt Core: dim_*/fct_* → rpt_*; includes `rpt_quality_*` (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md)). Scenario-specific `int_orders_*` models are designed but enabled only when a real analytical scenario appears
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — Automation + Queue Upgrade**

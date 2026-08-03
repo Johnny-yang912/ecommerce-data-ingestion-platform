@@ -269,4 +269,5 @@ corrections 若另成一張 BQ 表：需要自己的 `FIELDS` 宣告、抽取邏
 ## 8. 待辦與未來
 
 - 微批升級時：`get_watermark()` 換方案 B（+ `advance_watermark()`）。
-- 進 dbt 分層（`stg_` 起）：已起，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md)。
+- 進 dbt 分層：`stg_`（`stg_orders`、`stg_quality_events`）與 `int_`（`int_orders`、`int_orders_quarantine`、`int_order_items`）已落地，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md)。§5.5.5「正典欄永不覆寫、填值往 DAG 邊緣推」的鐵律已在 `int_order_items` 落實為衍生金額的**嚴格 NULL 傳播**（不 `coalesce`）。
+- `dim_/fct_` 若採 `order_date` 分區，需先做合法區間守衛——離譜的未來日期會超出 BQ 分區可接受範圍、讓整張表建立失敗（`int_` 層即因此刻意不分區）。

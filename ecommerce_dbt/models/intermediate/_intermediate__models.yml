@@ -1,0 +1,126 @@
+version: 2
+
+models:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # int_orders / int_orders_quarantine 是 stg_orders 的「完整劃分」（互斥 + 窮盡）。
+  # 兩模型各自持有一份逐字相同的共用區塊（刻意的複製，見 README.zh-TW §5.1），
+  # 互補性的自動化保證在 tests/assert_orders_split_is_partition.sql。
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - name: int_orders
+    description: >
+      Gold 入口：通過 Row Filter 的乾淨資料流。判定基準為「有效品質狀態」
+      （ODS 攝入快照 ⊕ quality_events 最新事件），非 has_clean_error 的字面快照——
+      被 Proposal B promote 的記錄在 ODS 仍是 has_clean_error=TRUE，靠事件才流得回 Gold。
+      物化為 table 全量重建（非 received_at 增量），否則 promotion 落在當天分區、
+      受影響訂單卻在舊分區，回流機制會在此層被切斷。見模型檔頭與 DQ_ARCHITECTURE-TW 機制二。
+    columns:
+      - name: raw_id
+        description: 物理身分（ODS 1:1 血緣鍵）；劃分後應唯一。
+        tests:
+          - not_null
+          - unique
+      - name: order_id
+        description: 業務身分（訂單自然鍵）。
+        tests:
+          - not_null
+          - unique
+      - name: received_at
+        description: 攝入時間（承自 ODS）。
+        tests:
+          - not_null
+      - name: has_clean_error
+        description: >
+          ODS 攝入當下的品質快照。此表允許為 TRUE——但僅限已被 promote 的記錄，
+          由 tests/assert_int_orders_no_unpromoted_dirty.sql 把關。
+        tests:
+          - not_null
+      - name: effective_quality_state
+        description: >
+          有效品質狀態。clean＝攝入當下即乾淨；promoted＝被新版規則重評估救回
+          （ODS 快照仍為髒，兩者的永久分歧是有意設計，靠 dq_rule_version + quality_events 追溯）。
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['clean', 'promoted']
+      - name: quality_state_latest
+        description: quality_events 最新事件的 to_state；無事件時為 NULL（保守合成，退回 ODS 快照）。
+      - name: quality_state_rule_version
+        description: 最新品質事件所用的規則版本（與 ODS 的 dq_rule_version 可能不同，即版本演進的分歧）。
+      - name: quality_state_at
+        description: 最新品質事件的發生時間。
+
+  - name: int_orders_quarantine
+    description: >
+      被 Row Filter 隔離的資料（有效品質狀態非乾淨）。這些記錄已在 ODS，只是不流入
+      dim_/fct_；其問題是規則評估而非 pipeline 失敗，remediation 走 Proposal B 重評估，
+      不是 force=true（對 status=processed 回 400）。見 DQ_ARCHITECTURE-TW Q2。
+    columns:
+      - name: raw_id
+        tests:
+          - not_null
+          - unique
+      - name: order_id
+        tests:
+          - not_null
+          - unique
+      - name: effective_quality_state
+        description: quarantined＝仍被隔離；permanently_rejected＝人工放棄。
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['quarantined', 'permanently_rejected']
+      - name: error_codes
+        description: >
+          clean_error_message 攤平出的穩定 code 清單（ARRAY<STRING>），供 RCA 與
+          rpt_quality_field_breakdown 直接聚合，免得每個消費者各自 UNNEST 一次 JSON。
+      - name: quarantined_at
+        description: >
+          真正的隔離時刻＝quality_events 的 event_at（initial_evaluation），事件缺席時
+          退回 received_at。刻意不用 CURRENT_TIMESTAMP()——全量重建下它每次跑批都會變，
+          記的是「這次 run 的時間」而非隔離時刻，會讓 rpt_quality_* 的時間軸失真。
+        tests:
+          - not_null
+
+  - name: int_order_items
+    description: >
+      ODS.items（JSON 陣列）攤平到 item 粒度，供未來的 fct_order_items。
+      來源為 int_orders（已過濾）——item 層錯誤在攝入層就會讓整張訂單被隔離，
+      故從此出發天然保證 Gold 不含髒資料。數值一律 safe_cast（items 未經 Pydantic 強轉）；
+      衍生金額採嚴格 NULL 傳播、不 coalesce（填值決定留給 dim_/fct_，CLOUD_LAYER-TW §5.5.5）。
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['raw_id', 'item_index']
+    columns:
+      - name: order_item_key
+        description: 代理鍵 raw_id-item_index（item 粒度唯一）。
+        tests:
+          - not_null
+          - unique
+      - name: raw_id
+        description: 所屬訂單的物理身分；必須能在 int_orders 解析到。
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('int_orders')
+                field: raw_id
+      - name: order_id
+        tests:
+          - not_null
+      - name: item_index
+        description: items 陣列中的位置（ODS 內為不可變快照，順序固定）。
+        tests:
+          - not_null
+      - name: quantity
+        description: 數量；safe_cast 失敗（上游送了不可轉字串）時為 NULL。
+      - name: discount_pct
+        description: 折扣百分比，業務值域 0~100。NULL 代表「無折扣資料」，刻意不補 0。
+      - name: net_amount
+        description: >
+          quantity × unit_price × (1 - discount_pct/100)。嚴格 NULL 傳播：
+          任一輸入為 NULL 則結果 NULL。若日後確認「缺值＝無折扣」，補值加在 dim_/fct_，
+          不回頭改本層（NULL→0 是有損且不可逆的決定）。

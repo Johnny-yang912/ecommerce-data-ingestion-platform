@@ -269,4 +269,5 @@ Corrected values land in old partitions; a `received_at`-incremental `stg_` run 
 ## 8. Open Items and Future
 
 - On micro-batch upgrade: swap `get_watermark()` to Approach B (+ `advance_watermark()`).
-- Move into dbt layering (starting at `stg_`): started, see [ecommerce_dbt/README](./ecommerce_dbt/README.md).
+- dbt layering: `stg_` (`stg_orders`, `stg_quality_events`) and `int_` (`int_orders`, `int_orders_quarantine`, `int_order_items`) are in place — see [ecommerce_dbt/README](./ecommerce_dbt/README.md). §5.5.5's hard rule ("never overwrite canonical columns; push imputation to the DAG edge") is realized in `int_order_items` as **strict NULL propagation** for derived amounts (no `coalesce`).
+- If `dim_/fct_` adopt `order_date` partitioning, add a legal-range guard first — absurd future dates fall outside BigQuery's acceptable partition range and fail the whole table build (this is exactly why the `int_` layer deliberately isn't partitioned).

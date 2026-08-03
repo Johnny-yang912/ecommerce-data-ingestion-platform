@@ -190,49 +190,59 @@ models:
 
 在 `dbt int_*` 的 SQL 中過濾，逐筆隔離。Row Filter 的判定基準**不是 ODS 的 `has_clean_error` 快照，而是「有效品質狀態」**——即 ODS 攝入當下判定，疊加 `quality_events` 後續演進（Proposal B promote）的合成結果。
 
+兩個模型共用同一段合成邏輯，收斂成單一布林 `is_effectively_clean`，一邊取它、一邊取其否定：
+
 ```sql
--- int_orders.sql（乾淨資料流，含 Proposal B 重評估回流）
-WITH latest_quality_state AS (
+-- 共用區塊（在 int_orders.sql 與 int_orders_quarantine.sql 中逐字相同）
+WITH latest_event AS (
     -- 每筆 raw_id 只取最新一筆品質事件（append-only，故以 event_at 排序取首列）
+    -- 決勝鍵加 id DESC：同一時戳有多事件時保證確定性
+    SELECT raw_id, to_state, rule_version, event_at
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY raw_id ORDER BY event_at DESC, id DESC
+        ) AS _rn
+        FROM {{ ref('stg_quality_events') }}
+    )
+    WHERE _rn = 1
+),
+resolved AS (
     SELECT
-        raw_id,
-        to_state,
-        ROW_NUMBER() OVER (
-            PARTITION BY raw_id ORDER BY event_at DESC
-        ) AS rn
-    FROM {{ ref('stg_quality_events') }}
+        s.*,
+        e.to_state AS quality_state_latest,
+        e.event_at AS quality_state_at,
+        -- ⚠️ COALESCE 不可省：has_clean_error=TRUE 且無事件時，
+        --    FALSE OR NULL = NULL，`WHERE NOT NULL` 也是 NULL
+        --    → 該列會從「兩張」表同時消失（靜默漏資料）
+        COALESCE(
+            s.has_clean_error = FALSE     -- 攝入當下即乾淨
+            OR e.to_state = 'promoted',   -- 或被 Proposal B 重評估提升
+            FALSE
+        ) AS is_effectively_clean
+    FROM {{ ref('stg_orders') }} s
+    LEFT JOIN latest_event e ON s.raw_id = e.raw_id   -- ⚠️ 必須 LEFT
 )
-SELECT s.*
-FROM {{ ref('stg_orders') }} s
-LEFT JOIN latest_quality_state q
-    ON s.raw_id = q.raw_id AND q.rn = 1
-WHERE
-    s.has_clean_error = FALSE      -- 攝入當下即乾淨
-    OR q.to_state = 'promoted'     -- 或被 Proposal B 重評估提升（最新狀態為 promoted）
+
+-- int_orders.sql（乾淨資料流，含 Proposal B 回流）
+SELECT * EXCEPT (is_effectively_clean) FROM resolved WHERE is_effectively_clean
 
 -- int_orders_quarantine.sql（仍被隔離的資料 = 有效狀態非乾淨）
-WITH latest_quality_state AS (
-    SELECT
-        raw_id,
-        to_state,
-        ROW_NUMBER() OVER (
-            PARTITION BY raw_id ORDER BY event_at DESC
-        ) AS rn
-    FROM {{ ref('stg_quality_events') }}
-)
+-- quarantined_at 取事件時間而非 CURRENT_TIMESTAMP()：模型是全量重建，
+-- CURRENT_TIMESTAMP 每次跑批都變，記的是「這次 run 的時間」而非隔離時刻
 SELECT
-    s.*,
-    CURRENT_TIMESTAMP() AS quarantined_at
-FROM {{ ref('stg_orders') }} s
-LEFT JOIN latest_quality_state q
-    ON s.raw_id = q.raw_id AND q.rn = 1
-WHERE
-    s.has_clean_error = TRUE
-    AND (q.to_state IS NULL OR q.to_state != 'promoted')  -- 從未 promote，或 promote 後又 re_quarantined
+    * EXCEPT (is_effectively_clean),
+    COALESCE(quality_state_at, received_at) AS quarantined_at
+FROM resolved WHERE NOT is_effectively_clean
 ```
 
+**劃分不變式**：兩模型是 `stg_orders` 的完整劃分（互斥 + 窮盡），每個 `raw_id` 恰好出現一次。此不變式由 `tests/assert_orders_split_is_partition.sql` 把關——它守的正是上方兩個 ⚠️（漏 COALESCE → 列從兩表同時消失；誤用 INNER JOIN → 無事件的列整批消失）。共用區塊採「刻意複製」而非抽共用模型，理由與對齊清單見 [ecommerce_dbt/README.zh-TW §5.1–5.3](./ecommerce_dbt/README.zh-TW.md)。
+
+`re_quarantined` 邊緣情況自動被涵蓋：只要最新事件不是 `promoted`，`is_effectively_clean` 即為 FALSE，記錄留在 quarantine，無需額外條件。
+
 **為什麼 Row Filter 不能只讀 `has_clean_error`？**
-ODS 是不可變錨點，`has_clean_error` 永遠停在**攝入當下**（`dq_rule_version` 那一版）的判定，被 Proposal B promote 的記錄**在 ODS 裡仍是 `has_clean_error=TRUE`**。若 Row Filter 照字面只寫 `WHERE has_clean_error = FALSE`，promoted 記錄會永遠卡在 quarantine、流不回 Gold。因此「有效品質狀態」必須由 `int_*` 在每次 dbt run 時，把 ODS 快照與 `quality_events` 最新事件**合成**出來——`has_clean_error` 是 `initial_evaluation` 那一筆的快照，`quality_events` 最新 `to_state` 才是當前真實。這也是「重評估不改 ODS、只 append `quality_events`」（見〈Bounded Writeback 原則〉）能讓資料回流的銜接點。`re_quarantined` 邊緣情況自動被涵蓋：只要最新事件不是 `promoted`，記錄就留在 quarantine，無需額外條件。
+ODS 是不可變錨點，`has_clean_error` 永遠停在**攝入當下**（`dq_rule_version` 那一版）的判定，被 Proposal B promote 的記錄**在 ODS 裡仍是 `has_clean_error=TRUE`**。若 Row Filter 照字面只寫 `WHERE has_clean_error = FALSE`，promoted 記錄會永遠卡在 quarantine、流不回 Gold。因此「有效品質狀態」必須由 `int_*` 在每次 dbt run 時，把 ODS 快照與 `quality_events` 最新事件**合成**出來——`has_clean_error` 是 `initial_evaluation` 那一筆的快照，`quality_events` 最新 `to_state` 才是當前真實。這也是「重評估不改 ODS、只 append `quality_events`」（見〈Bounded Writeback 原則〉）能讓資料回流的銜接點。
+
+**這個「事件在新分區、資料在舊分區」的錯位，也決定了 `int_*` 的物化策略**：promotion 事件 `event_at = now()` 落當天分區，但它救的訂單 `received_at` 在很久以前。若 `int_orders` 比照 `stg_orders` 按 `received_at` 回看窗做增量，那個舊分區永遠不會被重算，回流機制會在 `int_` 這一層被靜默切斷。故 `int_*` 一律全量重建（見 [ecommerce_dbt/README.zh-TW §5.4](./ecommerce_dbt/README.zh-TW.md)）。
 
 ### 機制三：場景專用分析模型（int_* 層）
 
@@ -261,6 +271,10 @@ WHERE
 ```
 
 **審計軌跡**：補值邏輯與轉換邏輯共存於 SQL 檔案，dbt model description 記錄該場景接受哪些錯誤及原因。SQL 本身即審計軌跡，進 version control。
+
+> **實作狀態：設計已備妥，刻意暫不實作**。場景補值的本質是「回答某個具體分析問題」——沒有那個問題就沒有正確答案可寫，先建等於憑空造一個假需求並付永久維護成本。啟用時機＝出現真實分析場景、且該場景明確能接受某類與它無關的錯誤。
+>
+> 實作時的兩個注意事項：① 判斷「只含無關 code」**不可用 `ARRAY_LENGTH(codes) = 1`**，因同一個 code 可能重複出現（如多個 item 各觸發一次 `non_finite_number`），數量比對會誤判；正確寫法是「不存在任何 allowed 以外的 code」。② 場景模型會成為「有效品質狀態」邏輯的**第三個消費者**，屆時應把目前刻意複製於 `int_orders` / `int_orders_quarantine` 的共用區塊收斂成共用模型（見 [ecommerce_dbt/README.zh-TW §5.3](./ecommerce_dbt/README.zh-TW.md)）。
 
 ---
 
@@ -607,12 +621,14 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 
 | 元件 | 所在層 | 狀態 |
 |---|---|---|
-| dbt `stg_*` Hard Gate tests | BQ Analytics | ⬜ Phase 4 |
-| `stg_quality_events` dbt model（供 `int_*` JOIN 取最新品質狀態） | BQ Analytics | ⬜ Phase 4 |
-| `int_orders` Row Filter（JOIN `quality_events` 最新狀態：`has_clean_error=FALSE OR to_state='promoted'`） | BQ Analytics | ⬜ Phase 4 |
-| `int_orders_quarantine` dbt model | BQ Analytics | ⬜ Phase 4 |
-| 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ Phase 4 |
-| Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 4 |
+| dbt `stg_*` Hard Gate tests | BQ Analytics | ✅ 已完成（自訂 generic test `error_rate_below`）|
+| `stg_quality_events` dbt model（供 `int_*` JOIN 取最新品質狀態） | BQ Analytics | ✅ 已完成（以 `id` 為 grain 去重，保留完整狀態機歷史）|
+| `int_orders` Row Filter（JOIN `quality_events` 最新狀態：`has_clean_error=FALSE OR to_state='promoted'`） | BQ Analytics | ✅ 已完成 |
+| `int_orders_quarantine` dbt model | BQ Analytics | ✅ 已完成（含 `error_codes` 攤平、`quarantined_at` 取事件時間）|
+| 劃分不變式測試（`int_orders` ∪ `int_orders_quarantine` = `stg_orders`）| BQ Analytics | ✅ 已完成（singular test，severity=error）|
+| `int_order_items`（items 攤平到 item 粒度，供 `fct_order_items`）| BQ Analytics | ✅ 已完成 |
+| 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ 設計已備妥，待真實分析場景出現才啟用（見機制三的實作狀態註）|
+| Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 5——**下游回流路徑已就緒**，只等事件產生端 |
 | `rpt_quality_*` dbt 模型 | BQ Analytics | ⬜ Phase 4 |
 
 ---
@@ -636,7 +652,12 @@ BQ `dim_*/fct_*` 反映目前最新評估下的乾淨狀態。
 
 **`quality_events` 目前不覆蓋 BQ 層的促進事件**  
 Proposal B（Airflow 重評估）尚未實作。目前 `quality_events` 只有攝入時的 `initial_evaluation` 事件。  
-Phase 4 Airflow 建立後，促進（`promotion`）與永久拒絕（`rejection`）的事件寫入邏輯需一併補上。
+Phase 4 Airflow 建立後，促進（`promotion`）與永久拒絕（`rejection`）的事件寫入邏輯需一併補上。  
+**但下游的回流路徑已經就緒**：`int_orders` 的有效狀態合成已實作並有測試把關，Proposal B 一旦開始產生 `promotion` 事件，下次 dbt run 即自然生效，無需再改 `int_` 層。
+
+**BQ sandbox 的 60 天過期會讓 promoted 記錄回退（帳號層限制）**  
+sandbox 強制套 60 天分區＋表過期（見 [CLOUD_LAYER-TW §1.6](./CLOUD_LAYER-TW.md)），`quality_events` staging 亦繼承。若某筆 `promotion` 事件過期消失，`int_orders` 的 LEFT JOIN 會 fall back 到 ODS 快照（`has_clean_error=TRUE`）→ 該筆**從 Gold 掉回 quarantine**。  
+方向是保守的（絕不會讓髒資料溜進 Gold，只會過度隔離），且啟用帳單即解除；在那之前，「跨全歷史取最新狀態」的實際上限是 60 天。這也是為什麼 `int_*` 的合成必須寫成**保守合成**（事件缺席 → 退回 ODS 快照），而不是假設事件永遠在。
 
 **場景補值審計軌跡為 SQL 文件**  
 場景專用 `int_*` 模型的補值邏輯記錄在 dbt 模型 SQL 與 model description，不建立獨立追蹤表。前提是無跨系統運行時稽核的實務需求；若未來出現此需求，再評估是否引入 BQ 層生命週期表。

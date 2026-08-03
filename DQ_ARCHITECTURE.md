@@ -190,49 +190,60 @@ models:
 
 Applied in `dbt int_*` SQL — isolates individual dirty records. The Row Filter's decision basis is **not the `has_clean_error` snapshot in ODS, but the "effective quality state"** — the ingestion-time verdict composed with any later evolution in `quality_events` (a Proposal B promotion).
 
+Both models share one composition block, collapsed into a single boolean `is_effectively_clean` — one side takes it, the other its negation:
+
 ```sql
--- int_orders.sql  (clean data flow, includes Proposal B re-evaluation flow-back)
-WITH latest_quality_state AS (
+-- Shared block (byte-identical in int_orders.sql and int_orders_quarantine.sql)
+WITH latest_event AS (
     -- one row per raw_id: the latest quality event (append-only, so order by event_at and take the first)
+    -- tiebreaker id DESC: determinism when several events share a timestamp
+    SELECT raw_id, to_state, rule_version, event_at
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY raw_id ORDER BY event_at DESC, id DESC
+        ) AS _rn
+        FROM {{ ref('stg_quality_events') }}
+    )
+    WHERE _rn = 1
+),
+resolved AS (
     SELECT
-        raw_id,
-        to_state,
-        ROW_NUMBER() OVER (
-            PARTITION BY raw_id ORDER BY event_at DESC
-        ) AS rn
-    FROM {{ ref('stg_quality_events') }}
+        s.*,
+        e.to_state AS quality_state_latest,
+        e.event_at AS quality_state_at,
+        -- ⚠️ COALESCE must not be dropped: with has_clean_error=TRUE and no event,
+        --    FALSE OR NULL = NULL, and `WHERE NOT NULL` is also NULL
+        --    → the row vanishes from BOTH tables at once (silent data loss)
+        COALESCE(
+            s.has_clean_error = FALSE     -- clean at ingestion time
+            OR e.to_state = 'promoted',   -- or promoted by Proposal B re-evaluation
+            FALSE
+        ) AS is_effectively_clean
+    FROM {{ ref('stg_orders') }} s
+    LEFT JOIN latest_event e ON s.raw_id = e.raw_id   -- ⚠️ must be LEFT
 )
-SELECT s.*
-FROM {{ ref('stg_orders') }} s
-LEFT JOIN latest_quality_state q
-    ON s.raw_id = q.raw_id AND q.rn = 1
-WHERE
-    s.has_clean_error = FALSE      -- clean at ingestion time
-    OR q.to_state = 'promoted'     -- or promoted by Proposal B re-evaluation (latest state = promoted)
+
+-- int_orders.sql  (clean data flow, includes Proposal B re-evaluation flow-back)
+SELECT * EXCEPT (is_effectively_clean) FROM resolved WHERE is_effectively_clean
 
 -- int_orders_quarantine.sql  (records still isolated = effective state not clean)
-WITH latest_quality_state AS (
-    SELECT
-        raw_id,
-        to_state,
-        ROW_NUMBER() OVER (
-            PARTITION BY raw_id ORDER BY event_at DESC
-        ) AS rn
-    FROM {{ ref('stg_quality_events') }}
-)
+-- quarantined_at uses the event time, not CURRENT_TIMESTAMP(): the model is a full
+-- rebuild, so CURRENT_TIMESTAMP changes every run — recording "when this run happened"
+-- rather than when the row was quarantined
 SELECT
-    s.*,
-    CURRENT_TIMESTAMP() AS quarantined_at
-FROM {{ ref('stg_orders') }} s
-LEFT JOIN latest_quality_state q
-    ON s.raw_id = q.raw_id AND q.rn = 1
-WHERE
-    s.has_clean_error = TRUE
-    AND (q.to_state IS NULL OR q.to_state != 'promoted')  -- never promoted, or promoted then re_quarantined
+    * EXCEPT (is_effectively_clean),
+    COALESCE(quality_state_at, received_at) AS quarantined_at
+FROM resolved WHERE NOT is_effectively_clean
 ```
 
+**Partition invariant**: the two models form a complete partition of `stg_orders` (mutually exclusive + exhaustive) — every `raw_id` appears exactly once. It is guarded by `tests/assert_orders_split_is_partition.sql`, which exists precisely for the two ⚠️ above (a dropped COALESCE makes rows vanish from both tables; an accidental INNER JOIN drops every row without an event). The shared block is **deliberately duplicated** rather than extracted into a shared model — rationale and alignment checklist in [ecommerce_dbt/README §5.1–5.3](./ecommerce_dbt/README.md).
+
+The `re_quarantined` edge case is covered automatically: as long as the latest event is not `promoted`, `is_effectively_clean` is FALSE and the record stays in quarantine, with no extra condition needed.
+
 **Why can't the Row Filter just read `has_clean_error`?**
-ODS is an immutable anchor — `has_clean_error` is frozen at the **ingestion-time** verdict (under that `dq_rule_version`), and a record promoted by Proposal B **still reads `has_clean_error=TRUE` in ODS**. If the Row Filter were written literally as `WHERE has_clean_error = FALSE`, promoted records would stay stuck in quarantine forever and never flow back to Gold. The "effective quality state" must therefore be **composed** by `int_*` on every dbt run, joining the ODS snapshot with the latest `quality_events` event — `has_clean_error` is the snapshot from the `initial_evaluation` event, while the latest `to_state` in `quality_events` is the current truth. This is the seam that lets "re-evaluate without modifying ODS, append `quality_events` only" (see *Bounded Writeback Principle*) actually flow data back. The `re_quarantined` edge case is covered automatically: as long as the latest event is not `promoted`, the record stays in quarantine, with no extra condition needed.
+ODS is an immutable anchor — `has_clean_error` is frozen at the **ingestion-time** verdict (under that `dq_rule_version`), and a record promoted by Proposal B **still reads `has_clean_error=TRUE` in ODS**. If the Row Filter were written literally as `WHERE has_clean_error = FALSE`, promoted records would stay stuck in quarantine forever and never flow back to Gold. The "effective quality state" must therefore be **composed** by `int_*` on every dbt run, joining the ODS snapshot with the latest `quality_events` event — `has_clean_error` is the snapshot from the `initial_evaluation` event, while the latest `to_state` in `quality_events` is the current truth. This is the seam that lets "re-evaluate without modifying ODS, append `quality_events` only" (see *Bounded Writeback Principle*) actually flow data back.
+
+**That "event in a new partition, data in an old one" mismatch also dictates `int_*`'s materialization**: a promotion event has `event_at = now()` and lands in today's partition, while the order it rescues has a `received_at` far in the past. If `int_orders` copied `stg_orders` and went incremental on a `received_at` lookback window, that old partition would never be recomputed and the flow-back mechanism would be silently severed at the `int_` layer. Hence `int_*` always does a full rebuild (see [ecommerce_dbt/README §5.4](./ecommerce_dbt/README.md)).
 
 ### Mechanism 3: Scenario-Specific Analysis Models (int_* layer)
 
@@ -261,6 +272,10 @@ WHERE
 ```
 
 **Audit trail**: Repair logic co-exists with transformation logic in the SQL file. The dbt model description records which errors the scenario accepts and why. The SQL itself is the audit trail, versioned in git.
+
+> **Implementation status: designed, deliberately not built yet.** Scenario-level imputation exists to answer a *specific* analytical question — without that question there is no correct answer to write, and building one anyway invents a fake requirement and pays permanent maintenance cost. Enable when a real scenario appears that can demonstrably tolerate a class of errors irrelevant to it.
+>
+> Two things to watch when implementing: ① deciding "contains only irrelevant codes" **must not use `ARRAY_LENGTH(codes) = 1`** — the same code can repeat (e.g. several items each raising `non_finite_number`), so counting misjudges; the correct form is "no code outside the allowed set exists". ② A scenario model becomes the **third consumer** of the effective-quality-state logic, at which point the block currently duplicated across `int_orders` / `int_orders_quarantine` should be collapsed into a shared model (see [ecommerce_dbt/README §5.3](./ecommerce_dbt/README.md)).
 
 ---
 
@@ -607,12 +622,14 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 
 | Component | Layer | Status |
 |---|---|---|
-| dbt `stg_*` Hard Gate tests | BQ Analytics | ⬜ Phase 4 |
-| `stg_quality_events` dbt model (for `int_*` to JOIN the latest quality state) | BQ Analytics | ⬜ Phase 4 |
-| `int_orders` Row Filter (JOIN latest `quality_events` state: `has_clean_error=FALSE OR to_state='promoted'`) | BQ Analytics | ⬜ Phase 4 |
-| `int_orders_quarantine` dbt model | BQ Analytics | ⬜ Phase 4 |
-| Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Phase 4 |
-| Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 4 |
+| dbt `stg_*` Hard Gate tests | BQ Analytics | ✅ Done (custom generic test `error_rate_below`) |
+| `stg_quality_events` dbt model (for `int_*` to JOIN the latest quality state) | BQ Analytics | ✅ Done (deduped at `id` grain, full state-machine history preserved) |
+| `int_orders` Row Filter (JOIN latest `quality_events` state: `has_clean_error=FALSE OR to_state='promoted'`) | BQ Analytics | ✅ Done |
+| `int_orders_quarantine` dbt model | BQ Analytics | ✅ Done (with flattened `error_codes`, `quarantined_at` from event time) |
+| Partition invariant test (`int_orders` ∪ `int_orders_quarantine` = `stg_orders`) | BQ Analytics | ✅ Done (singular test, severity=error) |
+| `int_order_items` (items flattened to item grain, for `fct_order_items`) | BQ Analytics | ✅ Done |
+| Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Designed; enable only when a real analytical scenario appears (see the status note under Mechanism 3) |
+| Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 5 — **the downstream flow-back path is already in place**, only the event producer is missing |
 | `rpt_quality_*` dbt models | BQ Analytics | ⬜ Phase 4 |
 
 ---
@@ -636,7 +653,12 @@ Actual thresholds should be calibrated once real traffic data is available. Init
 
 **`quality_events` does not yet cover BQ-layer promotion events**  
 Proposal B (Airflow re-evaluation) is not yet implemented. Currently `quality_events` only records `initial_evaluation` events written at ingestion time.  
-When Airflow is introduced in Phase 4, the write logic for `promotion` and `permanently_rejected` events must be added alongside it.
+When Airflow is introduced in Phase 4, the write logic for `promotion` and `permanently_rejected` events must be added alongside it.  
+**The downstream flow-back path is, however, already in place**: `int_orders`'s effective-state composition is implemented and test-guarded, so once Proposal B starts emitting `promotion` events they take effect on the next dbt run, with no further changes to the `int_` layer.
+
+**BQ sandbox's 60-day expiration can push promoted records back to quarantine (an account-level limit)**  
+The sandbox forces 60-day partition and table expiration (see [CLOUD_LAYER §1.6](./CLOUD_LAYER.md)), which the `quality_events` staging table inherits. If a `promotion` event expires and disappears, `int_orders`'s LEFT JOIN falls back to the ODS snapshot (`has_clean_error=TRUE`) → that record **drops out of Gold back into quarantine**.  
+The direction is conservative (dirty data never leaks into Gold; the failure mode is over-isolation), and enabling billing removes the limit. Until then, "take the latest state across all history" is effectively capped at 60 days. This is also exactly why the `int_*` composition must be written **conservatively** (event absent → fall back to the ODS snapshot) rather than assuming the event is always there.
 
 **Scenario repair audit trail is SQL documentation**  
 Repair logic in scenario-specific `int_*` models is documented in the dbt model SQL and model description — no separate tracking table is maintained. This assumes no runtime cross-system auditing requirement exists; if that need arises, a BQ-layer lifecycle table can be introduced at that point.

@@ -31,3 +31,9 @@ models:
       # staging 層預設物化 table；stg_orders 於模型內 config 覆寫為 incremental
       # （insert_overwrite + received_at 分區 + 回看窗，見該檔頭註與 CLOUD_LAYER-TW §1.2）。
       +materialized: table
+    intermediate:
+      # int_ 層一律 table 全量重建，刻意【不】比照 stg_ 用 received_at 增量：
+      # Proposal B 的 promotion 事件落在當天分區，但它救的訂單 received_at 在舊分區，
+      # 回看窗永遠看不到 → 被 promote 的記錄流不回 Gold（見 int_orders.sql 檔頭）。
+      # table 走 CREATE OR REPLACE（DDL），不受 BQ sandbox 禁 DML 限制。
+      +materialized: table

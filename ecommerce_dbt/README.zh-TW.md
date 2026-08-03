@@ -54,7 +54,7 @@ dbt build  --select stg_orders        # run + test 一起
 | 報表 | `rpt_` | 固定粒度預聚合 | 同 Gold |
 
 - 命名採 `stg_orders`（沿用專案既有文件），非 dbt 官方 `stg_<source>__<entity>`。
-- 檔案組織：`models/staging/` 內 `_staging__sources.yml`（source 定義）、`stg_orders.sql`、`stg_orders.yml`（測試/描述）。
+- 檔案組織：`models/staging/` 內 `_staging__sources.yml`（source 定義）、`stg_orders.sql`、`stg_orders.yml`（測試/描述）；`models/intermediate/` 內各 `int_*.sql` 與共用的 `_intermediate__models.yml`。
 
 ## 4. 實作決策（`stg_orders`）
 
@@ -137,38 +137,168 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 | 刪欄 | 不動，欄留著 | **`DROP` 欄** |
 | 改型別 | 不動 | `ALTER` 型別 |
 
-`sync_all_columns` 的 DROP 會牴觸「staging 只做加法、刪欄留 legacy 欄保歷史」（§5.2/§5.3）。`append_new_columns` 天生只加不刪，正好對齊。
+`sync_all_columns` 的 DROP 會牴觸「staging 只做加法、刪欄留 legacy 欄保歷史」（[CLOUD_LAYER-TW §5.2/§5.3](../CLOUD_LAYER-TW.md)）。`append_new_columns` 天生只加不刪，正好對齊。
 
 **觸發閘門＝顯式清單，故不吃 drift**：`check_for_schema_changes` 比對的是 model 產出的欄位（顯式清單），不是底層 staging。staging 靠 `ALLOW_FIELD_ADDITION` 自動長的欄，在你把它加進顯式 SELECT 前偵測不到 → 不會自己 ALTER。此選項**只在刻意改清單（進 git、被 review）時觸發**，顯式紀律原封不動。
 
-**界線**（救不了的，仍走 §6 runbook）：
+**界線**（救不了的，仍走 §7 runbook）：
 - **歷史回填**（值要連舊分區一起有，如 Proposal C 重建）：它只 NULL 補舊分區、只寫回看窗 → 舊分區真值仍需 targeted refresh。
 - **改型別 / 改名 / 改分區**：仍 `--full-refresh` / 重建表。
 
-## 5. 測試策略
+## 5. 實作決策（`int_` 層）
+
+`int_` 是 **Gold 入口**——攔截發生在這一層（[DQ_ARCHITECTURE-TW Q1 機制二](../DQ_ARCHITECTURE-TW.md)）。DAG：
+
+```
+stg_orders ─────────┐
+                    ├─► int_orders            (Row Filter 通過) ──► int_order_items
+stg_quality_events ─┘   int_orders_quarantine (被隔離)
+```
+
+### 5.1 有效品質狀態：刻意複製，不抽共用模型
+
+`int_orders` 與 `int_orders_quarantine` 都需要同一段邏輯——**合成「有效品質狀態」**：
+
+> 判定基準【不是】ODS 的 `has_clean_error` 字面快照。ODS 是不可變錨點，被 Proposal B promote 的記錄在 ODS 裡**永遠**是 `has_clean_error=TRUE`；只讀快照它會永遠卡在 quarantine、流不回 Gold。有效狀態必須由 `int_` 在每次 run 時把「ODS 快照 ⊕ `quality_events` 最新事件」合成出來。
+
+這段邏輯（`latest_event` → `resolved` → `classified` 三個 CTE）**刻意在兩個模型檔各寫一份**，而非抽成共用模型。決策過程：
+
+| 方案 | 做法 | 實體物件 | JOIN 執行次數 | 互補性保證 |
+|---|---|---|---|---|
+| A | 共用 ephemeral model，輸出 `is_effectively_clean`；下游 `where flag` / `where not flag` | 不增加（ephemeral 不建 relation）| 每個下游各一次 | **機制**（同一布林 + 一次否定）|
+| B | 共用小表 `int_quality_current` + macro 定義布林 | +1 張小表 | 只算一次 | 機制（macro）|
+| **C（選用）** | 兩個模型各自 inline 同一段 CTE | 不增加 | 每個下游各一次 | **紀律 + 測試** |
+
+**釐清一個常見誤解**：A（ephemeral）與 C 編譯後的 SQL 幾乎逐字相同——ephemeral 會被 inline 進每個下游，**既不會多建表、也不會少跑 JOIN**。真要減少 JOIN 次數只有 B（物化）做得到。**所以 A 與 C 的差別純粹在維護面，不在成本面。**
+
+選 C 的實際理由：
+
+1. **消費者只有 2 個**，複製成本低於「多一層 `ref` 間接跳轉」的認知成本；
+2. **模型檔自我完備**——讀 `int_orders.sql` 就看得到全部判定邏輯，且與 DQ 文件的範例逐字對應，不必在三個檔案之間追邏輯；
+3. 代價（互補性從機制保證降為紀律保證）**可以用一支測試買回來**——見 §5.2。
+
+### 5.2 對齊清單 ⭐（改動任一模型時逐條核對）
+
+C 方案下，`int_orders` 與 `int_orders_quarantine` 必須維持對 `stg_orders` 的**完整劃分**（互斥 + 窮盡：每個 `raw_id` 恰好出現一次）。共用區塊在兩檔中以 `═══` 註解框出，**必須逐字相同**。
+
+| # | 檢查項 | 改錯的後果 |
+|---|---|---|
+| 1 | 兩邊 `is_effectively_clean` 的**定義逐字相同**，且一邊 `WHERE cond`、一邊 `WHERE NOT cond` | 條件不互補 → 某些列兩邊都不在（**靜默漏資料**）或兩邊都在（下游重複計數）|
+| 2 | `coalesce(..., false)` **不可省** | `has_clean_error=TRUE` 且無事件時 `FALSE OR NULL = NULL`；`WHERE NOT NULL` 也是 NULL → **該列從兩張表同時消失** |
+| 3 | JOIN 一律 `LEFT JOIN` | 誤寫 INNER → 所有沒有品質事件的列整批消失 |
+| 4 | 視窗的 `partition by` / `order by` 決勝鍵兩邊一致（`partition by raw_id order by event_at desc, id desc`）| 同一列在兩邊取到不同事件 → 劃分破裂 |
+| 5 | `effective_quality_state` 的 CASE 分支兩邊一致 | 血緣標籤對不上帳，`rpt_quality_*` 統計錯 |
+| 6 | 兩模型的**物化策略**一致（目前皆 `table` 全量重建）| 一邊增量一邊全量 → 劃分在跑批之間破裂 |
+| 7 | `tests/assert_orders_split_is_partition.sql` 維持 `severity: error`，**永不降級、永不 `--exclude`** | 這是 C 方案下唯一的自動化安全網 |
+
+> 第 2 項是最容易漏的：`is_effectively_clean` 的三態（TRUE/FALSE/**NULL**）中，NULL 會讓列從兩張表**同時**消失，而且不報任何錯。劃分測試正是為它而寫。
+
+### 5.3 收斂觸發點與尚未啟用的選項
+
+- **收斂觸發點**：當出現**第 3 份複製**時（例如日後啟用場景專用模型），複製成本開始超過間接層成本，屆時應把共用區塊收斂成方案 A（ephemeral）或 B（小表 + macro）。
+- **場景專用 `int_orders_*` 模型（[DQ 機制三](../DQ_ARCHITECTURE-TW.md)）——設計已備妥，刻意暫不實作**。理由：場景補值的本質是「回答某個具體分析問題」，沒有那個問題就沒有正確答案可寫，先建等於憑空造一個假需求並付永久維護成本。啟用時機＝出現真實分析場景、且該場景明確能接受某類與它無關的錯誤。啟用時需一併補一個 `dq_has_only_error_codes(json_col, allowed_codes)` macro（判斷「不存在任何 allowed 以外的 code」）——**不可用 `array_length(codes) = 1` 判斷**，因同一個 code 可能重複出現（如多個 item 各觸發一次 `non_finite_number`），數量比對會誤判。
+
+### 5.4 物化：`stg_` 用增量、`int_` 用全量重建 ★
+
+同一個專案裡兩層用了相反的物化策略，不是不一致——是因為兩層**「什麼會變」的形狀不同**。
+
+| | `stg_orders` | `int_orders` / `int_orders_quarantine` |
+|---|---|---|
+| 物化 | `incremental` + `insert_overwrite` + 回看窗 | `table`（每次 run 全量重建）|
+| 上游變更的來源 | 一個：staging 新增／重抽的列 | 兩個：新訂單（`received_at` 軸）**＋** 品質事件（`event_at` 軸）|
+| 變更的時間軸 | 與分區欄位一致，都在近期 | **錯位**：事件在今天，它影響的訂單在很久以前 |
+| 列會不會消失 | 不會（append-only 鏡射）| **會**（promote 後要離開 quarantine）|
+| 漏算一個分區的後果 | 延遲——下輪或 runbook 補得回來 | **永久錯誤**——幽靈列留在 quarantine，且同時出現在兩張表 |
+
+最後一列是關鍵：`stg_` 的增量失誤是**延遲**，`int_` 的增量失誤是**錯誤**，而且不報錯、不自癒。
+
+#### 為什麼 `int_` 不能照抄回看窗
+
+> Proposal B 的 promotion 事件 `event_at = now()`、落**當天**分區，但它救的那筆訂單 `received_at` 在**很久以前**的舊分區。若按 `received_at` 回看窗增量，那個舊分區永遠不會被重算 → 被 promote 的記錄**永遠流不回 Gold**，回流機制在此層被靜默切斷。
+
+（與 [CLOUD_LAYER-TW §7.4](../CLOUD_LAYER-TW.md) 的 late-arriving 同構但軸不同：那裡是「值」變（Proposal C 修正列），這裡是「狀態」變（Proposal B 事件）。）
+
+因此 `int_` 層一律 `materialized='table'`（在 `dbt_project.yml` 設為該資料夾預設）。`table` 走 `CREATE OR REPLACE`（DDL、原子替換、不受 sandbox 禁 DML 限制，§4.3 的限制對 `int_` 目前不適用），並順帶換到兩個好處：
+
+- **不會有邏輯漂移**：表永遠等於「現在的 SQL 套在現在的上游」。增量表的舊分區可能留著用舊版邏輯算出的列，得靠 runbook 補（`stg_orders` 就有這個包袱，見 §4.7、§7）。
+- **改欄位清單零成本**：不需要 `on_schema_change`、不需要判斷該不該 `--full-refresh`。
+
+#### 真要改增量，難的不是回看窗，是這三件事
+
+1. **粒度錯配**：受影響的單位是「列」，`insert_overwrite` 換的是「分區」。只 SELECT 受影響的列會讓同分區其他列蒸發，所以必須先把「受影響的列」反推成「受影響的分區」，再重選那些分區的**全部**列——重選集合＝「回看窗分區 **∪** 近期有品質事件的 `raw_id` 所屬分區」。這需要一趟額外的 discovery 查詢（好消息：BQ 是列式，discovery 只掃 `received_at`／`raw_id` 兩欄，成本是全表掃的個位數百分比）。
+2. **在最需要它的那天退化成全量**：Proposal B 的典型形態是「規則放寬 → 撈回**跨全歷史**的舊 quarantine」，事件的 `raw_id` 散布在每個分區上 → 受影響分區＝全部分區，那次 run 比全量還貴（多付 discovery + tmp table + N 個 copy job）。增量存在的理由，正好發生在它失效的那天。
+3. **必須連帶收斂共用區塊**：兩張互補的表要對同一批分區做一致重算，那段 discovery 邏輯必須在兩檔逐字相同——共用區塊會從「三個直觀的 CTE」膨脹成「三個 CTE + 一段容易寫錯的動態分區 Jinja」。**改增量的那一刻就是 §5.3 收斂觸發點被觸發的時刻**，兩件事必須一起做。
+
+#### 何時該改：看可觀測數字，不看訂單筆數
+
+實測基準：`int_` 層一次 run 掃 910 KB / 554 筆訂單 → **每筆訂單每次 run 約 1.64 KB**（三個模型加總；此比率就是列寬，隨規模基本不變）。
+
+| 訂單總數 | 單次 run 掃描 | 日批月成本（on-demand $6.25/TiB）|
+|---|---|---|
+| 1,000 萬 | 16 GB | ~$3 |
+| 1 億 | 164 GB | ~$30 |
+| 10 億 | 1.6 TB | ~$300 |
+
+sandbox 的 1 TiB/月免費額度，在日批下約撐到 **1,500–2,000 萬筆訂單**（還要扣 `stg_` 與未來 `dim_/fct_` 的用量）。
+
+但**成本不是第一個撞到的瓶頸**，會先撞到的是：① `profiles.yml` 的 `job_execution_timeout_seconds: 300`——它會讓 run 直接失敗而不是變貴（目前全量重建 2.5 秒）；② 整條 DAG 的批次窗口，`int_` 全量疊上未來同樣全量的 `dim_/fct_`。
+
+**判準**：監控 `target/run_results.json` 的 `bytes_billed` 月累計與 `execution_time`，任一項到額度／timeout 的 **50%** 就開始評估。在那之前，全量重建是「正確性免費、複雜度為零」的選擇。
+
+> **一個刻意接受的架構不對稱**：`stg_` 做增量省下的是重算與寫入，但 `int_` 每次仍全掃 `stg_`——所以**整條管線的讀取成本依然 ∝ 歷史總量**。這是明知並接受的取捨，換來 `int_` 層的正確性無條件成立。
+
+### 5.5 不分區，叢集只掛 `order_id`
+
+- `int_` 只被 DAG 內部消費（非分析師 ad-hoc 查詢），分區收益 ≈ 0；`order_date` 分區留給 `dim_/fct_`（[CLOUD_LAYER-TW §1.2](../CLOUD_LAYER-TW.md)「每張表依自己的 access pattern 各自選」）。
+- 更實際的理由是一個**地雷**：`int_orders_quarantine` 正是 `ORDER_DATE_IN_FUTURE` 髒列的收容處，離譜的未來日期會超出 BQ 分區合法區間、**讓整張表建立失敗**。按 `order_date` 分區等於自找失敗。`dim_/fct_` 啟用該分區時需先做合法區間守衛。
+
+### 5.6 `quarantined_at`：取事件時間，非 `CURRENT_TIMESTAMP()`
+
+DQ 文件早期範例寫 `CURRENT_TIMESTAMP() AS quarantined_at`。在 `table` 全量重建下這個值**每次跑批都會變**——它記錄的是「這次 run 的時間」而非「這筆被隔離的時刻」，會讓 `rpt_quality_*` 的時間軸失真。
+
+改為 `coalesce(quality_state_at, received_at)`：優先取 `initial_evaluation` 事件的 `event_at`（真正的隔離時刻），事件缺席時退回攝入時間。若日後需要跑批時戳，另開欄位、語意分開。
+
+### 5.7 `int_order_items`：來源、`safe_cast`、嚴格 NULL 傳播
+
+把 `ODS.items`（JSON 陣列）以 `unnest(json_query_array(items)) with offset` 攤平到 item 粒度，供未來的 `fct_order_items`。
+
+- **來源選 `int_orders`（已過濾）而非 `stg_orders`**：item 層的錯誤（`quantity_non_positive`、`unit_price_negative`、`discount_pct_out_of_range`、`non_finite_number`）在攝入層就會讓**整張訂單** `has_clean_error=TRUE` 被隔離，所以從 `int_orders` 出發天然保證「Gold 不含髒資料」。要做 item 層 RCA 時另建讀 quarantine 的模型。
+- **數值一律 `safe_cast`**：`clean.py` 明載「items 內的值未經 Pydantic 強轉，可能是字串」——items 整包以 JSONB 落地，欄位值不經 `ODSOrder` 型別強轉。用 `cast` 會讓一筆髒 item **炸掉整批**；`safe_cast` 轉不動 → NULL，符合本專案「標記不阻斷」的哲學。
+- **衍生金額採嚴格 NULL 傳播，不 `coalesce`**：`net_amount = quantity × unit_price × (1 - discount_pct/100)`，任一輸入為 NULL 則結果 NULL。理由是 [CLOUD_LAYER-TW §5.5.5](../CLOUD_LAYER-TW.md) 的鐵律——NULL 帶資訊（「沒有折扣資料」≠「折扣為 0」），`COALESCE` 有損且單向，一旦在 `int_` 壓成 0，全下游再也分不出「沒收集」與「真的是 0」。若日後確認「缺值＝無折扣」，補值加在 `dim_/fct_`，**不回頭改本層**。
+- **`(raw_id, item_index)` 是 item 粒度鍵**：`items` 在 ODS 內是不可變的 JSONB 快照、陣列順序固定，故位置可作為穩定身分；代理鍵 `order_item_key = raw_id-item_index`。
+
+## 6. 測試策略
 
 | 測試 | 對象 | severity | 說明 |
 |---|---|---|---|
-| `error_rate_below`（自訂 generic test）| 整批 `has_clean_error` 比率 | error @10% / warn @5% | **Hard Gate**（DQ 機制一）。不能用 `dbt_utils.expression_is_true`（逐列、塞 WHERE，聚合會報錯）→ 自訂 `macros/error_rate_below.sql` 用 `HAVING` 做全表聚合 |
-| `unique` + `not_null` | `raw_id`/`id`/`order_id` | error | `unique(raw_id)` 即去重驗證 |
+| `error_rate_below`（自訂 generic test）| `stg_orders` 整批 `has_clean_error` 比率 | error @10% / warn @5% | **Hard Gate**（DQ 機制一）。不能用 `dbt_utils.expression_is_true`（逐列、塞 WHERE，聚合會報錯）→ 自訂 `macros/error_rate_below.sql` 用 `HAVING` 做全表聚合 |
+| `unique` + `not_null` | `stg_` 的 `raw_id`/`id`/`order_id`；`int_` 的 `raw_id`/`order_id` | error | `stg_` 的 `unique(raw_id)` 即去重驗證 |
 | `not_null` | `received_at`/`has_clean_error`/`has_schema_drift` | error | REQUIRED 欄位 |
-| source freshness | `staging.orders` | warn 26h / error 50h | 帶 `filter` 繞保險絲 |
+| source freshness | `staging.orders`、`staging.quality_events` | warn 26h / error 50h | 帶 `filter` 繞保險絲 |
+| **`assert_orders_split_is_partition`**（singular）⭐ | `int_orders` ∪ `int_orders_quarantine` vs `stg_orders` | error | **劃分不變式**：每個 `raw_id` 恰好出現一次。C 方案（§5.1 複製）下唯一的自動化安全網，守 §5.2 對齊清單的 #1–#4。**永不降級** |
+| `assert_int_orders_no_unpromoted_dirty`（singular）| `int_orders` | error | **Gold 契約**：不得含 `has_clean_error=TRUE` 且未被 promote 的列。寫成 singular 而非欄位測試，因為它是**兩欄之間的條件關係**——`has_clean_error=TRUE` 本身在此表合法（promoted 記錄在 ODS 仍是髒的）|
+| `accepted_values` | `int_orders`/`int_orders_quarantine` 的 `effective_quality_state` | error | 兩表的狀態值域互斥（`clean`/`promoted` vs `quarantined`/`permanently_rejected`），等於從另一角度覆核劃分 |
+| `dbt_utils.unique_combination_of_columns` + `relationships` | `int_order_items` 的 `(raw_id, item_index)`、`raw_id → int_orders` | error | item 粒度唯一性與血緣完整性 |
 
-> 自訂 generic test 的參數需巢狀在 `arguments:` 下（dbt 1.11 要求，否則 `MissingArgumentsPropertyInGenericTestDeprecation`）。
+> 自訂 generic test 與部分內建測試的參數需巢狀在 `arguments:` 下（dbt 1.11 要求，否則 `MissingArgumentsPropertyInGenericTestDeprecation`）。
 
-## 6. 常見操作 runbook
+## 7. 常見操作 runbook
 
-- **何時 `--full-refresh`**：改分區/叢集、改去重邏輯、回看窗外的歷史需重算、或首次建表。走 DDL、不受 sandbox 限制。
+- **何時 `--full-refresh`**：改分區/叢集、改去重邏輯、回看窗外的歷史需重算、或首次建表。走 DDL、不受 sandbox 限制。（僅適用 `stg_` 的增量模型；`int_` 為 `table` 全量重建，每次 run 本就重建。）
 - **Proposal C targeted refresh**：修正列落在舊分區、回看窗看不到 → 修復 runbook 最後一步對災區分區做 targeted refresh（`--full-refresh` 或未來對單分區 `insert_overwrite`）。見 [CLOUD_LAYER-TW §7.4](../CLOUD_LAYER-TW.md)、DQ C-2 #7。
+- **改動 `int_orders` 或 `int_orders_quarantine` 前**：先過一遍 §5.2 對齊清單；改完跑 `dbt build --select intermediate+`，確認 `assert_orders_split_is_partition` 為綠。
 
-## 7. 相依與版本
+## 8. 相依與版本
 
 - dbt-core 1.11 / dbt-bigquery 1.11
 - `packages.yml`：`dbt-labs/dbt_utils >=1.1.0,<2.0.0`（實裝 1.4.1）
 
-## 8. 現況與待辦
+## 9. 現況與待辦
 
 - ✅ `stg_orders`（去重 + Hard Gate + freshness，增量）
-- ⬜ `stg_quality_events`（E/L 已把 `quality_events` 抽上 BQ；前置已解除，此 dbt model 待建）
-- ⬜ `int_orders` + Row Filter、`int_orders_quarantine`、場景專用 `int_orders_*`
+- ✅ `stg_quality_events`（以 `id` 為 grain 去重，保留完整狀態機歷史）
+- ✅ `int_orders` + Row Filter、`int_orders_quarantine`（劃分不變式有測試把關）
+- ✅ `int_order_items`（items 攤平到 item 粒度）
+- ⬜ 場景專用 `int_orders_*`（設計已備妥，待真實分析場景出現才啟用——見 §5.3）
 - ⬜ `dim_/fct_`、`rpt_quality_*`
+- ⬜ Proposal B（Airflow 重評估寫 `quality_events`）——下游回流路徑已就緒，只等事件產生端

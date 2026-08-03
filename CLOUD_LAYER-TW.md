@@ -22,9 +22,44 @@ staging 由抽取腳本以 batch load job 灌入。BQ 的 streaming insert 按�
 
 分區欄位選法的原則是「選那張表最常、最貴的查詢拿來過濾的欄位」。staging 的 access pattern 是**管線增量**（抽取 watermark、dbt incremental 都過濾 `received_at`），所以分區用 `received_at`，讓每次跑批只掃新增的分區（partition pruning）。
 
-> **`received_at` vs `order_date`**：staging 服務管線，故用攝入時間 `received_at` 分區；下游 Gold（`dim_/fct_`）服務分析師，月/週平均按業務時間 `order_date` 過濾，那一層才改用 `order_date` 分區。分區欄位是「每張表依自己的 access pattern 各自選」。
+> **`received_at` vs `order_date`**：staging 服務管線，故用攝入時間 `received_at` 分區；下游 Gold（`dim_/fct_`）服務分析師，月/週平均按業務時間 `order_date` 過濾，那一層才改用 `order_date` 分區。分區欄位是「每張表依自己的 access pattern 各自選」。**Gold 側的完整決策見下方 §1.2.1**——那不是把本節照抄一遍，四個決定各有各的理由，且其中兩個與 staging 相反。
 
 粒度選 DAY 不選 HOUR：批次是 T+1／小時級；且單表上限 4000 分區，DAY 可撐約 11 年、HOUR 僅 166 天。
+
+### 1.2.1 Gold（`dim_/fct_`）的分區決策 ⭐
+
+四個決定，逐條與 staging 對照：
+
+| 決策 | staging | Gold `fct_*` | Gold `dim_*` | 為什麼不同 |
+|---|---|---|---|---|
+| 分區欄位 | `received_at` | **`order_date`** | **不分區** | 事實表服務分析師的業務時間過濾；維度是**按鍵 join** 進來的，分區對 join 沒有裁切作用，只換來一堆小分區與 metadata 開銷 |
+| 粒度 | DAY | DAY | — | 同 §1.2 |
+| 保留政策 | 60 天（sandbox 強制） | **5 年**（`var` gated） | — | Gold 要留全歷史，但 DAY 粒度受 4000 分區上限約束（約 11 年）→ 必須有明確保留政策，否則第 11 年撞頂 |
+| `require_partition_filter` | ✅ 開 | ❌ **關** | — | 見下 |
+
+#### 為什麼 Gold 不上保險絲
+
+staging 開它零副作用（§1.4：存取一律帶 `received_at`）。但 Gold 服務分析師 ad-hoc 查詢與 Looker Studio 的**探索式查詢**，那些查詢常常不帶日期過濾——開了就是一律 400。這與 dbt README §4.6 的「保險絲傳染」是同一個張力，只是這次發生在最下游、面對的是人而不是管線。
+
+代價是放棄了「防單次誤觸全表掃」。替代防線是 BQ 的 **custom quota**（per-user/per-project 每日掃描上限）。這兩者防的**不是同一件事**：保險絲防單次失誤（每次查詢都問「你帶過濾了嗎」），quota 防系統性濫用（累計超標才擋）。對一個開放給分析師探索的層，後者才是對的形狀。
+
+#### 分區到底省多少：實測（2026-08，540 筆）
+
+同資料建兩張表，跑「近 30 天切片」這個分析師典型查詢：
+
+| | totalBytesProcessed | 相對全表 |
+|---|---|---|
+| 全表 | 68,856 B | 100% |
+| 只 `cluster by order_date` | 12,474 B | **18%** |
+| `partition by order_date` + cluster | 6,490 B | 9% |
+
+**clustering 單獨就裁掉了 82%，分區再往下拿 9 個百分點。** 所以「分區大幅省成本」這個常見說法需要修正——分區的價值不在裁切量，而在 clustering 給不了的三件事：
+
+1. **成本可預測**：分區裁切在查詢前由 metadata 決定，`dry run` 的 bytes 是準的；clustering 是 block 級、視資料排列而定，`dry run` 會高估。要做成本控管靠的是前者。
+2. **`require_partition_filter` 的前提**：只有分區表能上（雖然 Gold 選擇不上）。
+3. **分區級操作**：`insert_overwrite` 整分區原子替換、單分區 targeted refresh——`stg_` 的 runbook 全靠這個。
+
+> 附帶：BQ 對每查詢每表有 **10 MB 最低計費**，故在本專案目前的資料量上兩版帳單完全相同。分區的效益只在「假設數千萬～數億筆」的前提下成立——這個前提是刻意宣告的（本專案是實務模擬），不是實測結論。外推見 dbt README §5.4 的每列成本表。
 
 ### 1.3 叢集：`order_id` + `has_clean_error`
 
@@ -56,7 +91,99 @@ BQ 每個 dataset 建立當下綁定 location 不可改；跨 location 查詢會
 
 > **跨表一致性見 §3.2**：兩張表獨立抽取、獨立 watermark、獨立 load job；「orders 上了但 `quality_events` 沒上」怎麼防，見〈跨表一致性〉。
 
-> **60 天過期上限（sandbox 限制）**：因本專案為練習用途、不啟用帳單，跑在 BQ sandbox，dataset 被強制套 60 天分區＋表過期，`quality_events` 也繼承此設定；故「跨全歷史取最新」的假設在 sandbox 下實際上限為 60 天——這是帳號層限制（腳本設 `expiration=None` 也會被 sandbox 忽略），啟用帳單後才解除。
+> **60 天過期上限（sandbox 限制）**：因本專案為練習用途、不啟用帳單，跑在 BQ sandbox，dataset 被強制套 60 天分區＋表過期，`quality_events` 也繼承此設定；故「跨全歷史取最新」的假設在 sandbox 下實際上限為 60 天——這是帳號層限制（腳本設 `expiration=None` 也會被 sandbox 忽略），啟用帳單後才解除。**完整實測見 §1.7**；該限制對 Gold 的業務時間軸分區後果嚴重得多。
+
+### 1.7 sandbox 分區過期：實測記錄（2026-08）⭐
+
+§1.6 只記了「`expiration=None` 會被忽略」。但 Gold 改用**業務時間軸**分區之後，這條限制的後果完全不同，故補一份完整實測。**下面每一項都是量出來的，不是推論。**
+
+#### 1.7.1 過期按「分區的日期值」算，不是建表時間
+
+四個 dataset（`staging`、`dbt_dev`）的 `default_partition_expiration_ms` 全部是 `5184000000`（60 天），既有分區表也全部繼承。實測：建一張 `partition by order_date` 的表，一次 CTAS 灌入橫跨 60 天界線的五個日期——
+
+| 分區 | 結果 |
+|---|---|
+| 2024-01-01 | **rows=0，已消失** |
+| 2026-05-01（94 天前） | **rows=0，已消失** |
+| 2026-06-04（界線上） | rows=1 ✅ |
+| 2026-07-01（33 天前） | rows=1 ✅ |
+| 2026-08-03（今天） | rows=1 ✅ |
+
+三個關鍵行為：**① 建表不失敗**（`CREATE OR REPLACE` 回傳成功）；**② 一個「2024-01-01」的分區在誕生的瞬間就已超過 60 天**；**③ 刪除同步且即時**——CTAS 回傳後立刻查，兩個舊分區已不在 `INFORMATION_SCHEMA.PARTITIONS`，連 `num_rows` metadata 都直接讀到 3 而不是 5。沒有 warning。
+
+> `stg_orders` 沒踩到這個，純粹是因為它按 `received_at` 分區、攝入時間永遠是近期。**換成業務時間軸，這層保護就消失了。**
+
+#### 1.7.2 過期上限鎖死在 60 天，四條路全封
+
+| 做法 | 結果 |
+|---|---|
+| DDL `options(partition_expiration_days = 3650)` | ❌ job 失敗 |
+| DDL `options(partition_expiration_days = NULL)` | ⚠️ **不報錯，靜默改寫成 60 天** |
+| API 改 `table.time_partitioning.expiration_ms` | ❌ 403 |
+| API 改 dataset `default_partition_expiration_ms` | ❌ 403 |
+
+錯誤原文：
+
+```
+reason: billingNotEnabled
+Partition expiration time must be less than 60 days while in sandbox mode.
+```
+
+**這是 `gold_partition_expiration_days` 必須用 `var` gate 住、預設不輸出的原因**——寫死 1825 會讓每次 `dbt run` 失敗、`dbt build` 的下游全部 skip。
+
+> **一個要知道但不能用的漏洞**：`partition_expiration_days = 3650` 的 DDL 其實是**半成功**的——job 標記為失敗（`state=DONE`、`error_result.reason=billingNotEnabled`），但表確實被建出來、`expiration_ms` 真的是 3650 天、舊列存活可查詢、等 60 秒也沒被回收。管制擋在 **job 驗證層**，DDL 的副作用漏了過去。不能用：job 失敗等於 dbt 失敗；且這是管制漏洞而非支援路徑，補上之後表會開始無聲被回收。
+
+#### 1.7.3 超出合法區間的日期：靜默落 `__UNPARTITIONED__`，**不會炸表**
+
+**這一項推翻了本文件 §8 的舊記載**（原文：「離譜的未來日期會超出 BQ 分區可接受範圍、讓整張表建立失敗」）。實測：
+
+```
+partition_id=20260803           rows=1
+partition_id=21591231           rows=1
+partition_id=__UNPARTITIONED__  rows=3   ← 1959-12-31 / 2160-01-01 / 9999-12-31
+建表成功，5 列全部存活可查詢
+```
+
+超出 `1960-01-01 ~ 2159-12-31` 的值不報錯，靜默進 `__UNPARTITIONED__`。連帶：這些列同樣**逃過 60 天回收**，且永遠無法被 partition pruning 裁掉。
+
+因此 `dim_/fct_` 採 `order_date` 分區**不需要**合法區間守衛。（`int_orders_quarantine` 刻意不分區的決定仍成立，但理由只剩「`int_` 只被 DAG 內部消費、分區收益 ≈ 0」那一條。）
+
+#### 1.7.4 `__NULL__` 分區逃過回收
+
+`order_date` 在 ODS 是 nullable。NULL 落 `__NULL__` 分區，該分區沒有日期、算不出過期時間，故**不被回收**——實測中它與 2024-01-01 同批寫入，後者當場消失、它存活。後果：`fct_orders` 裡沒有 `order_date` 的訂單會比有日期的活得久。目前資料 0 個 NULL，但 schema 允許。
+
+#### 1.7.5 兩個 60 天時鐘掛在不同軸上 ⭐
+
+這是上述現象裡對**測試設計**影響最大的一條：
+
+```
+int_orders ← stg_orders ← staging.orders    按 received_at 過期
+fct_orders / fct_order_items                按 order_date  過期
+```
+
+所以「`fct_orders` 的內容 == `int_orders` 的內容」這個不變式**不能寫成 `count(*) = count(*)`**：兩表保留期本來就不同，即使綠也是「兩個 reaper 剛好同步」而非「SQL 對」。更糟的是回收時機不同步——`fct_orders` 是 `CREATE OR REPLACE`、回收同步發生；`stg_orders` 是 incremental、舊分區靠 BQ 背景 reaper 非同步回收——邊界日必然對不上，測試會變成每天固定紅一陣子的 flaky test。
+
+解法是**把不變式錨在 `order_date` 窗上**（反向 join，見 `tests/assert_fct_orders_complete_projection.sql`），並讓 `load_test.py` 產生的 `order_date ≈ received_at`（見該檔 `ORDER_DATE_LOOKBACK_DAYS`）使兩軸對齊。**舊版產生器把 `order_date` 寫死在 2024 年、與 `received_at` 平均相差 410 天，那會讓新灌的資料一進 Gold 就被回收、測試永久紅。**
+
+#### 1.7.6 BQ 側是滾動 60 天的「攝入視窗」，ODS 無法回填 ⭐
+
+前五項談的是分區怎麼被回收。這一項談那件事對**整條管線的形狀**做了什麼——**這是最容易被遺忘、卻最會誤導未來決策的一條。**
+
+抽取腳本把 ODS 的 `received_at` **原值**寫成分區欄位（`extract_ods_to_bq.py` 的 `FIELDS` 與 `partition_field`）。所以：
+
+> **任何 `received_at` 超過 60 天的 ODS 列，無論重抽幾次，都會在落地當下被回收。**
+
+ODS 在 PostgreSQL 仍是永久且完整的錨點（`raw`/`ods`/`quality_events` 一筆不少）。但**在 BQ 這一側，管線結構上就是一個滾動的 60 天攝入視窗**——不是「保留最近 60 天的資料」，而是「只裝得下最近 60 天*被攝入*的資料」。歷史資料要回到 BQ，唯一的路是**重新攝入**（產生新的 `received_at`），不是重抽。
+
+三個直接推論：
+
+1. **「只清 BQ staging 再重抽」是無效的捷徑**。`get_watermark()` 會因查不到分區而回 `None`、觸發全量抽取（§2.1），但抽上去的舊列一樣當場蒸發，結果與清除前相同。要讓 BQ 有資料，只能灌新的。
+
+2. **staging 清空後，抽取會靜默降級成「每次全掃 ODS」，而且回報成功**。watermark 恆為 `None` → 每輪都是全量；load job 回報 `output_rows = <ODS 全部列數>`，而 **E/L gate 只檢查 load job 有沒有拋例外，沒有事後 `SELECT COUNT(*)` 驗證**（§3.2）——於是會出現「每次跑批都成功載入 N 筆、表卻永遠是空的」這種**綠燈說謊**的狀態。要防它，gate 需補一個載入後的實際列數檢查（目前未實作）。
+
+3. **`dbt source freshness` 會先於一切變紅**。`error_after: 50 hours`，所以停止攝入約兩天後它就是 ERROR STALE，遠早於分區開始被回收。目前它不在 `dbt build` 的範圍內（是獨立指令），所以 build 全綠而 freshness 早已紅——**Phase 5 用 Airflow 把它接成 DAG 前置 gate 時，這件事會變成 DAG 卡住**。屆時要嘛確保持續攝入、要嘛把它降級為 warn。
+
+> 對比 §7 的 Proposal C：那裡談的是「修正列落在舊分區、watermark 看不到，所以要主動推」。這裡更強一階——在 sandbox 上，**舊分區根本不存在可推的目標**。§7.1「上雲是主動步驟」的結論不變，但 sandbox 下它的可行範圍被壓縮到 60 天內。
 
 ---
 
@@ -269,5 +396,5 @@ corrections 若另成一張 BQ 表：需要自己的 `FIELDS` 宣告、抽取邏
 ## 8. 待辦與未來
 
 - 微批升級時：`get_watermark()` 換方案 B（+ `advance_watermark()`）。
-- 進 dbt 分層：`stg_`（`stg_orders`、`stg_quality_events`）與 `int_`（`int_orders`、`int_orders_quarantine`、`int_order_items`）已落地，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md)。§5.5.5「正典欄永不覆寫、填值往 DAG 邊緣推」的鐵律已在 `int_order_items` 落實為衍生金額的**嚴格 NULL 傳播**（不 `coalesce`）。
-- `dim_/fct_` 若採 `order_date` 分區，需先做合法區間守衛——離譜的未來日期會超出 BQ 分區可接受範圍、讓整張表建立失敗（`int_` 層即因此刻意不分區）。
+- 進 dbt 分層：`stg_`（`stg_orders`、`stg_quality_events`）、`int_`（`int_orders`、`int_orders_quarantine`、`int_order_items`）、`dim_/fct_`（`dim_customer`、`dim_product`、`fct_orders`、`fct_order_items`）已落地，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md)。§5.5.5「正典欄永不覆寫、填值往 DAG 邊緣推」的鐵律已在 `int_order_items` 落實為衍生金額的**嚴格 NULL 傳播**（不 `coalesce`），並在 `fct_orders` 以 `items_missing_amount` 顯性化 rollup 的不完整性（見 §1.2）。
+- ~~`dim_/fct_` 若採 `order_date` 分區，需先做合法區間守衛~~ — **此條已於 2026-08 實測推翻，見 §1.7.3**。超出 BQ 分區合法區間的日期**不會**讓建表失敗，而是靜默落入 `__UNPARTITIONED__`。

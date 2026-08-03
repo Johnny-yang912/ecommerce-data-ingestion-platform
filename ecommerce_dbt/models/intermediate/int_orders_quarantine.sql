@@ -10,8 +10,11 @@
 --   而非「這筆被隔離的時刻」，會讓 rpt_quality_* 的時間軸失真。改取 quality_events 的
 --   event_at（initial_evaluation 事件＝真正的隔離時刻），事件缺席時退回 received_at。
 --
--- 刻意【不】按 order_date 分區：本表正是 ORDER_DATE_IN_FUTURE 髒列的收容處，
---   離譜的未來日期會超出 BQ 分區合法區間、讓整張表建立失敗。
+-- 刻意【不】按 order_date 分區：int_ 只被 DAG 內部消費（非分析師 ad-hoc），分區收益 ≈ 0。
+--   ⚠️ 早期版本另記了「本表是 ORDER_DATE_IN_FUTURE 髒列的收容處，離譜的未來日期會超出
+--      BQ 分區合法區間、讓整張表建立失敗」——【該理由經 2026-08 實測推翻】：超出
+--      1960-01-01 ~ 2159-12-31 的值不會炸表，會靜默落進 __UNPARTITIONED__ 分區
+--      （見 CLOUD_LAYER-TW §1.7.3）。不分區的決定仍然成立，但只剩上面那一條理由。
 --
 -- 物化＝table：理由同 int_orders（Proposal B 的狀態變更落在舊分區，按 received_at
 --   增量會看不到）。兩模型的物化策略必須一致，否則劃分不變式會在跑批之間破裂。

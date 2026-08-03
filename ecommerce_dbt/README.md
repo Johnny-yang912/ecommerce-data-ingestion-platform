@@ -38,7 +38,7 @@ ecommerce_dbt:
 ```bash
 dbt deps                              # install packages (dbt_utils)
 dbt run    --select stg_orders        # build the model (incremental)
-dbt run    --select stg_orders --full-refresh   # full rebuild (see §6)
+dbt run    --select stg_orders --full-refresh   # full rebuild (see §8)
 dbt test   --select stg_orders        # run tests (incl. Hard Gate)
 dbt source freshness                  # source freshness
 dbt build  --select stg_orders        # run + test together
@@ -54,7 +54,7 @@ dbt build  --select stg_orders        # run + test together
 | Reporting | `rpt_` | Fixed-grain pre-aggregation | Same as Gold |
 
 - Naming uses `stg_orders` (consistent with existing project docs), not dbt's `stg_<source>__<entity>`.
-- File layout: under `models/staging/` — `_staging__sources.yml` (source def), `stg_orders.sql`, `stg_orders.yml` (tests/descriptions); under `models/intermediate/` — the `int_*.sql` models plus a shared `_intermediate__models.yml`.
+- File layout: under `models/staging/` — `_staging__sources.yml` (source def), `stg_orders.sql`, `stg_orders.yml` (tests/descriptions); under `models/intermediate/` — the `int_*.sql` models plus a shared `_intermediate__models.yml`; under `models/marts/` — the `dim_*.sql`/`fct_*.sql` models plus `_marts__models.yml`.
 
 ## 4. Implementation Decisions (`stg_orders`)
 
@@ -141,7 +141,7 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 
 **The trigger gate is the explicit list, so it doesn't absorb drift**: `check_for_schema_changes` compares the model's produced columns (the explicit list), not the underlying staging. A column staging grew via `ALLOW_FIELD_ADDITION` is invisible until you add it to the explicit SELECT → no auto-ALTER. This option **fires only when you deliberately edit the list (into git, reviewed)**, leaving the explicit-list discipline intact.
 
-**Boundaries** (what it can't solve — still go through the §7 runbook):
+**Boundaries** (what it can't solve — still go through the §8 runbook):
 - **Historical backfill** (values needed in old partitions too, e.g. a Proposal C rebuild): it only NULL-fills old partitions and writes the lookback window → the true values in old partitions still need a targeted refresh.
 - **Type change / rename / partition change**: still `--full-refresh` / table rebuild.
 
@@ -220,7 +220,7 @@ The last row is the crux: a missed partition in `stg_` is a **delay**, in `int_`
 
 Hence the whole `int_` layer is `materialized='table'` (set as the folder default in `dbt_project.yml`). `table` uses `CREATE OR REPLACE` (DDL, atomic swap, unaffected by the sandbox DML ban — §4.3's constraint is currently moot for `int_`), and throws in two bonuses:
 
-- **No logic drift**: the table always equals "the current SQL applied to the current upstream". An incremental table's old partitions can retain rows computed by an older version of the logic, fixable only via runbook (`stg_orders` carries exactly that burden — see §4.7, §7).
+- **No logic drift**: the table always equals "the current SQL applied to the current upstream". An incremental table's old partitions can retain rows computed by an older version of the logic, fixable only via runbook (`stg_orders` carries exactly that burden — see §4.7, §8).
 - **Changing the column list is free**: no `on_schema_change` to reason about, no judgment call on whether a `--full-refresh` is needed.
 
 #### If it ever does go incremental, the hard part isn't the lookback window — it's these three
@@ -250,7 +250,7 @@ But **cost is not the first bottleneck you hit**. Two things bite earlier: ① `
 ### 5.5 No partitioning; clustering on `order_id` only
 
 - `int_` is consumed only inside the DAG (not by analysts doing ad-hoc queries), so partition pruning buys ≈ nothing; `order_date` partitioning belongs to `dim_/fct_` ([CLOUD_LAYER §1.2](../CLOUD_LAYER.md): "each table picks by its own access pattern").
-- The more concrete reason is a **landmine**: `int_orders_quarantine` is precisely where `ORDER_DATE_IN_FUTURE` rows land, and an absurd future date falls outside BigQuery's legal partition range, **failing the whole table build**. Partitioning it by `order_date` would be asking for failure. `dim_/fct_` must add a legal-range guard before enabling that partitioning.
+- ⚠️ An earlier version recorded a second "landmine" here: `int_orders_quarantine` is where `ORDER_DATE_IN_FUTURE` rows land, and an absurd future date would fall outside BigQuery's legal partition range and fail the whole table build. **That reason was disproved by measurement in 2026-08** — values outside `1960-01-01 ~ 2159-12-31` do not fail the build; they land silently in the `__UNPARTITIONED__` partition (see [CLOUD_LAYER §1.7.3](../CLOUD_LAYER.md)). So `dim_/fct_` partitioning on `order_date` needs **no** legal-range guard (§6.2), and this layer's no-partition decision rests solely on the reason above.
 
 ### 5.6 `quarantined_at`: the event time, not `CURRENT_TIMESTAMP()`
 
@@ -267,7 +267,108 @@ Flattens `ODS.items` (a JSON array) to item grain via `unnest(json_query_array(i
 - **Derived amounts use strict NULL propagation, no `coalesce`**: `net_amount = quantity × unit_price × (1 - discount_pct/100)`, NULL if any input is NULL. The rationale is [CLOUD_LAYER §5.5.5](../CLOUD_LAYER.md)'s hard rule — NULL carries information ("no discount data" ≠ "discount is 0"), and `COALESCE` is lossy and one-way: collapse it to 0 at `int_` and no downstream can ever tell "not collected" from "genuinely zero" again. If "missing = no discount" is ever confirmed, add the imputation in `dim_/fct_`, **never retrofit this layer**.
 - **`(raw_id, item_index)` is the item-grain key**: `items` is an immutable JSONB snapshot in ODS with fixed array order, so position is a stable identity; surrogate key `order_item_key = raw_id-item_index`.
 
-## 6. Testing Strategy
+## 6. Implementation Decisions (`dim_`/`fct_` layer — Star Schema)
+
+Gold uses Kimball's **header/line dual fact tables**:
+
+```
+int_orders ──────┬──► dim_customer      (SCD1)
+                 ├──► fct_orders        grain: order_id
+int_order_items ─┼──► dim_product       (SCD1)
+                 └──► fct_order_items   grain: (order_id, item_index)
+```
+
+> ⚠️ **Never join the two fact tables and aggregate measures from both** — the header's order total gets multiplied by the line count (double counting). For item detail query `fct_order_items`; for order totals query `fct_orders`.
+
+### 6.1 Measure placement: roll up into the header + an invariant test ⭐
+
+The biggest risk with dual fact tables isn't building them wrong, it's "the same number exists in two places and may disagree." Three options:
+
+| | A: roll up into `fct_orders` | B: amounts live only on the line fact | **C (chosen)** |
+|---|---|---|---|
+| "Orders and revenue this month" | single-table query | must join + group by | single-table query |
+| The two numbers disagreeing | possible (nothing guards it) | impossible (single source of truth) | **impossible (a test guards it)** |
+| Extra cost | 0 | 0 | one singular test |
+
+C it is: roll up into `fct_orders` and assert per-order equality via `assert_fct_orders_rollup_matches_items`. This is the **same move** as the `int_` layer's "deliberate duplication + `assert_orders_split_is_partition` to buy back the risk" (§5.1) — spend one test to upgrade a discipline guarantee into a mechanical one, and get single-table queryability in return.
+
+In that test, `is distinct from` (not `=`) is mandatory: amounts propagate NULL strictly, and `NULL = NULL` yields NULL rather than TRUE, so `=` would let "both sides NULL" rows be silently filtered out by the `WHERE`.
+
+#### `SUM` silently swallows the NULLs you deliberately kept ⭐
+
+The strict NULL propagation of `int_order_items` (§5.7) has a trap at the rollup: **BigQuery's `SUM()` ignores NULLs**. If a single item's `discount_pct` fails `safe_cast`, the order's `net_amount` is short by one item — **no error, no trace**.
+
+The remedy deliberately is **not** `COALESCE` (that violates the hard rule in [CLOUD_LAYER §5.5.5](../CLOUD_LAYER.md), and is lossy and one-way). Instead it makes the incompleteness **explicit**: `fct_orders.items_missing_amount` records how many of that order's items have an uncomputable amount, letting consumers decide whether the sum is trustworthy. This is exactly what §5.5.5 means by "leave imputation to `dim_/fct_`, handled per question" — we don't decide for downstream that NULL should be 0; we give it the basis to decide.
+
+Related: `item_count = 0` expresses "an order with no items" as a **value** rather than as an **absence**; `fct_orders` must `LEFT JOIN` the rollup — `INNER` would make that whole class of orders vanish from Gold.
+
+### 6.2 Partitioning and retention
+
+| Decision | `fct_*` | `dim_*` | Why |
+|---|---|---|---|
+| Partition | `order_date`(DAY) | **none** | Dimensions are reached **by key join**; a partition column prunes nothing there and only buys small-partition metadata overhead |
+| Cluster | `customer_id` / `product_id, order_id` | dimension key | Matches the actual access pattern |
+| Retention | 5 years (`var` gated) | — | DAY granularity is bounded by the 4000-partition cap (~11 years) → an explicit policy is mandatory |
+| `require_partition_filter` | ❌ off | — | Gold serves analyst ad-hoc and BI exploratory queries; turning it on makes every unfiltered one a 400 |
+
+Full reasoning — including the measured "clustering alone prunes 82%, partitioning adds 9pp" and the fuse-vs-custom-quota split — is in [CLOUD_LAYER §1.2.1](../CLOUD_LAYER.md).
+
+**`partition_expiration_days` must be `var`-gated**: the BQ sandbox hard-locks it below 60 days, so hard-coding 1825 makes every `dbt run` fail ([§1.7.2](../CLOUD_LAYER.md)). Once billing is on:
+
+```bash
+dbt run --vars '{gold_partition_expiration_days: 1825, gold_projection_window_days: 1825}'
+```
+
+Materialization stays `table` (full rebuild) for the same reason as §5.4, only **stronger**: Gold's partition axis is `order_date` (business time), completely decoupled from "when the data changed" — a 2024 order promoted by Proposal B today can never be seen by any `order_date` lookback window.
+
+### 6.3 Dimensions: build only two; SCD1 + the fact table carrying the at-the-time snapshot
+
+**Which to build** (echoing §5.3, "no speculative models"): only `dim_customer` and `dim_product`. `dim_date` (no fiscal-year/holiday requirement yet; `order_date` itself can be `date_trunc`'d), `dim_geography` (no conformed geography master; extracting it just relocates columns and joins them back — and wide tables cost little in BigQuery's columnar storage) and a junk dimension (saving row storage isn't a problem in BigQuery) are all **degenerated onto the fact tables**.
+
+**SCD strategy**: neither dimension has an independent master — attributes arrive with each order — so SCD1 with an explicit tiebreaker (without one, which of several same-day orders wins would drift with execution order).
+
+SCD1's distortion — historical orders stamped with the *current* tier — is **bought back by the fact table**: `fct_orders.membership_tier_at_order` records the tier at order time. Customer attributes carried on an order are already a point-in-time snapshot, so letting the fact table carry them gives **the type-2 effect with zero infrastructure**:
+
+- "Total spend of customers who are *currently* platinum" → join `dim_customer.membership_tier`
+- "Orders that were placed *while* platinum" → read `fct_orders.membership_tier_at_order`
+
+**SCD2 is designed but deliberately not enabled; the trigger is enabling billing.** Not because it's tedious, but because on the sandbox it **breaks**: a dbt snapshot is a stateful table, and once the 60-day table expiration eats it, it is gone for good — categorically unlike `fct_` full rebuilds, which self-heal. (Same discipline as §5.3: write the design down, implement when the trigger fires.)
+
+### 6.4 `dim_product`'s attribute conflicts: flag, don't block
+
+The same `product_id` can arrive with different `product_name`/`category`/`brand` on different orders. Measured 2026-08: **163 of 342** `product_id`s conflict, root cause being that `load_test.py` drew `product_id` and its attributes from two independent random draws (fixed — see `make_product()` in that file).
+
+Handled in three layers:
+
+1. The model uses an explicit tiebreaker to guarantee **determinism** — a conflict never breaks the grain, it just picks the latest
+2. `fct_order_items.product_name_at_order` preserves the line-level truth for comparison against the dimension
+3. `assert_product_attributes_stable` (**severity: warn**) tracks the conflict count
+
+Warn rather than error, because this is an **upstream contract signal**, not a correctness defect in this layer — if `product_id` genuinely cannot determine product attributes, the fix belongs upstream or in the data contract, not in stopping the whole DAG. Same judgement as `has_schema_drift` in the DQ doc: drift has no interception authority, only alerting. Contrast: `assert_fct_orders_*` are errors, because those test **whether our own SQL is right**.
+
+### 6.5 Key handling
+
+**Dimension keys use natural keys directly** (`customer_id`/`product_id`), no hash surrogate key: BigQuery has no indexes, so a surrogate key brings no join-performance benefit — one less key-management layer, and analysts can read it. The switch trigger is precise: **the day §6.3 becomes SCD2**, `customer_id` stops being unique and a surrogate key goes from optional to mandatory.
+
+**Fact tables carry no NULL FKs**: `customer_id`/`product_id` are both nullable in ODS, and a NULL FK makes INNER JOIN drop rows silently and LEFT JOIN render blanks in BI. So each dimension gets an unknown member (`'__UNKNOWN__'`) and the facts `coalesce` onto it.
+
+This does **not** violate §5.5.5's NULL hard rule: that rule forbids lossy collapse of **measures** in a shared layer (after `NULL→0` you can no longer tell "not collected" from "genuinely 0"); here we act on a **key**, and `'__UNKNOWN__'` reverses cleanly back to "this row has no identifier" — it is **lossless**.
+
+**`fct_order_items`' grain is `(order_id, item_index)`**, not the upstream `raw_id`: Gold faces analysts, and per the README, `raw_id` is physical identity while `order_id` is business identity. Both are UNIQUE and 1:1 in ODS, so switching loses no uniqueness; `raw_id` is retained as a lineage column but is **not** a key. The upstream surrogate key was renamed `int_order_item_key` and stops at the `int_` layer, avoiding same-name-different-value. The zero-padding in `format('%s-%03d', order_id, item_index)` makes lexical order equal numeric order (otherwise `A-10` sorts before `A-2`).
+
+`fct_order_items` also carries `customer_id`/`order_date` **down from the header** so the line fact is queryable standalone — "unit sales of a product among platinum members" shouldn't be forced to scan two tables. Carrying a few low-cardinality columns costs nearly nothing in columnar storage.
+
+### 6.6 Business rules deliberately left undefined
+
+The following three are undefined in the docs and are **deliberately not assumed** (echoing §5.3) — a fabricated assumption makes a wrong number look like a fact:
+
+| Item | What's undefined | Current handling |
+|---|---|---|
+| `tax_amount` | Is the tax base `net` or `net + shipping`? | Only `tax_pct` is exposed (**a ratio — non-additive, never SUM it**); no derived amount |
+| Net revenue | Should `returned = TRUE` orders be subtracted? | `returned` stays on the fact as a flag; downstream decides |
+| `profit_amount` | Does margin include shipping and tax? | Not built; downstream can compute `net_amount - cost_amount` |
+
+## 7. Testing Strategy
 
 | Test | Target | Severity | Notes |
 |---|---|---|---|
@@ -279,26 +380,35 @@ Flattens `ODS.items` (a JSON array) to item grain via `unnest(json_query_array(i
 | `assert_int_orders_no_unpromoted_dirty` (singular) | `int_orders` | error | **Gold contract**: no row with `has_clean_error=TRUE` that hasn't been promoted. Written as a singular test rather than a column test because it's a **conditional relation between two columns** — `has_clean_error=TRUE` is legal here (promoted records stay dirty in ODS) |
 | `accepted_values` | `effective_quality_state` on `int_orders`/`int_orders_quarantine` | error | The two tables' state domains are disjoint (`clean`/`promoted` vs `quarantined`/`permanently_rejected`), cross-checking the partition from another angle |
 | `dbt_utils.unique_combination_of_columns` + `relationships` | `int_order_items`'s `(raw_id, item_index)`, `raw_id → int_orders` | error | Item-grain uniqueness and lineage integrity |
+| **`assert_fct_orders_rollup_matches_items`** (singular) ⭐ | `fct_orders` rollup measures vs `fct_order_items` aggregates | error | **Rollup consistency invariant** (the core of §6.1 option C). Compared per order with `is distinct from` — `=` would let "both sides NULL" rows be silently filtered out by the `WHERE`. Both tables share partition settings, so no time window is needed |
+| **`assert_fct_orders_complete_projection`** (singular) ⭐ | `int_orders` (in-window) vs `fct_orders` | error | **Lossless-projection contract**: interception already happened in `int_`, so Gold must not drop a single row. Written as an anti-join over an `order_date` window rather than `count = count` — the two tables' 60-day clocks hang on different axes ([CLOUD §1.7.5](../CLOUD_LAYER.md)), so a count comparison would go flaky daily |
+| `assert_product_attributes_stable` (singular) | `product_id` → attributes on `int_order_items` | **warn** | An upstream contract signal, not a defect in this layer — if `product_id` can't determine attributes, fix upstream rather than stopping the DAG (§6.4) |
+| `unique` + `not_null` | `dim_customer`/`dim_product` dimension keys; `fct_orders.order_id`; `fct_order_items.order_item_key` | error | Dimension grain and fact surrogate-key uniqueness |
+| `relationships` | `customer_id`/`product_id` on both `fct_` tables → `dim_*`; `fct_order_items.order_id` → `fct_orders` | error | Star-schema FK integrity. Paired with `not_null` (the unknown member guarantees FKs are never NULL, §6.5) |
+| `dbt_utils.unique_combination_of_columns` | `fct_order_items`'s `(order_id, item_index)` | error | The declared grain |
 
 > Custom generic tests (and some built-in ones) need their arguments nested under `arguments:` (dbt 1.11 requirement, else `MissingArgumentsPropertyInGenericTestDeprecation`).
 
-## 7. Operational Runbook
+## 8. Operational Runbook
 
 - **When to `--full-refresh`**: changing partition/cluster, changing dedup logic, recomputing history outside the lookback window, or first-time build. Uses DDL, unaffected by the sandbox. (Applies to `stg_`'s incremental models only; `int_` is a `table` full rebuild on every run anyway.)
 - **Proposal C targeted refresh**: correction rows land in old partitions the lookback window can't see → the last step of the repair runbook does a targeted refresh of the affected partitions (`--full-refresh`, or a future single-partition `insert_overwrite`). See [CLOUD_LAYER §7.4](../CLOUD_LAYER.md), DQ C-2 #7.
 - **Before changing `int_orders` or `int_orders_quarantine`**: walk the §5.2 alignment checklist; afterwards run `dbt build --select intermediate+` and confirm `assert_orders_split_is_partition` is green.
 
-## 8. Dependencies & Versions
+## 9. Dependencies & Versions
 
 - dbt-core 1.11 / dbt-bigquery 1.11
 - `packages.yml`: `dbt-labs/dbt_utils >=1.1.0,<2.0.0` (resolves to 1.4.1)
 
-## 9. Status & TODO
+## 10. Status & TODO
 
 - ✅ `stg_orders` (dedup + Hard Gate + freshness, incremental)
 - ✅ `stg_quality_events` (deduped at `id` grain, preserving the full state-machine history)
 - ✅ `int_orders` + Row Filter, `int_orders_quarantine` (partition invariant guarded by a test)
 - ✅ `int_order_items` (items flattened to item grain)
+- ✅ `dim_customer`, `dim_product` (SCD1 + unknown member)
+- ✅ `fct_orders`, `fct_order_items` (dual fact tables; rollup consistency and lossless projection both guarded by tests)
 - ⬜ Scenario-specific `int_orders_*` (designed; enable only when a real analytical scenario appears — see §5.3)
-- ⬜ `dim_/fct_`, `rpt_quality_*`
+- ⬜ SCD2 `dim_customer` (designed; trigger = enabling billing — see §6.3)
+- ⬜ `rpt_quality_*`
 - ⬜ Proposal B (Airflow re-evaluation writing `quality_events`) — the downstream reinstatement path is ready, only the event producer is missing

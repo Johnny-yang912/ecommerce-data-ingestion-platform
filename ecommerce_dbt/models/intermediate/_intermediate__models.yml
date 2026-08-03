@@ -95,8 +95,11 @@ models:
           arguments:
             combination_of_columns: ['raw_id', 'item_index']
     columns:
-      - name: order_item_key
-        description: 代理鍵 raw_id-item_index（item 粒度唯一）。
+      - name: int_order_item_key
+        description: >
+          內部代理鍵 raw_id-item_index（item 粒度唯一）。刻意不往 Gold 帶——
+          fct_order_items 的 grain 宣告為 (order_id, item_index)，於該層另造
+          order_item_key（order_id 基底），避免同名不同值。
         tests:
           - not_null
           - unique

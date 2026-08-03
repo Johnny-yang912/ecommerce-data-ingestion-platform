@@ -559,7 +559,8 @@ Looker Studio（直連 BigQuery）
 - [v] ODS → BigQuery 抽取腳本（`extract_ods_to_bq.py`）— 以 `received_at` 為 watermark 做增量抽取（方案 A，由 `INFORMATION_SCHEMA.PARTITIONS` 推導，封裝在 `get_watermark()` 作為未來微批方案 B 的接縫）；staging 表分區（`received_at` DAY）+ 叢集（`order_id`、`has_clean_error`）+ `require_partition_filter` 保險絲；只走 batch load（不串流）、JSON 欄位以原生物件落地、`ALLOW_FIELD_ADDITION` 支援 additive schema 演進；`FIELDS` 單一真相來源由 `tests/test_schema_bq_consistency.py` 把關（見 [CLOUD_LAYER-TW.md](./CLOUD_LAYER-TW.md)）
 - [v] dbt Core `stg_` 層（`stg_orders`：`raw_id` 去重 + Hard Gate + source freshness；`stg_quality_events`：以 `id` 為 grain 去重、保留完整狀態機歷史；incremental + `insert_overwrite` + `copy_partitions`）— 見 [ecommerce_dbt/README.zh-TW.md](./ecommerce_dbt/README.zh-TW.md)
 - [v] dbt Core `int_` 層（Gold 入口，攔截發生於此）：`int_orders`（Row Filter，判定基準為「ODS 快照 ⊕ `quality_events` 最新事件」合成的**有效品質狀態**，非 `has_clean_error` 字面值）、`int_orders_quarantine`（含 `error_codes` 攤平、`quarantined_at` 取事件時間）、`int_order_items`（items 攤平到 item 粒度）。**劃分不變式**（兩表對 `stg_orders` 互斥 + 窮盡）由 singular test 把關；物化刻意採 `table` 全量重建而非 `received_at` 增量——Proposal B 的 promotion 事件落當天分區、受影響訂單卻在舊分區，增量會靜默切斷回流路徑
-- [ ] dbt Core：dim_*/fct_* → rpt_*；含 `rpt_quality_*`（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）。場景專用 `int_orders_*` 模型設計已備妥，待真實分析場景出現才啟用
+- [v] dbt Core：dim_*/fct_*（Kimball header/line 雙事實表 + 兩張 SCD1 維度，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md) §6）
+- [ ] dbt Core：rpt_*；含 `rpt_quality_*`（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）。場景專用 `int_orders_*` 與 SCD2 `dim_customer` 設計已備妥，各有明確觸發點才啟用
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — 自動化 + Queue 升級**

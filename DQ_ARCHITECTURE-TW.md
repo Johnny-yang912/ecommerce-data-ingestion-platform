@@ -39,6 +39,8 @@ dbt int_*                                      ← Gold 入口
 dbt dim_*/fct_*                                ← Gold
   職責：Star Schema，供下游彈性查詢
   品質要求：最乾淨，不含任何 has_clean_error=TRUE 的記錄
+  附註：攔截已在 int_ 做完，本層對 int_orders 應為【無損投影】——不再過濾任何一列。
+        由 assert_fct_orders_complete_projection 把關（Gold 靜默掉列是此層最危險的失效）。
 
 dbt rpt_*
   職責：固定粒度預聚合，BI Dashboard 直接使用
@@ -627,6 +629,8 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | `int_orders_quarantine` dbt model | BQ Analytics | ✅ 已完成（含 `error_codes` 攤平、`quarantined_at` 取事件時間）|
 | 劃分不變式測試（`int_orders` ∪ `int_orders_quarantine` = `stg_orders`）| BQ Analytics | ✅ 已完成（singular test，severity=error）|
 | `int_order_items`（items 攤平到 item 粒度，供 `fct_order_items`）| BQ Analytics | ✅ 已完成 |
+| `dim_customer`/`dim_product`（SCD1 + unknown member）| BQ Analytics | ✅ 已完成 |
+| `fct_orders`/`fct_order_items`（Kimball header/line 雙事實表）| BQ Analytics | ✅ 已完成（rollup 一致性 + 無損投影皆有 singular test）|
 | 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ 設計已備妥，待真實分析場景出現才啟用（見機制三的實作狀態註）|
 | Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 5——**下游回流路徑已就緒**，只等事件產生端 |
 | `rpt_quality_*` dbt 模型 | BQ Analytics | ⬜ Phase 4 |

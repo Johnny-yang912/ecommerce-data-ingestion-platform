@@ -39,6 +39,10 @@ dbt int_*                                      ← Gold entry
 dbt dim_*/fct_*                                ← Gold
   Responsibility : Star Schema, flexible ad-hoc queries for downstream consumers
   Quality requirement : Cleanest layer — no records with has_clean_error = TRUE
+  Note : interception already happened in int_, so this layer is a LOSSLESS PROJECTION
+         of int_orders — it filters nothing further. Guarded by
+         assert_fct_orders_complete_projection (silently dropping rows is this
+         layer's most dangerous failure mode).
 
 dbt rpt_*
   Responsibility : Fixed-grain pre-aggregations, optimised for BI dashboards
@@ -628,6 +632,8 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | `int_orders_quarantine` dbt model | BQ Analytics | ✅ Done (with flattened `error_codes`, `quarantined_at` from event time) |
 | Partition invariant test (`int_orders` ∪ `int_orders_quarantine` = `stg_orders`) | BQ Analytics | ✅ Done (singular test, severity=error) |
 | `int_order_items` (items flattened to item grain, for `fct_order_items`) | BQ Analytics | ✅ Done |
+| `dim_customer`/`dim_product` (SCD1 + unknown member) | BQ Analytics | ✅ Done |
+| `fct_orders`/`fct_order_items` (Kimball header/line dual fact tables) | BQ Analytics | ✅ Done (rollup consistency + lossless projection both covered by singular tests) |
 | Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Designed; enable only when a real analytical scenario appears (see the status note under Mechanism 3) |
 | Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 5 — **the downstream flow-back path is already in place**, only the event producer is missing |
 | `rpt_quality_*` dbt models | BQ Analytics | ⬜ Phase 4 |

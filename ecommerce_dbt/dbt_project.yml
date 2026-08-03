@@ -37,3 +37,26 @@ models:
       # 回看窗永遠看不到 → 被 promote 的記錄流不回 Gold（見 int_orders.sql 檔頭）。
       # table 走 CREATE OR REPLACE（DDL），不受 BQ sandbox 禁 DML 限制。
       +materialized: table
+    marts:
+      # dim_/fct_ 同樣 table 全量重建，理由同 int_ 且更強：Gold 的分區軸是 order_date
+      # （業務時間），與「資料何時變動」完全脫鉤——被 promote 的舊訂單，任何按
+      # order_date 的回看窗都永遠看不到它（見 fct_orders.sql 檔頭）。
+      +materialized: table
+
+vars:
+  # 星狀模型的 unknown member 鍵（決策 G）。事實表不留 NULL FK：INNER JOIN 會靜默
+  # 掉列、LEFT JOIN 讓 BI 顯示空白。動的是【鍵】不是【度量】，且可完整反查回
+  # 「這筆沒有識別」，是無損的——不牴觸 CLOUD_LAYER-TW §5.5.5 的 NULL 鐵律。
+  unknown_member_key: '__UNKNOWN__'
+
+  # ⚠️ Gold 分區的保留政策，預設【不輸出】。
+  # BQ sandbox 硬鎖分區過期 < 60 天，任何更長的設定會讓 job 回 billingNotEnabled
+  # 而整個 dbt run 失敗（實測見 CLOUD_LAYER-TW §1.7）。啟用帳單後打開：
+  #   dbt run --vars '{gold_partition_expiration_days: 1825}'
+  # 1825 天（5 年）避開單表 4000 分區上限（DAY 粒度約 11 年撞頂）。
+  # 注意：打開後 gold_projection_window_days 應一併改為與此一致。
+  gold_partition_expiration_days: null
+
+  # 完整投影測試的比對窗（見 tests/assert_fct_orders_complete_projection.sql）。
+  # 59 天＝sandbox 60 天硬上限留一天安全邊際。
+  gold_projection_window_days: 59

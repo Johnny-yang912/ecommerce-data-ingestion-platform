@@ -38,7 +38,7 @@ ecommerce_dbt:
 ```bash
 dbt deps                              # 安裝套件（dbt_utils）
 dbt run    --select stg_orders        # 建模型（增量）
-dbt run    --select stg_orders --full-refresh   # 全量重建（見 §6）
+dbt run    --select stg_orders --full-refresh   # 全量重建（見 §8）
 dbt test   --select stg_orders        # 跑測試（含 Hard Gate）
 dbt source freshness                  # source 新鮮度
 dbt build  --select stg_orders        # run + test 一起
@@ -54,7 +54,7 @@ dbt build  --select stg_orders        # run + test 一起
 | 報表 | `rpt_` | 固定粒度預聚合 | 同 Gold |
 
 - 命名採 `stg_orders`（沿用專案既有文件），非 dbt 官方 `stg_<source>__<entity>`。
-- 檔案組織：`models/staging/` 內 `_staging__sources.yml`（source 定義）、`stg_orders.sql`、`stg_orders.yml`（測試/描述）；`models/intermediate/` 內各 `int_*.sql` 與共用的 `_intermediate__models.yml`。
+- 檔案組織：`models/staging/` 內 `_staging__sources.yml`（source 定義）、`stg_orders.sql`、`stg_orders.yml`（測試/描述）；`models/intermediate/` 內各 `int_*.sql` 與共用的 `_intermediate__models.yml`；`models/marts/` 內各 `dim_*.sql`/`fct_*.sql` 與 `_marts__models.yml`。
 
 ## 4. 實作決策（`stg_orders`）
 
@@ -141,7 +141,7 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 
 **觸發閘門＝顯式清單，故不吃 drift**：`check_for_schema_changes` 比對的是 model 產出的欄位（顯式清單），不是底層 staging。staging 靠 `ALLOW_FIELD_ADDITION` 自動長的欄，在你把它加進顯式 SELECT 前偵測不到 → 不會自己 ALTER。此選項**只在刻意改清單（進 git、被 review）時觸發**，顯式紀律原封不動。
 
-**界線**（救不了的，仍走 §7 runbook）：
+**界線**（救不了的，仍走 §8 runbook）：
 - **歷史回填**（值要連舊分區一起有，如 Proposal C 重建）：它只 NULL 補舊分區、只寫回看窗 → 舊分區真值仍需 targeted refresh。
 - **改型別 / 改名 / 改分區**：仍 `--full-refresh` / 重建表。
 
@@ -220,7 +220,7 @@ C 方案下，`int_orders` 與 `int_orders_quarantine` 必須維持對 `stg_orde
 
 因此 `int_` 層一律 `materialized='table'`（在 `dbt_project.yml` 設為該資料夾預設）。`table` 走 `CREATE OR REPLACE`（DDL、原子替換、不受 sandbox 禁 DML 限制，§4.3 的限制對 `int_` 目前不適用），並順帶換到兩個好處：
 
-- **不會有邏輯漂移**：表永遠等於「現在的 SQL 套在現在的上游」。增量表的舊分區可能留著用舊版邏輯算出的列，得靠 runbook 補（`stg_orders` 就有這個包袱，見 §4.7、§7）。
+- **不會有邏輯漂移**：表永遠等於「現在的 SQL 套在現在的上游」。增量表的舊分區可能留著用舊版邏輯算出的列，得靠 runbook 補（`stg_orders` 就有這個包袱，見 §4.7、§8）。
 - **改欄位清單零成本**：不需要 `on_schema_change`、不需要判斷該不該 `--full-refresh`。
 
 #### 真要改增量，難的不是回看窗，是這三件事
@@ -250,7 +250,7 @@ sandbox 的 1 TiB/月免費額度，在日批下約撐到 **1,500–2,000 萬筆
 ### 5.5 不分區，叢集只掛 `order_id`
 
 - `int_` 只被 DAG 內部消費（非分析師 ad-hoc 查詢），分區收益 ≈ 0；`order_date` 分區留給 `dim_/fct_`（[CLOUD_LAYER-TW §1.2](../CLOUD_LAYER-TW.md)「每張表依自己的 access pattern 各自選」）。
-- 更實際的理由是一個**地雷**：`int_orders_quarantine` 正是 `ORDER_DATE_IN_FUTURE` 髒列的收容處，離譜的未來日期會超出 BQ 分區合法區間、**讓整張表建立失敗**。按 `order_date` 分區等於自找失敗。`dim_/fct_` 啟用該分區時需先做合法區間守衛。
+- ⚠️ 早期版本在此另記了一個「地雷」：`int_orders_quarantine` 是 `ORDER_DATE_IN_FUTURE` 髒列的收容處，離譜的未來日期會超出 BQ 分區合法區間、讓整張表建立失敗。**該理由已於 2026-08 實測推翻**——超出 `1960-01-01 ~ 2159-12-31` 的值不會炸表，會靜默落進 `__UNPARTITIONED__` 分區（見 [CLOUD_LAYER-TW §1.7.3](../CLOUD_LAYER-TW.md)）。故 `dim_/fct_` 採 `order_date` 分區**不需要**合法區間守衛（§6.2），而本層不分區的決定只剩上面那一條理由。
 
 ### 5.6 `quarantined_at`：取事件時間，非 `CURRENT_TIMESTAMP()`
 
@@ -267,7 +267,108 @@ DQ 文件早期範例寫 `CURRENT_TIMESTAMP() AS quarantined_at`。在 `table` �
 - **衍生金額採嚴格 NULL 傳播，不 `coalesce`**：`net_amount = quantity × unit_price × (1 - discount_pct/100)`，任一輸入為 NULL 則結果 NULL。理由是 [CLOUD_LAYER-TW §5.5.5](../CLOUD_LAYER-TW.md) 的鐵律——NULL 帶資訊（「沒有折扣資料」≠「折扣為 0」），`COALESCE` 有損且單向，一旦在 `int_` 壓成 0，全下游再也分不出「沒收集」與「真的是 0」。若日後確認「缺值＝無折扣」，補值加在 `dim_/fct_`，**不回頭改本層**。
 - **`(raw_id, item_index)` 是 item 粒度鍵**：`items` 在 ODS 內是不可變的 JSONB 快照、陣列順序固定，故位置可作為穩定身分；代理鍵 `order_item_key = raw_id-item_index`。
 
-## 6. 測試策略
+## 6. 實作決策（`dim_`/`fct_` 層 — 星狀模型）
+
+Gold 採 **Kimball header/line 雙事實表**：
+
+```
+int_orders ──────┬──► dim_customer      (SCD1)
+                 ├──► fct_orders        grain: order_id
+int_order_items ─┼──► dim_product       (SCD1)
+                 └──► fct_order_items   grain: (order_id, item_index)
+```
+
+> ⚠️ **不得 join 兩張事實表後同時聚合兩邊的度量**——header 的訂單總額會被 line 的列數放大（重複計算）。要 item 明細查 `fct_order_items`，要訂單總額查 `fct_orders`。
+
+### 6.1 度量分配：rollup 進 header + 不變式測試 ⭐
+
+雙事實表最大的風險不是建錯，是「同一個數字存在兩處、可能不一致」。三個方案：
+
+| | A：rollup 進 `fct_orders` | B：金額只放 line fact | **C（選用）** |
+|---|---|---|---|
+| 「本月訂單數 × 總營收」 | 單表查 | 必須 join + group by | 單表查 |
+| 兩處數字不一致 | 可能（無人把關） | 不可能（單一事實來源） | **不可能（測試把關）** |
+| 額外成本 | 0 | 0 | 一支 singular test |
+
+選 C：rollup 進 `fct_orders`，並以 `assert_fct_orders_rollup_matches_items` 逐單斷言。這與 `int_` 層「刻意複製共用區塊 + `assert_orders_split_is_partition` 買回風險」（§5.1）是**同一個手法**——用一支測試把紀律保證升級成機制保證，換取查詢便利。
+
+測試中 `is distinct from`（而非 `=`）不可省：金額是嚴格 NULL 傳播的，`NULL = NULL` 結果是 NULL 而非 TRUE，用 `=` 會讓「兩邊都 NULL」的列被 `WHERE` 靜默濾掉。
+
+#### `SUM` 會靜默吃掉刻意保留的 NULL ⭐
+
+`int_order_items` 的嚴格 NULL 傳播（§5.7）到了 rollup 這裡有個陷阱：**BQ 的 `SUM()` 忽略 NULL**。一筆訂單裡只要有一個 item 的 `discount_pct` `safe_cast` 失敗，`net_amount` 就少算一個品項，**不報錯、不留痕跡**。
+
+處置刻意**不** `COALESCE`（那違反 [CLOUD_LAYER-TW §5.5.5](../CLOUD_LAYER-TW.md) 的鐵律，且有損單向），改成把不完整性**顯性化**：`fct_orders.items_missing_amount` 記錄該訂單有幾個品項的金額算不出來，讓下游自己判斷這個加總可不可信。這正是 §5.5.5 所謂「填值決定留到 `dim_/fct_` 依問題處理」的正確落點——我們不替下游決定 NULL 該當 0，而是給它判斷的依據。
+
+附帶：`item_count = 0` 讓「沒有任何品項的訂單」以**值**表達而非以**缺席**表達；`fct_orders` 對 `item_rollup` 必須 `LEFT JOIN`，`INNER` 會讓那類訂單整批從 Gold 消失。
+
+### 6.2 分區與保留政策
+
+| 決策 | `fct_*` | `dim_*` | 理由 |
+|---|---|---|---|
+| 分區 | `order_date`(DAY) | **不分區** | 維度是**按鍵 join** 進來的，分區對 join 沒有裁切作用，只換來小分區與 metadata 開銷 |
+| 叢集 | `customer_id` / `product_id, order_id` | 維度鍵 | 對齊實際 access pattern |
+| 保留 | 5 年（`var` gated） | — | DAY 粒度受 4000 分區上限約束（約 11 年）→ 必須有明確政策 |
+| `require_partition_filter` | ❌ 不上 | — | Gold 服務分析師 ad-hoc 與 BI 探索式查詢，開了就是一律 400 |
+
+完整論證（含「clustering 單獨已裁掉 82%、分區再拿 9pp」的實測，以及保險絲 vs custom quota 的分工）見 [CLOUD_LAYER-TW §1.2.1](../CLOUD_LAYER-TW.md)。
+
+**`partition_expiration_days` 必須 `var` gated**：BQ sandbox 硬鎖 < 60 天，寫死 1825 會讓每次 `dbt run` 失敗（[§1.7.2](../CLOUD_LAYER-TW.md)）。啟用帳單後：
+
+```bash
+dbt run --vars '{gold_partition_expiration_days: 1825, gold_projection_window_days: 1825}'
+```
+
+物化仍是 `table` 全量重建，理由同 §5.4 **且更強**：Gold 的分區軸是 `order_date`（業務時間），與「資料何時變動」完全脫鉤——一筆 2024 年的訂單今天被 Proposal B promote，任何按 `order_date` 的回看窗都永遠看不到它。
+
+### 6.3 維度：只建兩張，SCD1 + 事實表承載當下快照
+
+**建哪些**（呼應 §5.3「不建投機性 model」）：只建 `dim_customer` 與 `dim_product`。`dim_date`（目前沒有財年/節慶需求，`order_date` 本身可 `date_trunc`）、`dim_geography`（沒有 conformed 地理主檔，抽出來只是把欄位搬家再 join 回來；BQ 列式儲存下寬表不吃虧）、junk dimension（省 row storage 在 BQ 不是問題）**一律 degenerate 到事實表**。
+
+**SCD 策略**：兩張維度都沒有獨立主檔，屬性隨訂單帶進來，故 SCD1 + 明確決勝鍵（少了決勝鍵，同日多筆訂單誰勝出會隨執行順序漂移）。
+
+SCD1 的失真——歷史訂單被貼上「現在的」等級——**用事實表補回來**：`fct_orders.membership_tier_at_order` 記錄下單當時的等級。訂單裡帶的顧客屬性本來就是下單當下的快照，用事實表承載它等於**零基建拿到 type-2 的效果**：
+
+- 「白金會員**現在**的總消費」→ join `dim_customer.membership_tier`
+- 「下單**當時**是白金的訂單」→ 直接讀 `fct_orders.membership_tier_at_order`
+
+**SCD2 為備妥但未啟用的設計，觸發點＝啟用帳單。** 不是因為麻煩，是因為在 sandbox 上它**會壞掉**：dbt snapshot 是有狀態表，被 60 天表過期吃掉就再也回不來，與 `fct_` 全量重建能自癒的性質完全不同。（同 §5.3 的紀律：設計寫下來，等觸發點到了才實作。）
+
+### 6.4 `dim_product` 的屬性衝突：標記，不阻擋
+
+同一個 `product_id` 可能在不同訂單帶著不同的 `product_name`/`category`/`brand`。2026-08 實測 342 個 `product_id` 中 **163 個衝突**，根因是 `load_test.py` 對 `product_id` 與其屬性各抽一次獨立亂數（已修，見該檔 `make_product()`）。
+
+處置分三層：
+
+1. 模型用明確決勝鍵保證**確定性**——衝突不會讓 grain 破裂，只會挑最新的
+2. `fct_order_items.product_name_at_order` 保留 line 級真值，可與維度對照
+3. `assert_product_attributes_stable`（**severity: warn**）監控衝突數
+
+warn 而非 error，因為這是**上游契約訊號**而非本層的正確性缺陷——`product_id` 若真的無法唯一決定商品屬性，該修的是上游或 data contract，不是讓整條 DAG 停下來。判斷邏輯與 DQ 文件的 `has_schema_drift`「沒有攔截權限、只能告警」一致。對照組：`assert_fct_orders_*` 是 error，因為那些測的是**我們自己的 SQL 對不對**。
+
+### 6.5 鍵的處理
+
+**維度鍵用 natural key 直連**（`customer_id`/`product_id`），不做 hash surrogate key：BQ 沒有 index，surrogate key 不帶 join 效能收益，少一層 key 管理、分析師直接看得懂。切換觸發點很明確——**§6.3 改成 SCD2 的那天**，`customer_id` 不再唯一，surrogate key 就從可選變成必要。
+
+**事實表不留 NULL FK**：`customer_id`/`product_id` 在 ODS 皆 nullable，而 NULL FK 會讓 INNER JOIN 靜默掉列、LEFT JOIN 讓 BI 顯示空白。故維度各補一筆 unknown member（`'__UNKNOWN__'`），事實表 `coalesce` 到它。
+
+這**不**牴觸 §5.5.5 的 NULL 鐵律：鐵律禁止的是在共享層對**度量**做有損 collapse（`NULL→0` 之後分不出「沒收集」與「真的是 0」）；這裡動的是**鍵**，且 `'__UNKNOWN__'` 可完整反查回「這筆沒有識別」，是**無損**的。
+
+**`fct_order_items` 的 grain 用 `(order_id, item_index)`**，不沿用上游的 `raw_id`：Gold 面向分析師，README〈`raw_id` 是物理身分、`order_id` 是業務身分〉。兩者在 ODS 皆 UNIQUE、1:1，改用 `order_id` 不損失唯一性；`raw_id` 保留為血緣欄位但**不是鍵**。上游那支代理鍵已改名 `int_order_item_key` 並停在 `int_` 層，避免同名不同值。代理鍵 `format('%s-%03d', order_id, item_index)` 的補零讓字典序＝數值序（否則 `A-10` 會排在 `A-2` 前）。
+
+`fct_order_items` 另把 order 層的 `customer_id`/`order_date` **一路帶下來**，讓 line fact 能獨立查詢——「某商品在白金會員間的銷量」不該被迫掃兩張表。BQ 列式下多帶低基數欄位近乎零成本。
+
+### 6.6 尚未定義的業務規則（刻意不做假設）
+
+以下三項文件裡沒有定義，**刻意不憑空假設**（呼應 §5.3）——憑空假設會讓一個錯誤的數字看起來像事實：
+
+| 項目 | 未定義的是什麼 | 目前處置 |
+|---|---|---|
+| `tax_amount` | 稅基是 `net` 還是 `net + shipping`？ | 只放 `tax_pct`（**比率，不可加，不要 SUM**），不衍生金額 |
+| 淨營收 | `returned = TRUE` 的訂單要不要扣掉？ | `returned` 留在事實表當 flag，由下游決定 |
+| `profit_amount` | 毛利要不要含運費與稅？ | 不做；`net_amount - cost_amount` 下游自行計算 |
+
+## 7. 測試策略
 
 | 測試 | 對象 | severity | 說明 |
 |---|---|---|---|
@@ -279,26 +380,35 @@ DQ 文件早期範例寫 `CURRENT_TIMESTAMP() AS quarantined_at`。在 `table` �
 | `assert_int_orders_no_unpromoted_dirty`（singular）| `int_orders` | error | **Gold 契約**：不得含 `has_clean_error=TRUE` 且未被 promote 的列。寫成 singular 而非欄位測試，因為它是**兩欄之間的條件關係**——`has_clean_error=TRUE` 本身在此表合法（promoted 記錄在 ODS 仍是髒的）|
 | `accepted_values` | `int_orders`/`int_orders_quarantine` 的 `effective_quality_state` | error | 兩表的狀態值域互斥（`clean`/`promoted` vs `quarantined`/`permanently_rejected`），等於從另一角度覆核劃分 |
 | `dbt_utils.unique_combination_of_columns` + `relationships` | `int_order_items` 的 `(raw_id, item_index)`、`raw_id → int_orders` | error | item 粒度唯一性與血緣完整性 |
+| **`assert_fct_orders_rollup_matches_items`**（singular）⭐ | `fct_orders` 的 rollup 度量 vs `fct_order_items` 聚合 | error | **rollup 一致性不變式**（§6.1 方案 C 的核心）。逐單以 `is distinct from` 比對——用 `=` 會讓「兩邊都 NULL」的列被 `WHERE` 靜默濾掉。兩表分區設定相同，故不需加時間窗 |
+| **`assert_fct_orders_complete_projection`**（singular）⭐ | `int_orders`（窗內）vs `fct_orders` | error | **無損投影契約**：攔截已在 `int_` 做完，Gold 不得再掉任何一列。寫成反向 join + `order_date` 窗而非 `count = count`——兩表的 60 天時鐘掛在不同軸上（[CLOUD §1.7.5](../CLOUD_LAYER-TW.md)），count 比對會變成每天 flaky |
+| `assert_product_attributes_stable`（singular）| `int_order_items` 的 `product_id` → 屬性 | **warn** | 上游契約訊號，非本層缺陷——`product_id` 無法唯一決定屬性時該修上游，不該停 DAG（§6.4）|
+| `unique` + `not_null` | `dim_customer`/`dim_product` 的維度鍵；`fct_orders.order_id`；`fct_order_items.order_item_key` | error | 維度 grain 與事實表代理鍵唯一性 |
+| `relationships` | 兩張 `fct_` 的 `customer_id`/`product_id` → `dim_*`；`fct_order_items.order_id` → `fct_orders` | error | 星狀模型的 FK 完整性。配 `not_null`（unknown member 保證 FK 不為 NULL，§6.5）|
+| `dbt_utils.unique_combination_of_columns` | `fct_order_items` 的 `(order_id, item_index)` | error | 宣告的 grain |
 
 > 自訂 generic test 與部分內建測試的參數需巢狀在 `arguments:` 下（dbt 1.11 要求，否則 `MissingArgumentsPropertyInGenericTestDeprecation`）。
 
-## 7. 常見操作 runbook
+## 8. 常見操作 runbook
 
 - **何時 `--full-refresh`**：改分區/叢集、改去重邏輯、回看窗外的歷史需重算、或首次建表。走 DDL、不受 sandbox 限制。（僅適用 `stg_` 的增量模型；`int_` 為 `table` 全量重建，每次 run 本就重建。）
 - **Proposal C targeted refresh**：修正列落在舊分區、回看窗看不到 → 修復 runbook 最後一步對災區分區做 targeted refresh（`--full-refresh` 或未來對單分區 `insert_overwrite`）。見 [CLOUD_LAYER-TW §7.4](../CLOUD_LAYER-TW.md)、DQ C-2 #7。
 - **改動 `int_orders` 或 `int_orders_quarantine` 前**：先過一遍 §5.2 對齊清單；改完跑 `dbt build --select intermediate+`，確認 `assert_orders_split_is_partition` 為綠。
 
-## 8. 相依與版本
+## 9. 相依與版本
 
 - dbt-core 1.11 / dbt-bigquery 1.11
 - `packages.yml`：`dbt-labs/dbt_utils >=1.1.0,<2.0.0`（實裝 1.4.1）
 
-## 9. 現況與待辦
+## 10. 現況與待辦
 
 - ✅ `stg_orders`（去重 + Hard Gate + freshness，增量）
 - ✅ `stg_quality_events`（以 `id` 為 grain 去重，保留完整狀態機歷史）
 - ✅ `int_orders` + Row Filter、`int_orders_quarantine`（劃分不變式有測試把關）
 - ✅ `int_order_items`（items 攤平到 item 粒度）
+- ✅ `dim_customer`、`dim_product`（SCD1 + unknown member）
+- ✅ `fct_orders`、`fct_order_items`（雙事實表；rollup 一致性與無損投影皆有測試把關）
 - ⬜ 場景專用 `int_orders_*`（設計已備妥，待真實分析場景出現才啟用——見 §5.3）
-- ⬜ `dim_/fct_`、`rpt_quality_*`
+- ⬜ SCD2 `dim_customer`（設計已備妥，觸發點＝啟用帳單——見 §6.3）
+- ⬜ `rpt_quality_*`
 - ⬜ Proposal B（Airflow 重評估寫 `quality_events`）——下游回流路徑已就緒，只等事件產生端

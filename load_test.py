@@ -23,13 +23,42 @@ PAYMENTS      = ["credit_card", "paypal", "bank_transfer", "cash_on_delivery"]
 SHIP_MODES    = ["Standard Class", "Second Class", "First Class", "Same Day"]
 STATUSES      = ["Shipped", "Pending", "Delivered", "Cancelled"]
 CATEGORIES    = ["Electronics", "Clothing", "Food", "Books", "Sports"]
+SUB_CATEGORIES = ["General", "Premium", "Budget", "Seasonal"]
+BRANDS        = ["LoadTestBrand", "Acme", "Globex", "Initech", "Umbrella"]
+CONDITIONS    = ["New", "Refurbished", "Open Box"]
 STATES        = ["Taipei", "Kaohsiung", "Taichung", "Tainan", "Hsinchu"]
+
+# order_date 的回溯窗。必須 < BQ sandbox 的 60 天分區過期，且要讓 order_date 貼近
+# received_at——Gold 的 fct_* 按 order_date 分區、staging/stg_ 按 received_at 分區，
+# 兩個 60 天時鐘掛在不同軸上，只有兩軸對齊時「fct 與 int 內容一致」才成立。
+# 舊版寫死 date(2024, 1, 1)，與 received_at 相差平均 410 天 → 新灌的資料一進 Gold
+# 就被分區過期回收（見 CLOUD_LAYER-TW §1.7）。
+ORDER_DATE_LOOKBACK_DAYS = 45
+
+
+def make_product(pid_num: int) -> dict:
+    """商品屬性一律由 product_id 決定（以 product_id 為 seed），不吃訂單的 rng。
+
+    舊版對 product_id 與 product_name/category 各抽一次亂數，同一個 product_id 會
+    在不同訂單帶著不同的名稱與分類（實測 342 個 id 裡 163 個衝突）——那讓
+    dim_product 無法以 product_id 為 grain 建立。商品屬性屬於商品本身，不屬於訂單。
+    """
+    prng = random.Random(f"product-{pid_num}")
+    return {
+        "product_id":   f"PROD-{pid_num:04d}",
+        "product_name": f"Product {pid_num}",
+        "category":     prng.choice(CATEGORIES),
+        "sub_category": prng.choice(SUB_CATEGORIES),
+        "brand":        prng.choice(BRANDS),
+        "condition":    prng.choice(CONDITIONS),
+    }
 
 
 def make_payload(i: int) -> dict:
     rng = random.Random(i)  # 固定 seed 讓每次跑結果可重現
 
-    order_date    = date(2024, 1, 1) + timedelta(days=rng.randint(0, 364))
+    # 貼近 received_at（見 ORDER_DATE_LOOKBACK_DAYS）
+    order_date    = date.today() - timedelta(days=rng.randint(0, ORDER_DATE_LOOKBACK_DAYS))
     delivery_date = order_date + timedelta(days=rng.randint(1, 14))
 
     return {
@@ -61,14 +90,7 @@ def make_payload(i: int) -> dict:
         },
         "items": [
             {
-                "product": {
-                    "product_id":   f"PROD-{rng.randint(1, 500):04d}",
-                    "product_name": f"Product {rng.randint(1, 500)}",
-                    "category":     rng.choice(CATEGORIES),
-                    "sub_category": "General",
-                    "brand":        "LoadTestBrand",
-                    "condition":    "New",
-                },
+                "product":      make_product(rng.randint(1, 500)),
                 "quantity":     rng.randint(1, 10),
                 "unit_price":   round(rng.uniform(10.0, 500.0), 2),
                 "cost_price":   round(rng.uniform(5.0, 200.0), 2),

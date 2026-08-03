@@ -22,9 +22,44 @@ Staging is populated by the extraction script via a batch load job. BigQuery's s
 
 The rule for choosing a partition column is "pick the column that the table's most frequent, most expensive queries filter on." Staging's access pattern is **pipeline incremental** (both the extraction watermark and dbt incremental filter on `received_at`), so it partitions by `received_at`, letting each run scan only the new partition (partition pruning).
 
-> **`received_at` vs `order_date`**: staging serves the pipeline, so it partitions by ingestion time `received_at`; downstream Gold (`dim_/fct_`) serves analysts whose monthly/weekly aggregates filter by the business time `order_date`, so that layer partitions by `order_date` instead. The partition column is chosen per table, according to its own access pattern.
+> **`received_at` vs `order_date`**: staging serves the pipeline, so it partitions by ingestion time `received_at`; downstream Gold (`dim_/fct_`) serves analysts whose monthly/weekly aggregates filter by the business time `order_date`, so that layer partitions by `order_date` instead. The partition column is chosen per table, according to its own access pattern. **The full Gold-side decision is §1.2.1 below** — it is not this section copied over: each of the four decisions has its own reasoning, and two of them come out the opposite way.
 
 DAY granularity over HOUR: batches are T+1 / hourly; and with a 4000-partition-per-table cap, DAY lasts ~11 years while HOUR lasts only 166 days.
+
+### 1.2.1 Partitioning Decisions for Gold (`dim_/fct_`) ⭐
+
+Four decisions, each contrasted with staging:
+
+| Decision | staging | Gold `fct_*` | Gold `dim_*` | Why they differ |
+|---|---|---|---|---|
+| Partition column | `received_at` | **`order_date`** | **none** | Facts serve analysts filtering on business time; dimensions are reached **by key join**, where a partition column prunes nothing and only buys small-partition metadata overhead |
+| Granularity | DAY | DAY | — | Same as §1.2 |
+| Retention | 60 days (sandbox-forced) | **5 years** (`var` gated) | — | Gold keeps full history, but DAY granularity is bounded by the 4000-partition cap (~11 years) → an explicit retention policy is mandatory, or year 11 hits the ceiling |
+| `require_partition_filter` | ✅ on | ❌ **off** | — | See below |
+
+#### Why Gold does not get the cost fuse
+
+Staging turns it on at zero cost (§1.4: every access already carries `received_at`). But Gold serves analyst ad-hoc queries and Looker Studio's **exploratory** queries, and those frequently carry no date filter at all — with the fuse on, every one of them is a 400. This is the same tension as the "fuse contagion" argument in the dbt README §4.6, except it now lands at the very bottom of the DAG and faces humans rather than pipelines.
+
+The cost is giving up "catch a single accidental full scan." The replacement is BigQuery **custom quota** (per-user / per-project daily scan cap). These two guard **different things**: the fuse guards a single mistake (every query is asked "did you filter?"), quota guards systematic abuse (only cumulative overrun blocks). For a layer opened up to analyst exploration, the latter is the right shape.
+
+#### How much does partitioning actually save: measured (2026-08, 540 rows)
+
+Two tables over identical data, running the typical analyst query "last-30-day slice":
+
+| | totalBytesProcessed | vs. full table |
+|---|---|---|
+| Full table | 68,856 B | 100% |
+| `cluster by order_date` only | 12,474 B | **18%** |
+| `partition by order_date` + cluster | 6,490 B | 9% |
+
+**Clustering alone pruned 82%; partitioning adds 9 more percentage points.** So the common claim "partitioning saves a lot of money" needs correcting — partitioning's value is not the pruning volume but the three things clustering cannot give:
+
+1. **Cost predictability**: partition pruning is decided from metadata before the query runs, so `dry run` byte counts are exact; clustering prunes at block level depending on data layout, so `dry run` over-estimates. Cost governance depends on the former.
+2. **The prerequisite for `require_partition_filter`**: only a partitioned table can have it (even though Gold chooses not to).
+3. **Partition-level operations**: `insert_overwrite`'s atomic whole-partition replace, single-partition targeted refresh — the entire `stg_` runbook rests on this.
+
+> Aside: BigQuery bills a **10 MB minimum per table per query**, so at this project's current data volume both variants cost exactly the same. Partitioning's benefit only holds under the "assume tens to hundreds of millions of rows" premise — a premise deliberately declared (this project is a practice simulation), not an empirical finding. For the extrapolation see the per-row cost table in the dbt README §5.4.
 
 ### 1.3 Clustering: `order_id` + `has_clean_error`
 
@@ -56,7 +91,99 @@ Its table design **does not copy orders**, because the access pattern is the opp
 
 > **Cross-table consistency: see §3.2** — the two tables extract independently, with independent watermarks and independent load jobs; how "orders landed but `quality_events` didn't" is prevented is covered there.
 
-> **60-day expiration cap (sandbox limit)**: because this is a practice project with billing disabled, it runs on a BQ sandbox, which forces a 60-day partition + table expiration on the dataset that `quality_events` inherits; so the "latest across all history" assumption is in practice capped at 60 days on the sandbox — an account-level limit (setting `expiration=None` in the script is ignored by the sandbox), lifted only once billing is enabled.
+> **60-day expiration cap (sandbox limit)**: because this is a practice project with billing disabled, it runs on a BQ sandbox, which forces a 60-day partition + table expiration on the dataset that `quality_events` inherits; so the "latest across all history" assumption is in practice capped at 60 days on the sandbox — an account-level limit (setting `expiration=None` in the script is ignored by the sandbox), lifted only once billing is enabled. **Full measurements in §1.7**; the consequences of this limit are far more severe once Gold partitions on a business time axis.
+
+### 1.7 Sandbox Partition Expiration: Measurement Record (2026-08) ⭐
+
+§1.6 recorded only "`expiration=None` is ignored." But once Gold partitions on a **business time axis**, the consequences of this limit are entirely different, so here is the full measurement. **Every item below was measured, not inferred.**
+
+#### 1.7.1 Expiration is computed from the partition's date value, not the build time
+
+All datasets (`staging`, `dbt_dev`) carry `default_partition_expiration_ms = 5184000000` (60 days), and every existing partitioned table inherits it. Measured: create a `partition by order_date` table and CTAS five dates straddling the 60-day boundary in one statement —
+
+| Partition | Result |
+|---|---|
+| 2024-01-01 | **rows=0, gone** |
+| 2026-05-01 (94 days ago) | **rows=0, gone** |
+| 2026-06-04 (on the boundary) | rows=1 ✅ |
+| 2026-07-01 (33 days ago) | rows=1 ✅ |
+| 2026-08-03 (today) | rows=1 ✅ |
+
+Three key behaviours: **① the build does not fail** (`CREATE OR REPLACE` returns success); **② a "2024-01-01" partition is already past 60 days at the instant it is born**; **③ deletion is synchronous and immediate** — querying right after the CTAS returns, both old partitions are already absent from `INFORMATION_SCHEMA.PARTITIONS`, and even the `num_rows` metadata reads 3 rather than 5. No warning.
+
+> `stg_orders` never hit this purely because it partitions on `received_at`, and ingestion time is always recent. **Switch to a business time axis and that protection disappears.**
+
+#### 1.7.2 The expiration ceiling is hard-locked at 60 days; all four routes are closed
+
+| Attempt | Result |
+|---|---|
+| DDL `options(partition_expiration_days = 3650)` | ❌ job fails |
+| DDL `options(partition_expiration_days = NULL)` | ⚠️ **no error, silently rewritten to 60 days** |
+| API: set `table.time_partitioning.expiration_ms` | ❌ 403 |
+| API: set dataset `default_partition_expiration_ms` | ❌ 403 |
+
+Verbatim error:
+
+```
+reason: billingNotEnabled
+Partition expiration time must be less than 60 days while in sandbox mode.
+```
+
+**This is why `gold_partition_expiration_days` must be `var`-gated and emit nothing by default** — hard-coding 1825 makes every `dbt run` fail and skips everything downstream in a `dbt build`.
+
+> **A leak worth knowing about but not using**: the `partition_expiration_days = 3650` DDL actually **half-succeeds** — the job is marked failed (`state=DONE`, `error_result.reason=billingNotEnabled`), yet the table is created, `expiration_ms` really is 3650 days, the old rows survive and are queryable, and they are still there 60 seconds later. Enforcement sits at the **job validation layer** and the DDL's side effect slips past it. Unusable: a failed job is a failed dbt run; and this is an enforcement gap rather than a supported path, so once Google closes it the table starts being reaped silently.
+
+#### 1.7.3 Out-of-range dates land silently in `__UNPARTITIONED__` — they do **not** fail the build
+
+**This item overturns the previous claim in §8 of this document** (originally: "absurd future dates fall outside BigQuery's acceptable partition range and fail the whole table build"). Measured:
+
+```
+partition_id=20260803           rows=1
+partition_id=21591231           rows=1
+partition_id=__UNPARTITIONED__  rows=3   ← 1959-12-31 / 2160-01-01 / 9999-12-31
+build succeeded; all 5 rows survive and are queryable
+```
+
+Values outside `1960-01-01 ~ 2159-12-31` raise no error and go silently into `__UNPARTITIONED__`. Knock-on effect: those rows likewise **escape the 60-day reaper**, and can never be pruned by partition pruning.
+
+So `dim_/fct_` partitioning on `order_date` needs **no** legal-range guard. (The decision to leave `int_orders_quarantine` unpartitioned still stands, but only on the "`int_` is consumed inside the DAG, partition benefit ≈ 0" reason.)
+
+#### 1.7.4 The `__NULL__` partition escapes the reaper
+
+`order_date` is nullable in ODS. NULLs land in BigQuery's `__NULL__` partition, which has no date and therefore no computable expiration, so it is **never reaped** — in the measurement it was written in the same batch as 2024-01-01, which vanished on the spot while it survived. Consequence: orders without an `order_date` outlive those with one in `fct_orders`. Current data has 0 NULLs, but the schema permits them.
+
+#### 1.7.5 Two 60-day clocks on different axes ⭐
+
+Of everything above, this is the one with the biggest impact on **test design**:
+
+```
+int_orders ← stg_orders ← staging.orders    expires by received_at
+fct_orders / fct_order_items                expires by order_date
+```
+
+So the invariant "`fct_orders`' content == `int_orders`' content" **cannot be written as `count(*) = count(*)`**: the two tables have structurally different retention, so even a green result means "the two reapers happened to agree," not "the SQL is right." Worse, reaping is not synchronized — `fct_orders` is `CREATE OR REPLACE` and reaps synchronously; `stg_orders` is incremental and its old partitions are reaped asynchronously by BigQuery's background reaper — so boundary days are guaranteed to disagree, turning the test into one that goes red for a stretch every single day.
+
+The fix is to **anchor the invariant on an `order_date` window** (anti-join; see `tests/assert_fct_orders_complete_projection.sql`) and to make `load_test.py` generate `order_date ≈ received_at` (see `ORDER_DATE_LOOKBACK_DAYS` in that file) so the two axes line up. **The old generator hard-coded `order_date` into 2024, an average of 410 days away from `received_at`; that would make every newly loaded row get reaped the moment it reaches Gold, leaving the test permanently red.**
+
+#### 1.7.6 The BQ side is a rolling 60-day *ingestion* window; ODS cannot be backfilled ⭐
+
+The five items above are about how partitions get reaped. This one is about what that does to the **shape of the whole pipeline** — **the most easily forgotten item here, and the one most likely to mislead a future decision.**
+
+The extraction script writes ODS's `received_at` **verbatim** as the partition column (see `FIELDS` and `partition_field` in `extract_ods_to_bq.py`). Therefore:
+
+> **Any ODS row whose `received_at` is older than 60 days will be reaped the moment it lands, no matter how many times it is re-extracted.**
+
+ODS remains a permanent, complete anchor in PostgreSQL (`raw`/`ods`/`quality_events` lose nothing). But **on the BQ side the pipeline is structurally a rolling 60-day ingestion window** — not "keeps the last 60 days of data" but "can only hold data *ingested* in the last 60 days." The only route for historical data to reach BQ is **re-ingestion** (producing a fresh `received_at`), not re-extraction.
+
+Three direct corollaries:
+
+1. **"Just clear BQ staging and re-extract" is an ineffective shortcut.** `get_watermark()` will find no partitions, return `None` and trigger a full extract (§2.1), but the old rows evaporate on landing exactly as before — the end state is identical to before the clear. The only way to get data into BQ is to load new data.
+
+2. **Once staging empties, extraction silently degrades to "full ODS scan every run" — and reports success.** The watermark stays `None`, so every run is a full extract; the load job reports `output_rows = <all ODS rows>`, and **the E/L gate only checks whether the load job raised, with no post-load `SELECT COUNT(*)` verification** (§3.2). The result is a **lying green light**: "loaded N rows successfully" every run while the table stays empty. Guarding against this needs a post-load row-count check in the gate (not implemented today).
+
+3. **`dbt source freshness` goes red before anything else does.** With `error_after: 50 hours`, it is ERROR STALE roughly two days after ingestion stops — long before partitions start being reaped. It is not part of `dbt build` today (it's a separate command), so `build` can be fully green while freshness has been red for weeks — **and when Phase 5 wires it into the Airflow DAG as a pre-gate, that turns into a blocked DAG.** At that point either keep ingesting continuously, or downgrade it to warn.
+
+> Contrast with Proposal C in §7: there the problem is "corrected rows land in old partitions the watermark cannot see, so they must be pushed deliberately." Here it is one degree stronger — on the sandbox, **the old partition does not exist as a push target at all**. §7.1's conclusion ("pushing to the cloud is an explicit step") still holds, but on the sandbox its reachable range is compressed to 60 days.
 
 ---
 
@@ -269,5 +396,5 @@ Corrected values land in old partitions; a `received_at`-incremental `stg_` run 
 ## 8. Open Items and Future
 
 - On micro-batch upgrade: swap `get_watermark()` to Approach B (+ `advance_watermark()`).
-- dbt layering: `stg_` (`stg_orders`, `stg_quality_events`) and `int_` (`int_orders`, `int_orders_quarantine`, `int_order_items`) are in place — see [ecommerce_dbt/README](./ecommerce_dbt/README.md). §5.5.5's hard rule ("never overwrite canonical columns; push imputation to the DAG edge") is realized in `int_order_items` as **strict NULL propagation** for derived amounts (no `coalesce`).
-- If `dim_/fct_` adopt `order_date` partitioning, add a legal-range guard first — absurd future dates fall outside BigQuery's acceptable partition range and fail the whole table build (this is exactly why the `int_` layer deliberately isn't partitioned).
+- dbt layering: `stg_` (`stg_orders`, `stg_quality_events`), `int_` (`int_orders`, `int_orders_quarantine`, `int_order_items`) and `dim_/fct_` (`dim_customer`, `dim_product`, `fct_orders`, `fct_order_items`) are in place — see [ecommerce_dbt/README](./ecommerce_dbt/README.md). §5.5.5's hard rule ("never overwrite canonical columns; push imputation to the DAG edge") is realized in `int_order_items` as **strict NULL propagation** for derived amounts (no `coalesce`), and in `fct_orders` as `items_missing_amount`, which surfaces rollup incompleteness explicitly (see §1.2).
+- ~~If `dim_/fct_` adopt `order_date` partitioning, add a legal-range guard first~~ — **retracted; disproved by measurement in 2026-08, see §1.7.3.** Dates outside BigQuery's legal partition range do **not** fail the build; they land silently in `__UNPARTITIONED__`.

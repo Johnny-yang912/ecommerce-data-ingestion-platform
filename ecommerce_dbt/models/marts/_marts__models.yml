@@ -1,0 +1,160 @@
+version: 2
+
+models:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 星狀模型（Kimball header/line 雙事實表）
+  #   fct_orders       一列 = 一筆訂單          grain: order_id
+  #   fct_order_items  一列 = 一個訂單的一個品項  grain: (order_id, item_index)
+  #
+  # ⚠️ 不得 join 兩張事實表後同時聚合兩邊的度量——header 的訂單總額會被 line 的
+  #    列數放大（重複計算）。兩表數字的一致性由
+  #    tests/assert_fct_orders_rollup_matches_items.sql 把關。
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - name: dim_customer
+    description: >
+      顧客維度（SCD1，取最新一筆訂單的屬性）。沒有獨立顧客主檔，屬性隨訂單帶進來，
+      故從 int_orders 反推、以 (order_date, received_at, raw_id) 決勝。
+      membership_tier 是【現在】的等級；【下單當時】的等級由
+      fct_orders.membership_tier_at_order 承載——用事實表承載當下快照，
+      零 snapshot 基建即取得 SCD2 的效果。SCD2 為備妥未啟用設計，觸發點＝啟用帳單。
+      含 unknown member（customer_id = '__UNKNOWN__'）供事實表的 NULL FK 落腳。
+      不分區：維度按鍵 join，非按日期掃，分區對 join 無裁切作用。
+    columns:
+      - name: customer_id
+        description: 顧客自然鍵，兼維度鍵（決策 F：natural key 直連）。含 '__UNKNOWN__' 成員。
+        tests:
+          - not_null
+          - unique
+      - name: membership_tier
+        description: 目前的會員等級（SCD1＝最新訂單當下的值）。歷史等級請用 fct_orders.membership_tier_at_order。
+      - name: sourced_from_order_id
+        description: 本列屬性取自哪一筆訂單（SCD1 決勝的追溯欄）；unknown member 為 NULL。
+
+  - name: dim_product
+    description: >
+      商品維度（SCD1，取最新一筆訂單品項的屬性）。同樣沒有商品主檔，從 int_order_items
+      反推、以 (order_date, item_index) 決勝。
+      product_id 若無法唯一決定屬性，SCD1 只挑得到一個版本——真值由
+      fct_order_items.product_name_at_order 保留，衝突量由
+      tests/assert_product_attributes_stable.sql（warn）監控。
+      含 unknown member（product_id = '__UNKNOWN__'）。不分區，理由同 dim_customer。
+    columns:
+      - name: product_id
+        description: 商品自然鍵，兼維度鍵。含 '__UNKNOWN__' 成員。
+        tests:
+          - not_null
+          - unique
+      - name: category
+        description: 商品分類。SCD1 下為最新一筆訂單品項所帶的值。
+
+  - name: fct_orders
+    description: >
+      訂單粒度事實表（header fact）。訂單總額 rollup 自 fct_order_items，
+      一致性由 assert_fct_orders_rollup_matches_items 逐單斷言。
+      分區 order_date(DAY)、cluster customer_id；刻意不上 require_partition_filter
+      （Gold 服務分析師 ad-hoc 與 BI 探索式查詢，防線改用 BQ custom quota）。
+      對 int_orders 應為無損投影，由 assert_fct_orders_complete_projection 把關。
+    columns:
+      - name: order_id
+        description: 訂單自然鍵，兼退化維度。
+        tests:
+          - not_null
+          - unique
+      - name: order_date
+        description: >
+          業務日期，分區欄位。可為 NULL（ODS 允許）——NULL 落 BQ 的 __NULL__ 分區，
+          該分區算不出過期時間故不受保留政策回收，壽命與其他列不同。
+      - name: customer_id
+        description: 顧客維度 FK；NULL 已 coalesce 為 '__UNKNOWN__'（決策 G）。
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customer')
+                field: customer_id
+      - name: membership_tier_at_order
+        description: 下單【當時】的會員等級（決策 E：事實表承載 SCD2 效果）。與 dim_customer.membership_tier 可能不同，那是刻意的。
+      - name: item_count
+        description: 品項數。0＝該訂單沒有任何品項（以值表達，非以缺席表達）。
+        tests:
+          - not_null
+      - name: items_missing_amount
+        description: >
+          該訂單中 net_amount 為 NULL 的品項數。⭐ 加總可信度的顯性標記——
+          BQ 的 SUM() 靜默忽略 NULL，此欄 > 0 代表 net_amount 少算了品項。
+          刻意不 COALESCE 金額（有損且單向，CLOUD_LAYER-TW §5.5.5），改讓下游自行判斷。
+        tests:
+          - not_null
+      - name: net_amount
+        description: 訂單淨額＝Σ(品項 net_amount)。items_missing_amount > 0 時此值不完整。
+      - name: tax_pct
+        description: >
+          稅率（訂單層）。⚠️ 是【比率】，非可加度量，不要 SUM。
+          刻意不衍生 tax_amount——稅基（net 或 net+shipping）尚無業務定義。
+      - name: effective_quality_state
+        description: clean＝攝入當下即乾淨；promoted＝被新版規則重評估救回。
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['clean', 'promoted']
+      - name: raw_id
+        description: 物理身分，供追溯回 ODS / Raw（非鍵）。
+        tests:
+          - not_null
+
+  - name: fct_order_items
+    description: >
+      訂單品項粒度事實表（line fact）。grain (order_id, item_index)——用業務身分而非
+      上游的 raw_id，因 Gold 面向分析師；raw_id 保留為血緣欄位但不是鍵。
+      order 層的 customer_id 與 order_date 一路帶下來，讓本表可獨立查詢而不必回 join
+      header。金額承自 int_order_items 的嚴格 NULL 傳播，刻意不 COALESCE。
+      分區設定必須與 fct_orders 完全一致，否則兩表被回收的列集合不同、
+      relationships 與 rollup 測試會破裂。
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['order_id', 'item_index']
+    columns:
+      - name: order_item_key
+        description: 代理鍵 order_id-item_index（item_index 補零至三位，使字典序＝數值序）。
+        tests:
+          - not_null
+          - unique
+      - name: order_id
+        description: 所屬訂單；必須能在 fct_orders 解析到。
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('fct_orders')
+                field: order_id
+      - name: item_index
+        description: items 陣列中的位置（ODS 內為不可變 JSONB 快照，順序固定）。
+        tests:
+          - not_null
+      - name: product_id
+        description: 商品維度 FK；NULL 已 coalesce 為 '__UNKNOWN__'。
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_id
+      - name: customer_id
+        description: 顧客維度 FK（自 header 帶下，使 line fact 可獨立查詢）。
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customer')
+                field: customer_id
+      - name: product_name_at_order
+        description: >
+          下單當時實際收到的商品名。與 dim_product.product_name 可能不同——
+          維度是 SCD1，衝突時只挑得到一個版本，這裡保留 line 級真值供對照。
+      - name: discount_pct
+        description: 折扣百分比，業務值域 0~100。NULL＝無折扣資料，刻意不補 0。
+      - name: net_amount
+        description: quantity × unit_price × (1 - discount_pct/100)。嚴格 NULL 傳播。

@@ -266,6 +266,7 @@ DQ 文件早期範例寫 `CURRENT_TIMESTAMP() AS quarantined_at`。在 `table` �
 
 - **來源選 `int_orders`（已過濾）而非 `stg_orders`**：item 層的錯誤（`quantity_non_positive`、`unit_price_negative`、`discount_pct_out_of_range`、`non_finite_number`）在攝入層就會讓**整張訂單** `has_clean_error=TRUE` 被隔離，所以從 `int_orders` 出發天然保證「Gold 不含髒資料」。要做 item 層 RCA 時另建讀 quarantine 的模型。
 - **數值一律 `safe_cast`**：`clean.py` 明載「items 內的值未經 Pydantic 強轉，可能是字串」——items 整包以 JSONB 落地，欄位值不經 `ODSOrder` 型別強轉。用 `cast` 會讓一筆髒 item **炸掉整批**；`safe_cast` 轉不動 → NULL，符合本專案「標記不阻斷」的哲學。
+- ⭐ **金額一律 `NUMERIC`，不用 `FLOAT64`**（2026-08 實測後改）：`FLOAT64` 的 `SUM()` **不滿足結合律**，同一組數字換個累加順序尾數就差一個 bit，於是 `assert_fct_orders_rollup_matches_items` 的精確比對必然隨機失敗（實測 39 筆不一致，最大相對誤差 **3.442e-16 ≈ 1 ULP**）。`NUMERIC` 是精確十進位（precision 38 / scale 9），加總精確且與順序無關，測試因此可以維持精確比對，不必退讓成容差比對——容差要設多少、隨資料量成長要不要調，那是個會回來找你的決定。`safe_cast` 的容錯在 `NUMERIC` 下同樣成立（已實測：轉不動→NULL、超出 precision→NULL、小數超過 scale 9→四捨五入而非報錯）。`quantity` 維持 `INT64`：它是計數不是金額。
 - **衍生金額採嚴格 NULL 傳播，不 `coalesce`**：`net_amount = quantity × unit_price × (1 - discount_pct/100)`，任一輸入為 NULL 則結果 NULL。理由是 [CLOUD_LAYER-TW §5.5.5](../CLOUD_LAYER-TW.md) 的鐵律——NULL 帶資訊（「沒有折扣資料」≠「折扣為 0」），`COALESCE` 有損且單向，一旦在 `int_` 壓成 0，全下游再也分不出「沒收集」與「真的是 0」。若日後確認「缺值＝無折扣」，補值加在 `dim_/fct_`，**不回頭改本層**。
 - **`(raw_id, item_index)` 是 item 粒度鍵**：`items` 在 ODS 內是不可變的 JSONB 快照、陣列順序固定，故位置可作為穩定身分；代理鍵 `order_item_key = raw_id-item_index`。
 
@@ -295,6 +296,9 @@ int_order_items ─┼──► dim_product       (SCD1)
 選 C：rollup 進 `fct_orders`，並以 `assert_fct_orders_rollup_matches_items` 逐單斷言。這與 `int_` 層「刻意複製共用區塊 + `assert_orders_split_is_partition` 買回風險」（§5.1）是**同一個手法**——用一支測試把紀律保證升級成機制保證，換取查詢便利。
 
 測試中 `is distinct from`（而非 `=`）不可省：金額是嚴格 NULL 傳播的，`NULL = NULL` 結果是 NULL 而非 TRUE，用 `=` 會讓「兩邊都 NULL」的列被 `WHERE` 靜默濾掉。
+
+> ⚠️ **這支測試同時是浮點數陷阱的偵測器**。2026-08 第一批「每張訂單多個品項」的資料進來當天，它就紅了 39 筆——`item_count` 與 `total_quantity` 完全相符，只有金額差 1 ULP。根因是 `FLOAT64` 的 `SUM()` 不滿足結合律，rollup 與測試端的重新聚合走了不同執行計畫。
+> 潛伏這麼久才浮現，是因為在那之前 60 天窗內的資料**每張訂單剛好一個品項**，單值 `SUM()` 沒有累加就沒有順序問題。處置是把金額改成 `NUMERIC`（§5.7），**不是**把測試放寬成容差比對。
 
 #### `SUM` 會靜默吃掉刻意保留的 NULL ⭐
 

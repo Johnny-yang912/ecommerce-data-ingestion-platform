@@ -219,6 +219,38 @@ ODS 在 PostgreSQL 仍是永久且完整的錨點（`raw`/`ods`/`quality_events`
 
 附帶：持續攝入同時也是 §1.7.6 那個「滾動 60 天攝入視窗」問題的解方——兩者**根因相同**（沒有持續攝入），所以未來若決定加 seeding，一次解決兩件事。
 
+#### 1.7.8 sandbox 的 60 天分區過期是【無條件】的，不是只鎖顯式設定 ⭐
+
+2026-08-04 實測 `dbt_dev` 的 `INFORMATION_SCHEMA.TABLE_OPTIONS`：
+
+| 表 | 有沒有設 `partition_expiration_days` | 實際值 |
+|---|---|---|
+| `stg_orders` / `stg_quality_events` | ❌ 模型內從未設定 | **60** |
+| `fct_orders` / `fct_order_items` | ❌ `gold_partition_expiration_days=null` → 該選項根本不輸出 | **60** |
+| `rpt_sales_daily_by_category` / `rpt_quality_events_daily` | ❌ 同上 | **60** |
+
+**結論：`none` 不等於「不過期」——sandbox 會替每一張分區表補上 60 天。**
+§1.7.2 記的「sandbox 硬鎖 < 60 天」只描述了顯式設定被拒的那一半；另一半是**未設定也照樣被套**。
+
+**這已經造成實際後果**（同日實測）：
+
+```
+int_orders   540 筆（order_date 2024-01-01 ~ 2026-07-01，不分區故全留）
+     ↓ 掉 333 筆
+fct_orders   207 筆（order_date 2026-06-05 ~ 2026-07-01，剛好 60 天窗）
+```
+
+落差全是 `order_date` 落在 60 天窗外的列——其中絕大多數是舊版 `load_test.py` 寫死
+`date(2024,1,1)` 產生的資料，一進 Gold 就被回收（該檔 `ORDER_DATE_LOOKBACK_DAYS`
+的註解已預告這個災難，修正已落地但**尚未重新灌資料**）。
+
+**這也解釋了 `assert_fct_orders_complete_projection` 為什麼必須帶 `order_date` 窗**：
+那不是防禦性設計，是**唯一能讓它成立的寫法**。`int_` 不分區故不受回收影響、`fct_` 受影響，
+無窗的 `count = count` 在 sandbox 下必然永遠紅。
+
+啟用帳單後這個強制值解除，`gold_partition_expiration_days` 才真正生效（屆時
+`gold_projection_window_days` 應一併調整為與保留政策一致）。
+
 ---
 
 ## 2. Watermark 策略

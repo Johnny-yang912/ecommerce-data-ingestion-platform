@@ -556,26 +556,32 @@ logger.info("quality_metric",
 
 ### 層次二：批次分析指標（日/週）
 
-`quality_events` 已由 `extract_ods_to_bq.py` 與 ODS 一起抽取進 BQ（E/L 已實作；現手動觸發，Phase 5 交 Airflow 排程），dbt 之後在其上建 `rpt_quality_*` 模型：
+`quality_events` 已由 `extract_ods_to_bq.py` 與 ODS 一起抽取進 BQ（E/L 已實作；現手動觸發，Phase 5 交 Airflow 排程），dbt 在其上建了兩張報表——**規劃時的三張在實作時重組成兩張**，理由如下：
 
 ```
-rpt_quality_daily
-├── date, rule_version
-├── total_count, clean_count, quarantine_count, promoted_count
-├── quarantine_rate, promotion_rate
-└── 可按 rule_version 切片，比較版本間的品質差異
+rpt_quality_events_daily         事件軸（event_at，UTC），incremental
+├── event_date, rule_version
+├── events_total
+├── initial_evaluations（＝所有攝入品質率的分母）
+├── initial_clean / initial_quarantined
+└── promotions / rejections / re_quarantines
 
-rpt_quality_field_breakdown
-├── 哪些欄位最常觸發 has_clean_error
-├── 每個欄位的 error rate 趨勢
-└── 來源：clean_error_message（JSONB 物件陣列），直接 UNNEST 讀 e.field / e.code，不需 parse 文字
-
-rpt_quality_version_comparison
-├── v1 攔截了多少 → v2 促進了多少 → 目前仍在 quarantine 多少
-└── 規則改動的實際效果量化
+rpt_quality_backlog              快照（讀 int_orders_quarantine 當下內容），table
+├── quarantined_date, dq_rule_version, effective_quality_state, error_code
+├── orders_with_code      ⚠️ 不可加（跨 code 加總會重複計數）
+└── orders_primary_code   ✅ 可加（＝「現在總共卡幾筆」）
 ```
+
+| 原規劃 | 實作結果 | 為什麼 |
+|---|---|---|
+| `rpt_quality_daily` | **拆成事件軸 + 快照兩張** | 原設計混了兩件性質相反的事：事件是不可變歷史、backlog 是會變的現況。混在一張表裡，「v1 攔了多少」會隨每次 promote 漂移，直接牴觸下一節〈歷史指標為何不會被追溯性改寫〉 |
+| `rpt_quality_field_breakdown` | **併入 `rpt_quality_backlog` 的 `error_code` 維度** | 上游 `int_orders_quarantine` 已把 `clean_error_message` 攤平成 `error_codes` 陣列（`dq_error_codes` macro），不需要另建一張表把同一份資料再攤一次 |
+| `rpt_quality_version_comparison` | **不另建表** | `rule_version` / `dq_rule_version` 已經是上面兩張表的切片維度，版本比較是 BI 上的一個篩選器，不是一張新表。另建等於憑空造一個沒有消費者的 model（見 [ecommerce_dbt/README.zh-TW §5.3](./ecommerce_dbt/README.zh-TW.md) 的紀律） |
+| `quarantine_rate` / `promotion_rate` 欄位 | **不落地，只落地分子與分母** | 預聚合表存比率，BI 一 roll up 就變成「比率的平均」而非「總和的比率」——分母永遠不相等，所以永遠是錯的。rate 交給 BI 計算欄位現算 |
 
 接 Looker Studio，供長期趨勢分析。
+
+**定位邊界（接 OTel 之後仍成立）**：本層是【資料可信度與規則效果的**分析**】，**不是管線健康監控**。分鐘級 error rate、Hard Gate 即時告警、批次 SLA 屬層次一（OTel/Grafana）。兩層刻意重疊一部分信號（error rate 兩邊都有），差別在消費形態——層次一是「現在、單一數字、為了告警」，層次二是「歷史、可切片、為了歸因」。三件事讓品質分析**不能只放 OTel**：① TSDB 撐不住 `error_code × field × client × version` 的高基數切片；② metric 會被降採樣，跨季度的規則效果比較做不了；③ 只有在倉裡才能 join `dim_`/`fct_`，把品質從工程指標翻譯成**業務曝險**。
 
 ### 歷史指標為何不會被追溯性改寫
 
@@ -633,7 +639,7 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | `fct_orders`/`fct_order_items`（Kimball header/line 雙事實表）| BQ Analytics | ✅ 已完成（rollup 一致性 + 無損投影皆有 singular test）|
 | 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ 設計已備妥，待真實分析場景出現才啟用（見機制三的實作狀態註）|
 | Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 5——**下游回流路徑已就緒**，只等事件產生端 |
-| `rpt_quality_*` dbt 模型 | BQ Analytics | ⬜ Phase 4 |
+| `rpt_quality_*` dbt 模型 | BQ Analytics | ✅ 已實作（拆為 `rpt_quality_events_daily` + `rpt_quality_backlog`）|
 
 ---
 

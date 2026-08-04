@@ -38,7 +38,7 @@ ecommerce_dbt:
 ```bash
 dbt deps                              # install packages (dbt_utils)
 dbt run    --select stg_orders        # build the model (incremental)
-dbt run    --select stg_orders --full-refresh   # full rebuild (see §8)
+dbt run    --select stg_orders --full-refresh   # full rebuild (see §9)
 dbt test   --select stg_orders        # run tests (incl. Hard Gate)
 dbt source freshness                  # source freshness
 dbt build  --select stg_orders        # run + test together
@@ -51,10 +51,12 @@ dbt build  --select stg_orders        # run + test together
 | Silver entry | `stg_` | 1:1 to source, type alignment, name standardization, **dedup** | Keep all data incl. dirty; carries Hard Gate |
 | Gold entry | `int_` | Cross-table joins, derived columns, **Row Filter interception** | Only clean data passes |
 | Gold | `dim_`/`fct_` | Star Schema | No `has_clean_error=TRUE` |
-| Reporting | `rpt_` | Fixed-grain pre-aggregation | Same as Gold |
+| Reporting | `rpt_` | Fixed-grain pre-aggregation, consumed directly by BI | Business reports same as Gold; quality reports deliberately read quarantine |
 
 - Naming uses `stg_orders` (consistent with existing project docs), not dbt's `stg_<source>__<entity>`.
-- File layout: under `models/staging/` — `_staging__sources.yml` (source def), `stg_orders.sql`, `stg_orders.yml` (tests/descriptions); under `models/intermediate/` — the `int_*.sql` models plus a shared `_intermediate__models.yml`; under `models/marts/` — the `dim_*.sql`/`fct_*.sql` models plus `_marts__models.yml`.
+- File layout: under `models/staging/` — `_staging__sources.yml` (source def), `stg_orders.sql`, `stg_orders.yml` (tests/descriptions); under `models/intermediate/` — the `int_*.sql` models plus a shared `_intermediate__models.yml`; under `models/marts/` — the `dim_*.sql`/`fct_*.sql` models plus `_marts__models.yml`; under `models/reports/` — the `rpt_*.sql` models plus `_reports__models.yml`.
+- `reports/` sits **beside** `marts/`, not nested inside it: dbt's own convention would put `rpt_` under marts, but the table above already lists Reporting as its own layer, and the two quality reports draw from `int_`/`stg_` rather than marts — nesting them under marts would be semantically wrong.
+- ⭐ `rpt_` spans **two data domains**: business reports always read `dim_`/`fct_`; quality reports read `int_orders_quarantine` and `stg_quality_events` — quarantined rows by definition **never reach Gold**, so that isn't bypassing the star schema, it's a different domain (see §7.1).
 
 ## 4. Implementation Decisions (`stg_orders`)
 
@@ -141,7 +143,7 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 
 **The trigger gate is the explicit list, so it doesn't absorb drift**: `check_for_schema_changes` compares the model's produced columns (the explicit list), not the underlying staging. A column staging grew via `ALLOW_FIELD_ADDITION` is invisible until you add it to the explicit SELECT → no auto-ALTER. This option **fires only when you deliberately edit the list (into git, reviewed)**, leaving the explicit-list discipline intact.
 
-**Boundaries** (what it can't solve — still go through the §8 runbook):
+**Boundaries** (what it can't solve — still go through the §9 runbook):
 - **Historical backfill** (values needed in old partitions too, e.g. a Proposal C rebuild): it only NULL-fills old partitions and writes the lookback window → the true values in old partitions still need a targeted refresh.
 - **Type change / rename / partition change**: still `--full-refresh` / table rebuild.
 
@@ -220,7 +222,7 @@ The last row is the crux: a missed partition in `stg_` is a **delay**, in `int_`
 
 Hence the whole `int_` layer is `materialized='table'` (set as the folder default in `dbt_project.yml`). `table` uses `CREATE OR REPLACE` (DDL, atomic swap, unaffected by the sandbox DML ban — §4.3's constraint is currently moot for `int_`), and throws in two bonuses:
 
-- **No logic drift**: the table always equals "the current SQL applied to the current upstream". An incremental table's old partitions can retain rows computed by an older version of the logic, fixable only via runbook (`stg_orders` carries exactly that burden — see §4.7, §8).
+- **No logic drift**: the table always equals "the current SQL applied to the current upstream". An incremental table's old partitions can retain rows computed by an older version of the logic, fixable only via runbook (`stg_orders` carries exactly that burden — see §4.7, §9).
 - **Changing the column list is free**: no `on_schema_change` to reason about, no judgment call on whether a `--full-refresh` is needed.
 
 #### If it ever does go incremental, the hard part isn't the lookback window — it's these three
@@ -368,7 +370,103 @@ The following three are undefined in the docs and are **deliberately not assumed
 | Net revenue | Should `returned = TRUE` orders be subtracted? | `returned` stays on the fact as a flag; downstream decides |
 | `profit_amount` | Does margin include shipping and tax? | Not built; downstream can compute `net_amount - cost_amount` |
 
-## 7. Testing Strategy
+## 7. Implementation Decisions (`rpt_` layer — Reporting)
+
+Three tables, one per chart on the BI page:
+
+```
+int_orders_quarantine ──► rpt_quality_backlog          snapshot axis: what's still stuck
+stg_quality_events ─────► rpt_quality_events_daily     event axis: what happened
+fct_order_items ─┬──────► rpt_sales_daily_by_category  business aggregate
+dim_product ─────┤
+fct_orders ──────┘ (returned flag only)
+```
+
+### 7.1 Business reports always read Gold, never `int_` directly
+
+Wiring `rpt_` straight onto `int_` as a canned query is an anti-pattern in mature teams. Four reasons; the last two are specific to this project:
+
+| # | Reason | Consequence of bypassing `fct_` |
+|---|---|---|
+| 1 | One definition per metric | "Revenue" gets two lineages → two numbers, and nobody knows which is wrong |
+| 2 | Don't redo the semantic decisions Gold already made | Unknown members, the `item_count=0` LEFT JOIN — all of it would have to be copied again |
+| 3 | It invalidates existing tests | `assert_fct_orders_rollup_matches_items` guards `fct_orders`'s rollup; if `rpt_` recomputes from `int_`, that test **doesn't cover it at all** |
+| 4 | ⭐ It overturns an architectural premise of `int_` | §5.5 "`int_` is consumed only inside the DAG" is the **only** reason `int_` isn't partitioned. `rpt_` reading `int_` promotes it from internal building material to a public contract → the partitioning decision needs revisiting, and `int_` becomes un-refactorable |
+
+**The legitimate exception**: quality reports. Quarantined rows by definition never reach Gold, so `rpt_quality_*` must draw from `int_orders_quarantine` and `stg_quality_events`.
+
+> ⚠️ This brings an easy mistake with it: **the denominator for quality rates is all of `stg_orders` (dirty included), not `fct_orders`**. Use Gold as the denominator and quarantine_rate is identically zero — that's exactly what the Row Filter does.
+
+> A note on honesty: the textbook justification for `rpt_` is "pre-aggregate to buy performance and cost," and at this project's current volume that justification is worth nothing. The docs deliberately don't claim "for performance," because that would be false — the real reasons are **one fixed definition per metric** and **BI not having to assemble joins itself**. Let report authors aggregate `fct_` freely inside the BI tool and metric definitions drift into the BI tool; at this scale that's what `rpt_` actually prevents.
+
+### 7.2 Three disciplines that span the layer
+
+**① Never materialize a ratio — only the additive numerator and denominator** ⭐
+
+Storing a rate in a pre-aggregate is the number-one trap: the moment BI rolls daily grain up to weekly, Looker Studio computes `AVG(daily_rate)` — **the average of ratios, not the ratio of sums**. Those agree only when every day's denominator is equal, and denominators are never equal. Leave the rate to a BI calculated field (which computes `SUM(num)/SUM(den)` and is correct at any grain).
+
+> Why not follow `fct_orders.tax_pct` and "keep it but mark it non-additive": `tax_pct` is a **raw fact** — don't store it and it's gone. `quarantine_rate` is purely derived; keeping a column that's only correct at daily grain actively manufactures an opportunity for misuse.
+
+**② `COUNT(DISTINCT)` is structurally non-additive in a pre-aggregate**
+
+Summing `orders` across categories double-counts (one order's items span several categories); summing `customers` across days double-counts too. No naming convention fixes this — it can only be flagged. **Trigger point**: when a chart genuinely needs distinct counts rolled up across dimensions, switch to BigQuery's native HLL sketches (`HLL_COUNT.INIT` → BYTES, `HLL_COUNT.MERGE` upstream, ~1% error). The reason for not doing it now isn't effort — it's that Looker Studio's calculated fields **cannot call** `HLL_COUNT.MERGE`, so it needs another view on top, and that friction point doesn't exist yet (same discipline as §5.3).
+
+**③ `rpt_` only does `GROUP BY` / window functions**
+
+No new join semantics, no new cleaning, no new business definitions. If some `rpt_` needs a join that `dim_`/`fct_` can't provide, that's a **signal the star schema is missing something** — fix Gold, don't improvise here. (Same sense of direction as §5.7's "imputation belongs in `dim_/fct_`, don't go back and change `int_`.")
+
+### 7.3 Quality reporting splits into two tables: two time axes, two kinds of mutability ⭐
+
+The `rpt_quality_daily` originally sketched in the DQ doc conflated two things of opposite nature, so the implementation split them:
+
+| | `rpt_quality_events_daily` | `rpt_quality_backlog` |
+|---|---|---|
+| Axis | **Event axis** (`event_at`) | **Snapshot** (current contents of quarantine) |
+| What a row means | "N quality events happened that day" | "N orders are stuck right now" |
+| Retroactively rewritten? | **No** (append-only) | Yes (it *is* the current state) |
+| Incremental possible? | ✅ axis aligned with the source of change | ❌ inherently not |
+
+**Why backlog can't just be accumulated off the event axis**: in theory `backlog(t) = cumulative quarantined − promoted − rejected`, since the event stream is the complete derivative of the state. But `quality_events` has 60-day partition expiration — **once it expires the starting point of that accumulation is gone, and the distortion is one-directional** (the start can only under-count quarantined → backlog is systematically understated). The snapshot table reads `int_orders_quarantine` directly and is immune to the event retention window.
+
+**Why the event table isn't hung on the ingestion axis**: grouping by `received_at` means promoting a three-month-old order today **rewrites the composition of a row three months ago** — that's state, not an event, and it makes "how much did v1 intercept" drift over time, in direct conflict with [DQ_ARCHITECTURE](../DQ_ARCHITECTURE.md) "Why historical metrics are never retroactively rewritten."
+
+### 7.4 Materialization: the one downstream model where incremental is inherently correct
+
+| | Materialization | Partition | Reason |
+|---|---|---|---|
+| `rpt_quality_events_daily` | `incremental` + `insert_overwrite` + `copy_partitions` | `event_date`(DAY) | Event axis is append-only and the time axis aligns with what changes → a lookback window suffices; **none** of §5.4's affected-partition discovery is needed |
+| `rpt_quality_backlog` | `table` | **none** | A state snapshot: one promotion and a row must leave the table → an incremental miss is a **permanent error**, not a delay. Partitioning only pays off for partition-level incremental replacement, which this layer will never do |
+| `rpt_sales_daily_by_category` | `table` | `order_date`(DAY) | ⭐ Full rebuild for now, but **adding the partition column now is free; adding it later means rebuilding the table** |
+
+> ⚠️ `rpt_quality_events_daily`'s `var('rpt_quality_events_lookback_days')` **must be ≥ `stg_quality_events_lookback_days`**. If the upstream window is wider than the downstream one, old events backfilled upstream today land outside the downstream window → they're never picked up, **and nothing errors** (the partition exists, it's just short on content). Change both vars together.
+
+**Time zone**: `event_date = date(event_at)` is **UTC**, deliberately not `date(event_at, 'Asia/Taipei')` — a time-zone conversion breaks predicate pushdown for partition pruning. Landing UTC in the warehouse and leaving time-zone presentation to BI is the standard division of labor, but it does mean "that day" ends at UTC midnight, 8 hours off Taipei time — hence the column description says so as well.
+
+**The path if `rpt_sales` ever goes incremental**: "daily incremental with an `order_date` lookback window **plus** a scheduled weekly `--full-refresh`" — **not** hand-written affected-partition discovery. The latter forces a purely business report to depend on `quality_events` as a change detector (coupling for a non-semantic reason), and on the day Proposal B promotes at scale it degrades to worse than a full rebuild (§5.4 point 2). The cost is a single documentable sentence: **retroactive corrections become visible in this report within ≤ 7 days**.
+
+### 7.5 Handling fan-out: an additive measure for reconciliation
+
+`rpt_quality_backlog` explodes to `error_code` (one order can carry several) → summing across codes double-counts orders. The fix puts **two measures with different meanings** in the same table:
+
+- `orders_with_code`: orders carrying this code (**non-additive**, for the Top-N chart)
+- `orders_primary_code`: orders whose *primary* code is this one (**additive**, for the "how many are stuck" KPI)
+
+Primary code = the first entry of the deduplicated, sorted `error_codes` array. It exists **only** for determinism and reconciliation and does **not** express a severity ranking — severity priority is a business definition, none exists, and we don't invent one (same as §6.6).
+
+> Rejected alternative: adding an `error_code = '__TOTAL__'` grand-total row. It turns "someone accidentally sums `__TOTAL__` too" into a new misuse surface, which is worse than the fan-out itself.
+
+**Deduplicating the array is not optional**: the same code can repeat because several items each triggered it (same issue as §5.3's "don't test with `array_length(codes) = 1`"); without dedup, `orders_with_code` counts one order as several.
+
+### 7.6 Deliberately not built
+
+| Item | Why not | Trigger point |
+|---|---|---|
+| **Monetary exposure** (what the stuck orders are worth) | `int_order_items` sources from `int_orders` (the clean path); quarantine's items have **never been exploded** (§5.7 already flagged this) | Requires `int_order_items_quarantine`; enable when quality reporting needs business exposure figures |
+| **HLL sketches** | Looker Studio calculated fields can't call `HLL_COUNT.MERGE` | A chart that needs distinct counts rolled up across dimensions |
+| **Cell-by-cell amount reconciliation tests** | Under `table` full rebuilds it's a **tautology** (validating the same SQL against itself — always green, zero information) | ⭐ see §8 |
+| `order_status` in the grain | The value domain is undefined; unknown whether it contains a "not placed" state | Confirm the domain, then decide whether to filter |
+
+## 8. Testing Strategy
 
 | Test | Target | Severity | Notes |
 |---|---|---|---|
@@ -386,21 +484,33 @@ The following three are undefined in the docs and are **deliberately not assumed
 | `unique` + `not_null` | `dim_customer`/`dim_product` dimension keys; `fct_orders.order_id`; `fct_order_items.order_item_key` | error | Dimension grain and fact surrogate-key uniqueness |
 | `relationships` | `customer_id`/`product_id` on both `fct_` tables → `dim_*`; `fct_order_items.order_id` → `fct_orders` | error | Star-schema FK integrity. Paired with `not_null` (the unknown member guarantees FKs are never NULL, §6.5) |
 | `dbt_utils.unique_combination_of_columns` | `fct_order_items`'s `(order_id, item_index)` | error | The declared grain |
+| **`assert_rpt_sales_no_item_loss`** (singular) ⭐ | `rpt_sales`'s `sum(items)` vs `fct_order_items` row counts (in-window, per day) | error | `rpt_sales` introduces the only **new joins** in the whole DAG (× `dim_product`, × `fct_orders`). A join quietly turning INNER shows up as "revenue slowly shrinking" and raises nothing. The full outer join is what catches "too many" as well (dimension fan-out) |
+| **`assert_rpt_quality_events_split`** (singular) ⭐ | `initial_clean + initial_quarantined = initial_evaluations` | error | **Domain-expansion alarm for the wide table**: the price of a wide table is "one more `to_state` upstream and the downstream needs a schema change to see it." A new state makes `count(*)` grow while the `countif`s don't → this goes red immediately instead of letting those events evaporate silently. It's what makes the wide table safe to use |
+| `assert_rpt_backlog_primary_code_balances` (singular) | `sum(orders_primary_code)` vs actual order counts in `int_orders_quarantine` | error | The safety net for §7.5's reconciliation measure. When it breaks, the symptom is the backlog KPI in BI simply being wrong, with no self-healing |
+| `dbt_utils.unique_combination_of_columns` + `not_null` | The declared grain of each of the three `rpt_` tables | error | A broken grain in a pre-aggregate doubles every number, silently |
+| `dbt_utils.expression_is_true` | `orders <= items`, `items_missing_amount <= items`, `orders_with_code >= orders_primary_code` | error | Cheap sanity floors |
 
 > Custom generic tests (and some built-in ones) need their arguments nested under `arguments:` (dbt 1.11 requirement, else `MissingArgumentsPropertyInGenericTestDeprecation`).
 
-## 8. Operational Runbook
+> ⚠️ **Deliberately not written**: `assert_rpt_sales_matches_fct`-style **cell-by-cell amount reconciliation**. Under `table` full rebuilds it's a tautology (`rpt_`'s sum *is* `fct_`'s columns added up) — always green, zero information. Its value only materializes the day the model goes incremental (catching missed partitions).
+>
+> **→ "make `rpt_sales` incremental" and "add cell-by-cell reconciliation" are two halves of one change; doing only the first is not allowed.** Structurally identical to §5.4's "the moment you go incremental is the moment the consolidation trigger fires."
+>
+> Contrast: `assert_rpt_sales_no_item_loss` *is* written now, because it tests **row counts across two joins** — independent of materialization strategy, and a genuinely possible failure.
+
+## 9. Operational Runbook
 
 - **When to `--full-refresh`**: changing partition/cluster, changing dedup logic, recomputing history outside the lookback window, or first-time build. Uses DDL, unaffected by the sandbox. (Applies to `stg_`'s incremental models only; `int_` is a `table` full rebuild on every run anyway.)
 - **Proposal C targeted refresh**: correction rows land in old partitions the lookback window can't see → the last step of the repair runbook does a targeted refresh of the affected partitions (`--full-refresh`, or a future single-partition `insert_overwrite`). See [CLOUD_LAYER §7.4](../CLOUD_LAYER.md), DQ C-2 #7.
 - **Before changing `int_orders` or `int_orders_quarantine`**: walk the §5.2 alignment checklist; afterwards run `dbt build --select intermediate+` and confirm `assert_orders_split_is_partition` is green.
+- **Adjusting `rpt_quality_events_daily`'s lookback window**: `rpt_quality_events_lookback_days` must be ≥ `stg_quality_events_lookback_days`; change both vars together (§7.4).
 
-## 9. Dependencies & Versions
+## 10. Dependencies & Versions
 
 - dbt-core 1.11 / dbt-bigquery 1.11
 - `packages.yml`: `dbt-labs/dbt_utils >=1.1.0,<2.0.0` (resolves to 1.4.1)
 
-## 10. Status & TODO
+## 11. Status & TODO
 
 - ✅ `stg_orders` (dedup + Hard Gate + freshness, incremental)
 - ✅ `stg_quality_events` (deduped at `id` grain, preserving the full state-machine history)
@@ -408,7 +518,10 @@ The following three are undefined in the docs and are **deliberately not assumed
 - ✅ `int_order_items` (items flattened to item grain)
 - ✅ `dim_customer`, `dim_product` (SCD1 + unknown member)
 - ✅ `fct_orders`, `fct_order_items` (dual fact tables; rollup consistency and lossless projection both guarded by tests)
+- ✅ `rpt_quality_events_daily` (event axis, incremental), `rpt_quality_backlog` (snapshot), `rpt_sales_daily_by_category`
 - ⬜ Scenario-specific `int_orders_*` (designed; enable only when a real analytical scenario appears — see §5.3)
 - ⬜ SCD2 `dim_customer` (designed; trigger = enabling billing — see §6.3)
-- ⬜ `rpt_quality_*`
+- ⬜ Make `rpt_sales_*` incremental (path = daily incremental + weekly full refresh; **must land the cell-by-cell reconciliation test at the same time** — see §7.4, §8)
+- ⬜ Monetary exposure measures (requires `int_order_items_quarantine` — see §7.6)
 - ⬜ Proposal B (Airflow re-evaluation writing `quality_events`) — the downstream reinstatement path is ready, only the event producer is missing
+- ⚠️ With Proposal B's event producer unimplemented, `rpt_quality_events_daily`'s `promotions` / `rejections` / `re_quarantines` are currently **always 0** (the columns are ready and will populate as soon as events exist)

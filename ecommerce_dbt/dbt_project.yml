@@ -42,6 +42,16 @@ models:
       # （業務時間），與「資料何時變動」完全脫鉤——被 promote 的舊訂單，任何按
       # order_date 的回看窗都永遠看不到它（見 fct_orders.sql 檔頭）。
       +materialized: table
+    reports:
+      # rpt_ 與 marts 平行而非巢狀在其下：dbt 官方慣例會把 rpt_ 放進 marts，
+      # 但 README.zh-TW §3 的分層表已把「報表」列為獨立一層；且兩張品質報表的上游是
+      # int_/stg_ 而非 marts（quarantine 的列照定義永遠不會出現在 Gold），
+      # 塞進 marts 反而語意錯。
+      #
+      # 預設 table 全量重建（同 marts 的理由：業務時間軸與「資料何時變動」脫鉤）。
+      # rpt_quality_events_daily 於模型內覆寫為 incremental——它掛在【事件軸】，
+      # append-only、時間軸與變更源對齊，是本專案唯一一個增量在語意上天生正確的下游模型。
+      +materialized: table
 
 vars:
   # 星狀模型的 unknown member 鍵（決策 G）。事實表不留 NULL FK：INNER JOIN 會靜默
@@ -59,4 +69,11 @@ vars:
 
   # 完整投影測試的比對窗（見 tests/assert_fct_orders_complete_projection.sql）。
   # 59 天＝sandbox 60 天硬上限留一天安全邊際。
+  # 也被 tests/assert_rpt_sales_no_item_loss.sql 沿用，兩支要一起改。
   gold_projection_window_days: 59
+
+  # rpt_quality_events_daily 的增量回看窗。
+  # ⚠️【必須 ≥ stg_quality_events_lookback_days】——上游窗比下游窗大時，
+  #   上游今天才補進來的舊事件會落在下游窗外 → 永遠撈不到，且不報錯
+  #   （分區存在、只是內容少算）。兩個 var 要一起調。
+  rpt_quality_events_lookback_days: 3

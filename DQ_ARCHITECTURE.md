@@ -559,26 +559,32 @@ No new components required — structlog infrastructure already exists.
 
 ### Tier 2: Batch analytical metrics (daily / weekly)
 
-`quality_events` is extracted to BQ by `extract_ods_to_bq.py` alongside ODS (E/L implemented; manually triggered for now, scheduled by Airflow in Phase 5). dbt then builds `rpt_quality_*` models on top:
+`quality_events` is extracted to BQ by `extract_ods_to_bq.py` alongside ODS (E/L implemented; manually triggered for now, scheduled by Airflow in Phase 5). dbt builds two reports on top of it — **the three tables originally sketched were reorganised into two during implementation**, for the reasons below:
 
 ```
-rpt_quality_daily
-├── date, rule_version
-├── total_count, clean_count, quarantine_count, promoted_count
-├── quarantine_rate, promotion_rate
-└── sliceable by rule_version to compare quality across versions
+rpt_quality_events_daily         event axis (event_at, UTC), incremental
+├── event_date, rule_version
+├── events_total
+├── initial_evaluations  (= the denominator of every ingestion quality rate)
+├── initial_clean / initial_quarantined
+└── promotions / rejections / re_quarantines
 
-rpt_quality_field_breakdown
-├── which fields most frequently trigger has_clean_error
-├── per-field error rate trend over time
-└── source: clean_error_message (JSONB array of objects) — UNNEST and read e.field / e.code directly, no text parsing required
-
-rpt_quality_version_comparison
-├── how many quarantined under v1 → promoted under v2 → still in quarantine
-└── quantifies the real-world impact of each rule change
+rpt_quality_backlog              snapshot (current contents of int_orders_quarantine), table
+├── quarantined_date, dq_rule_version, effective_quality_state, error_code
+├── orders_with_code      ⚠️ non-additive (summing across codes double-counts)
+└── orders_primary_code   ✅ additive (= "how many are stuck right now")
 ```
+
+| Originally planned | As implemented | Why |
+|---|---|---|
+| `rpt_quality_daily` | **Split into an event-axis table and a snapshot table** | The original design conflated two things of opposite nature: events are immutable history, backlog is mutable current state. Combined in one table, "how much did v1 intercept" drifts with every promotion — in direct conflict with the next section, "Why historical metrics are never retroactively rewritten" |
+| `rpt_quality_field_breakdown` | **Folded into `rpt_quality_backlog`'s `error_code` dimension** | Upstream `int_orders_quarantine` already flattens `clean_error_message` into an `error_codes` array (the `dq_error_codes` macro); a separate table would flatten the same data twice |
+| `rpt_quality_version_comparison` | **Not built as its own table** | `rule_version` / `dq_rule_version` are already slicing dimensions on both tables above. Version comparison is a filter in BI, not a new table — building it would conjure a model with no consumer (see the discipline in [ecommerce_dbt/README §5.3](./ecommerce_dbt/README.md)) |
+| `quarantine_rate` / `promotion_rate` columns | **Not materialized — only numerator and denominator are** | Store a ratio in a pre-aggregate and the moment BI rolls it up it becomes "the average of ratios" instead of "the ratio of sums" — denominators are never equal, so it's always wrong. The rate is computed by a BI calculated field |
 
 Connected to Looker Studio for long-term trend analysis.
+
+**Scope boundary (still holds once OTel lands)**: this tier is **analysis of data trustworthiness and rule effectiveness**, **not pipeline health monitoring**. Minute-level error rate, real-time Hard Gate alerting, and batch SLA belong to Tier 1 (OTel/Grafana). The two tiers deliberately overlap on some signals (error rate exists in both); the difference is the mode of consumption — Tier 1 is "now, a single number, for alerting", Tier 2 is "history, sliceable, for attribution". Three things make quality analysis unable to live in OTel alone: ① a TSDB can't sustain the high-cardinality slicing of `error_code × field × client × version`; ② metrics get downsampled, so cross-quarter rule-effectiveness comparison becomes impossible; ③ only in the warehouse can you join `dim_`/`fct_` and translate quality from an engineering metric into **business exposure**.
 
 ### Why historical metrics are never retroactively rewritten
 
@@ -636,7 +642,7 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | `fct_orders`/`fct_order_items` (Kimball header/line dual fact tables) | BQ Analytics | ✅ Done (rollup consistency + lossless projection both covered by singular tests) |
 | Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Designed; enable only when a real analytical scenario appears (see the status note under Mechanism 3) |
 | Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 5 — **the downstream flow-back path is already in place**, only the event producer is missing |
-| `rpt_quality_*` dbt models | BQ Analytics | ⬜ Phase 4 |
+| `rpt_quality_*` dbt models | BQ Analytics | ✅ Implemented (split into `rpt_quality_events_daily` + `rpt_quality_backlog`) |
 
 ---
 

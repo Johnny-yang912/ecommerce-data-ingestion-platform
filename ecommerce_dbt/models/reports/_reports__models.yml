@@ -1,0 +1,218 @@
+version: 2
+
+models:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # rpt_ 報表層（固定粒度預聚合，BI Dashboard 直接消費）
+  #
+  # 三張表分屬兩個資料域：
+  #   rpt_quality_events_daily  事件軸，不可變的歷史（「發生了什麼」）
+  #   rpt_quality_backlog       快照軸，會變的現況（「現在還剩什麼」）
+  #   rpt_sales_daily_by_category  業務聚合，上游一律走 Gold（fct_/dim_）
+  #
+  # ⭐ 三個貫穿全層的紀律：
+  #   1. 【不落地任何比率】——只落地可加的分子與分母。BI 一 roll up，
+  #      預存的 rate 會變成「比率的平均」而非「總和的比率」（分母永遠不相等）。
+  #   2. 【COUNT(DISTINCT) 標死不可加】——預聚合層的結構性限制，無法靠命名補救。
+  #      跨維度彙總 distinct 的觸發點＝改存 BQ HLL sketch。
+  #   3. 【rpt_ 只做 GROUP BY / window】——不做新的 join 語意、不做新的清洗、
+  #      不引入新的業務定義。若某張 rpt_ 需要 dim_/fct_ 給不出的 join，
+  #      那是星狀模型缺東西的訊號，該補的是 Gold，不是在這裡湊。
+  #
+  # ⚠️ 刻意【先不寫】的測試：assert_rpt_sales_matches_fct 這類逐格金額對帳。
+  #    在 table 全量重建下它是同義反覆（用同一段 SQL 驗自己，恆綠、零資訊），
+  #    價值要到切增量那天才兌現（抓漏分區）。
+  #    → 【「rpt_sales 改增量」與「加逐格對帳測試」是同一件事的兩半，不得只做前者。】
+  #      這與 README.zh-TW §5.4「改增量的那一刻就是收斂觸發點被觸發的時刻」同構。
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - name: rpt_quality_events_daily
+    description: >
+      品質事件流的日聚合（grain: event_date × rule_version）。掛在【事件軸】，
+      因此數字不會被追溯性改寫——promote 一筆舊訂單只會新增一列 promotion 事件，
+      不會改動舊日的 initial_evaluation 計數。也因此這是本專案唯一一個
+      增量在語意上天生正確的下游模型（時間軸與變更源對齊，回看窗就夠）。
+      定位是【資料可信度與規則效果的分析】，不是管線健康監控——後者（分鐘級
+      error rate、Hard Gate 即時告警、批次 SLA）屬 OTel/Grafana，即 DQ 文件的層次一。
+      ⚠️ Proposal B 未實作前，promotions / rejections / re_quarantines 恆為 0。
+      ⚠️ 刻意不輸出 quarantine_rate / promotion_rate，rate 請在 BI 用計算欄位
+      SUM(分子)/SUM(分母) 現算（見本檔頭紀律 1）。
+    columns:
+      - name: event_date
+        description: >
+          事件日期，【UTC】。刻意不用 date(event_at, 'Asia/Taipei')——時區轉換會讓
+          分區裁切的謂詞下推失效。倉儲層落地 UTC、時區呈現交給 BI 是標準分工，
+          但這代表「當日」的邊界是 UTC 午夜，與台北時間差 8 小時。分區欄位。
+        tests:
+          - not_null
+      - name: rule_version
+        description: 事件當下的規則版本；規則改動效果比較的切片維度。ODS 為 NOT NULL。
+        tests:
+          - not_null
+      - name: events_total
+        description: 該切片的全部事件數（所有 event_type / to_state）。可加。
+      - name: initial_evaluations
+        description: >
+          當日攝入評估筆數＝每筆訂單攝入時恰好一筆 initial_evaluation。
+          ⭐ 這是所有攝入品質率的【分母】。可加。
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: initial_clean
+        description: 攝入即判定乾淨的筆數。可加。
+      - name: initial_quarantined
+        description: ⭐ 攝入即被隔離的筆數＝quarantine_rate 的【分子】。可加。
+      - name: promotions
+        description: >
+          被新版規則救回的事件數（Proposal B 回流量）。判準看 to_state 不看 event_type，
+          與 int_ 層合成有效品質狀態的判準對齊。Proposal B 上線前恆為 0。可加。
+      - name: rejections
+        description: 人工放棄（permanently_rejected）的事件數。Proposal B 上線前恆為 0。可加。
+      - name: re_quarantines
+        description: >
+          規則變嚴後重評估失敗、退回隔離的事件數（狀態機邊緣情況，DQ 文件〈適用邊界〉）。
+          Proposal B 上線前恆為 0。可加。
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - event_date
+              - rule_version
+
+  - name: rpt_quality_backlog
+    description: >
+      目前仍卡在 quarantine 的訂單（狀態快照；grain: quarantined_date × dq_rule_version
+      × effective_quality_state × error_code）。與 rpt_quality_events_daily 的分工是
+      「現在還剩什麼」vs「發生了什麼」。
+      ⭐ 為什麼不從事件軸累加算出 backlog：quality_events 有 60 天分區過期，
+      過期後累加的起點就丟了、曲線會系統性低估；本表直讀 int_orders_quarantine
+      的當下內容，不受事件保留期影響。
+      天生不可增量（狀態快照：一筆被 promote 就要從表裡消失），故 table 全量重建、不分區。
+      ⚠️ 目前沒有金額曝險度量——quarantine 的 items 從未被攤平（README.zh-TW §5.7）。
+      觸發點＝需要 int_order_items_quarantine。刻意不用其他欄位湊一個金額（§6.6）。
+    columns:
+      - name: quarantined_date
+        description: >
+          被隔離的日期，供老化分析。取自上游 quarantined_at，而它已正確採事件時間
+          （coalesce(quality_state_at, received_at)）而非跑批時間，故在全量重建下穩定。
+        tests:
+          - not_null
+      - name: dq_rule_version
+        description: >
+          攝入當下的規則版本。ODS 為 nullable，故補 unknown member '__UNKNOWN__'——
+          動的是維度值不是度量、可完整反查，無損（同 §6.5 對鍵的論證）。
+        tests:
+          - not_null
+      - name: effective_quality_state
+        description: >
+          quarantined（還可能被 promote 救回）vs permanently_rejected（已人工放棄）。
+          語意完全不同，混算會讓「待處理量」虛高，故進 grain。
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['quarantined', 'permanently_rejected']
+      - name: error_code
+        description: >
+          攤平自上游已備好的 error_codes 陣列（dq_error_codes macro 已在 quarantine 層
+          攤好，此處零額外 JSON 成本）。陣列先去重——同一 code 可能因多個 item 各觸發一次
+          而重複。'__NONE__' 是防禦性分桶：照目前 int_ 邏輯不該出現，但用 LEFT JOIN UNNEST
+          換一個分桶，比 CROSS JOIN 靜默掉列便宜得多。
+        tests:
+          - not_null
+      - name: orders_with_code
+        description: >
+          ⚠️【不可加】：帶此 code 的訂單數。跨 error_code 加總會把多碼訂單重複計數。
+          用途＝Top N 錯誤碼圖。
+      - name: orders_primary_code
+        description: >
+          ✅【可加】：以此 code 為主要碼的訂單數；主要碼一張訂單只有一個，
+          故跨 error_code 加總＝該切片訂單總數。用途＝「現在總共卡了幾筆」的 KPI。
+          ⚠️ 主要碼＝排序後第一個 code，【只】為確定性與配平，不代表嚴重性排序——
+          嚴重性優先級是業務定義，目前沒有，不憑空造（§6.6）。
+          配平由 assert_rpt_backlog_primary_code_balances 把關。
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - quarantined_date
+              - dq_rule_version
+              - effective_quality_state
+              - error_code
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "orders_with_code >= orders_primary_code"
+
+  - name: rpt_sales_daily_by_category
+    description: >
+      分類別日銷售預聚合（grain: order_date × category × is_returned）。
+      上游一律走 Gold（fct_order_items × dim_product × fct_orders），刻意不從 int_ 直接拉——
+      除了口徑單一與不重做 Gold 的語意決定之外，最關鍵的是：rpt_ 讀 int_ 會把 int_ 從
+      「內部建材」升格成「對外契約」，而「int_ 只被 DAG 內部消費」正是 int_ 不分區的
+      唯一理由（README.zh-TW §5.5）。
+      從 item 軸出發（category 只在 item 層），故訂單數必須 count(distinct)；
+      也因此本表不放任何訂單層度量（會被 line 列數放大）。
+      取 fct_orders.returned 不違反雙事實表禁令——只取 header 的維度旗標，不聚合其度量。
+      ⭐ is_returned 進 grain 而非輸出兩組金額：淨營收要不要扣退貨尚無業務定義（§6.6），
+      進 grain 等於把選擇權完整交給 BI，輸出兩組等於替業務挑了它可能都不要的定義。
+      現在 table 全量重建，但已掛 order_date 分區——分區欄位現在加是免費的、事後補要重建表。
+    columns:
+      - name: order_date
+        description: 訂單日期（業務時間軸），分區欄位。
+        tests:
+          - not_null
+      - name: category
+        description: >
+          商品分類，取自 dim_product（SCD1）。unknown product 的屬性為 NULL，
+          故補 '__UNKNOWN__' 讓 BI 不顯示空白分類（動維度值、無損）。
+        tests:
+          - not_null
+      - name: is_returned
+        description: >
+          承自 fct_orders.returned。⚠️【可為 NULL】＝退貨狀態未知，不是「沒退貨」——
+          刻意不 coalesce 成 false，那是 CLOUD_LAYER-TW §5.5.5 鐵律禁止的有損單向 collapse。
+          故本欄【不】掛 not_null。BI 上要區分三態（true / false / 未知）。
+      - name: orders
+        description: >
+          ⚠️【不可加】count(distinct order_id)。跨 category 加總會重複（一張訂單的品項
+          可橫跨多分類）。只在本表宣告的粒度上有效。
+      - name: customers
+        description: >
+          ⚠️【不可加】count(distinct customer_id)。跨日加總會重複（同一顧客多天下單）。
+          另注意：fct_ 的 customer_id 已 coalesce 到 '__UNKNOWN__'，所有無識別的顧客
+          會塌成一個顧客——這是 unknown member 的必然代價，不是 bug。
+          跨維度正確彙總的觸發點＝改存 BQ HLL sketch（見本檔頭紀律 2）。
+      - name: items
+        description: ✅ 可加。品項列數。與 fct_order_items 的列數配平，由 assert_rpt_sales_no_item_loss 把關。
+      - name: total_quantity
+        description: ✅ 可加。品項數量加總。
+      - name: gross_amount
+        description: ✅ 可加。quantity × unit_price 的加總。
+      - name: net_amount
+        description: >
+          ✅ 可加。折後金額加總。承自上游的嚴格 NULL 傳播，刻意不 coalesce——
+          可信度請一併看 items_missing_amount。
+      - name: cost_amount
+        description: ✅ 可加。成本加總。
+      - name: shipping_amount
+        description: ✅ 可加。運費加總。
+      - name: items_missing_amount
+        description: >
+          ⭐ ✅ 可加。該切片有幾個品項的 net_amount 算不出來（safe_cast 失敗 → NULL）。
+          BQ 的 SUM() 靜默忽略 NULL，一個壞 item 會讓金額少算一筆而不報錯；
+          沿用 fct_orders.items_missing_amount 的手法把不完整性顯性化，
+          讓 BI 端自己判斷這個加總可不可信，而不是替它把 NULL 當 0（有損且單向）。
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - order_date
+              - category
+              - is_returned
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "orders <= items"
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "items_missing_amount <= items"

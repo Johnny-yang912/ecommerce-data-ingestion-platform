@@ -38,7 +38,7 @@ ecommerce_dbt:
 ```bash
 dbt deps                              # 安裝套件（dbt_utils）
 dbt run    --select stg_orders        # 建模型（增量）
-dbt run    --select stg_orders --full-refresh   # 全量重建（見 §8）
+dbt run    --select stg_orders --full-refresh   # 全量重建（見 §9）
 dbt test   --select stg_orders        # 跑測試（含 Hard Gate）
 dbt source freshness                  # source 新鮮度
 dbt build  --select stg_orders        # run + test 一起
@@ -51,10 +51,12 @@ dbt build  --select stg_orders        # run + test 一起
 | Silver 入口 | `stg_` | 1:1 對應來源、型別對齊、命名標準化、**去重** | 保留所有資料含髒的；掛 Hard Gate |
 | Gold 入口 | `int_` | 跨表 join、衍生欄位、**Row Filter 攔截** | 只讓乾淨資料通過 |
 | Gold | `dim_`/`fct_` | Star Schema | 不含 `has_clean_error=TRUE` |
-| 報表 | `rpt_` | 固定粒度預聚合 | 同 Gold |
+| 報表 | `rpt_` | 固定粒度預聚合，BI 直接消費 | 業務報表同 Gold；品質報表刻意讀 quarantine |
 
 - 命名採 `stg_orders`（沿用專案既有文件），非 dbt 官方 `stg_<source>__<entity>`。
-- 檔案組織：`models/staging/` 內 `_staging__sources.yml`（source 定義）、`stg_orders.sql`、`stg_orders.yml`（測試/描述）；`models/intermediate/` 內各 `int_*.sql` 與共用的 `_intermediate__models.yml`；`models/marts/` 內各 `dim_*.sql`/`fct_*.sql` 與 `_marts__models.yml`。
+- 檔案組織：`models/staging/` 內 `_staging__sources.yml`（source 定義）、`stg_orders.sql`、`stg_orders.yml`（測試/描述）；`models/intermediate/` 內各 `int_*.sql` 與共用的 `_intermediate__models.yml`；`models/marts/` 內各 `dim_*.sql`/`fct_*.sql` 與 `_marts__models.yml`；`models/reports/` 內各 `rpt_*.sql` 與 `_reports__models.yml`。
+- `reports/` 與 `marts/` **平行而非巢狀在其下**：dbt 官方慣例會把 `rpt_` 放進 marts，但上表已把「報表」列為獨立一層，且兩張品質報表的上游是 `int_`/`stg_` 而非 marts，塞進 marts 反而語意錯。
+- ⭐ `rpt_` 有**兩個資料域**：業務報表上游一律走 `dim_`/`fct_`；品質報表讀 `int_orders_quarantine` 與 `stg_quality_events`——被隔離的列按定義**永遠不會出現在 Gold**，那不是繞過星狀模型，是不同的資料域（見 §7.1）。
 
 ## 4. 實作決策（`stg_orders`）
 
@@ -141,7 +143,7 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 
 **觸發閘門＝顯式清單，故不吃 drift**：`check_for_schema_changes` 比對的是 model 產出的欄位（顯式清單），不是底層 staging。staging 靠 `ALLOW_FIELD_ADDITION` 自動長的欄，在你把它加進顯式 SELECT 前偵測不到 → 不會自己 ALTER。此選項**只在刻意改清單（進 git、被 review）時觸發**，顯式紀律原封不動。
 
-**界線**（救不了的，仍走 §8 runbook）：
+**界線**（救不了的，仍走 §9 runbook）：
 - **歷史回填**（值要連舊分區一起有，如 Proposal C 重建）：它只 NULL 補舊分區、只寫回看窗 → 舊分區真值仍需 targeted refresh。
 - **改型別 / 改名 / 改分區**：仍 `--full-refresh` / 重建表。
 
@@ -220,7 +222,7 @@ C 方案下，`int_orders` 與 `int_orders_quarantine` 必須維持對 `stg_orde
 
 因此 `int_` 層一律 `materialized='table'`（在 `dbt_project.yml` 設為該資料夾預設）。`table` 走 `CREATE OR REPLACE`（DDL、原子替換、不受 sandbox 禁 DML 限制，§4.3 的限制對 `int_` 目前不適用），並順帶換到兩個好處：
 
-- **不會有邏輯漂移**：表永遠等於「現在的 SQL 套在現在的上游」。增量表的舊分區可能留著用舊版邏輯算出的列，得靠 runbook 補（`stg_orders` 就有這個包袱，見 §4.7、§8）。
+- **不會有邏輯漂移**：表永遠等於「現在的 SQL 套在現在的上游」。增量表的舊分區可能留著用舊版邏輯算出的列，得靠 runbook 補（`stg_orders` 就有這個包袱，見 §4.7、§9）。
 - **改欄位清單零成本**：不需要 `on_schema_change`、不需要判斷該不該 `--full-refresh`。
 
 #### 真要改增量，難的不是回看窗，是這三件事
@@ -368,7 +370,103 @@ warn 而非 error，因為這是**上游契約訊號**而非本層的正確性�
 | 淨營收 | `returned = TRUE` 的訂單要不要扣掉？ | `returned` 留在事實表當 flag，由下游決定 |
 | `profit_amount` | 毛利要不要含運費與稅？ | 不做；`net_amount - cost_amount` 下游自行計算 |
 
-## 7. 測試策略
+## 7. 實作決策（`rpt_` 層 — 報表）
+
+三張表，對應 BI 上三張圖：
+
+```
+int_orders_quarantine ──► rpt_quality_backlog          快照軸：現在還剩什麼
+stg_quality_events ─────► rpt_quality_events_daily     事件軸：發生了什麼
+fct_order_items ─┬──────► rpt_sales_daily_by_category  業務聚合
+dim_product ─────┤
+fct_orders ──────┘（只取 returned 旗標）
+```
+
+### 7.1 業務報表的上游一律走 Gold，不從 `int_` 直接拉
+
+`rpt_` 直接讀 `int_` 寫成固定查詢，在成熟團隊是 anti-pattern。四個理由，後兩個是本專案特有的：
+
+| # | 理由 | 繞過 `fct_` 的後果 |
+|---|---|---|
+| 1 | 口徑單一 | 「營收」有兩條血緣 → 兩個數字，且沒人知道哪個錯 |
+| 2 | 不重做 Gold 已經做過的語意決定 | unknown member、`item_count=0` 的 LEFT JOIN 全得再抄一遍 |
+| 3 | 會讓既有測試失效 | `assert_fct_orders_rollup_matches_items` 保的是 `fct_orders` 的 rollup；`rpt_` 若自己從 `int_` 重算，那支測試**完全不覆蓋它** |
+| 4 | ⭐ 會推翻 `int_` 層的架構前提 | §5.5「`int_` 只被 DAG 內部消費」是 `int_` **不分區的唯一理由**。`rpt_` 讀 `int_` 等於把 `int_` 從內部建材升格成對外契約 → 分區決策要重審，且 `int_` 從此改不動 |
+
+**合法的例外**：品質報表。被隔離的列按定義永遠不在 Gold，所以 `rpt_quality_*` 的上游必然是 `int_orders_quarantine` 與 `stg_quality_events`。
+
+> ⚠️ 這帶出一個容易寫錯的地方：**品質率的分母是 `stg_orders` 全體（含髒），不是 `fct_orders`**。用 Gold 當分母，quarantine_rate 恆為 0——那正是 Row Filter 的作用。
+
+> 附帶說明：`rpt_` 的教科書理由是「預聚合換效能與成本」，而在本專案目前的資料量上這個理由是零。文件裡不寫「為了效能」，因為那會是假的——真正的理由是**固定口徑 + BI 端不必自己組 join**。讓報表作者在 BI 裡自由拉 `fct_` 做聚合，指標定義就漂到 BI 裡去了，那才是 `rpt_` 在這個規模上要防的事。
+
+### 7.2 三個貫穿全層的紀律
+
+**① 比率一律不落地，只落地可加的分子與分母** ⭐
+
+預聚合層存 rate 是頭號陷阱：BI 一旦把日粒度 roll up 到週，Looker Studio 算的是 `AVG(daily_rate)`——**「比率的平均」而非「總和的比率」**，兩者只在每日分母相等時才一致，而分母永遠不相等。rate 交給 BI 計算欄位（它做 `SUM(分子)/SUM(分母)`，任何粒度都對）。
+
+> 為何不比照 `fct_orders.tax_pct` 那樣「留著並註明不可加」：`tax_pct` 是**原始事實**，不存就沒了；`quarantine_rate` 是純衍生值，留一個「只在日粒度正確」的欄位等於主動製造誤用機會。
+
+**② `COUNT(DISTINCT)` 在預聚合層結構性不可加**
+
+跨 category 加總 `orders` 會重複（一張訂單的品項橫跨多分類），跨日加總 `customers` 也會重複。這無法靠命名補救，只能標死。**觸發點**：需要跨維度正確彙總 distinct 時，改存 BQ 原生 HLL sketch（`HLL_COUNT.INIT` → BYTES，上層 `HLL_COUNT.MERGE`，誤差 ~1%）。現在不做的理由不是麻煩，是 Looker Studio 的計算欄位**呼叫不了** `HLL_COUNT.MERGE`，得再包一層 view——那個摩擦點目前不存在（同 §5.3 的紀律）。
+
+**③ `rpt_` 只做 `GROUP BY` / window**
+
+不做新的 join 語意、不做新的清洗、不引入新的業務定義。若某張 `rpt_` 需要 `dim_`/`fct_` 給不出的 join，那是**星狀模型缺東西的訊號**，該補的是 Gold，不是在這裡湊。（與 §5.7「填值加在 `dim_/fct_`，不回頭改 `int_`」同一個方向感。）
+
+### 7.3 品質報表拆成兩張：兩條時間軸，兩種可變性 ⭐
+
+DQ 文件原規劃的 `rpt_quality_daily` 混了兩件性質相反的事，實作時拆開：
+
+| | `rpt_quality_events_daily` | `rpt_quality_backlog` |
+|---|---|---|
+| 軸 | **事件軸**（`event_at`） | **快照**（讀 quarantine 當下內容） |
+| 一列的語意 | 「當天發生了 N 個品質事件」 | 「現在還有 N 筆卡著」 |
+| 會被追溯改寫嗎 | **不會**（append-only） | 會（本來就是現況） |
+| 可否增量 | ✅ 軸與變更源對齊 | ❌ 天生不可增量 |
+
+**為什麼 backlog 不能從事件軸累加算出來**：理論上 `backlog(t) = 累計 quarantined − promoted − rejected`，事件流是狀態的完整導數。但 `quality_events` 有 60 天分區過期——**過期後累加的起點就丟了，而且失真是單向的**（起點只會少算 quarantined → backlog 被系統性低估）。快照表直讀 `int_orders_quarantine`，不受事件保留期影響。
+
+**為什麼事件表不掛攝入軸**：若按 `received_at` 分組，今天 promote 一筆三個月前的訂單會**改掉三個月前那一列的組成**——那是狀態不是事件，且會讓「v1 攔了多少」這個數字隨時間漂移，直接牴觸 [DQ_ARCHITECTURE-TW](../DQ_ARCHITECTURE-TW.md)〈歷史指標為何不會被追溯性改寫〉。
+
+### 7.4 物化：本專案唯一一個增量天生正確的下游模型
+
+| | 物化 | 分區 | 理由 |
+|---|---|---|---|
+| `rpt_quality_events_daily` | `incremental` + `insert_overwrite` + `copy_partitions` | `event_date`(DAY) | 事件軸 append-only，時間軸與「什麼會變」對齊 → 回看窗就夠，**不需要** §5.4 那套受影響分區 discovery |
+| `rpt_quality_backlog` | `table` | **不分區** | 狀態快照，一筆被 promote 就要從表裡消失 → 增量失誤是**永久錯誤**不是延遲。分區的價值在分區級增量替換，本層永遠不會增量 |
+| `rpt_sales_daily_by_category` | `table` | `order_date`(DAY) | ⭐ 現在全量，但**分區欄位現在加是免費的、事後補要重建表** |
+
+> ⚠️ `rpt_quality_events_daily` 的 `var('rpt_quality_events_lookback_days')` **必須 ≥ `stg_quality_events_lookback_days`**。上游窗比下游窗大時，上游今天才補進來的舊事件會落在下游窗外 → 永遠撈不到，**且不報錯**（分區存在，只是內容少算）。兩個 var 要一起調。
+
+**時區**：`event_date = date(event_at)` 走 **UTC**，刻意不用 `date(event_at, 'Asia/Taipei')`——時區轉換會讓分區裁切的謂詞下推失效。倉儲層落地 UTC、時區呈現交給 BI 是標準分工，但這代表「當日」的邊界是 UTC 午夜，與台北差 8 小時，故 column description 也寫了一次。
+
+**`rpt_sales` 未來切增量的路徑**：「日 incremental + `order_date` 回看窗 ＋ 排程每週一次 `--full-refresh`」，**不是**自己寫受影響分區 discovery。後者會讓一張純業務報表被迫依賴 `quality_events` 當變更偵測器（為非語意的理由建立耦合），且在 Proposal B 大規模回流那天會退化成比全量還貴（§5.4 第 2 點）。代價是可寫進文件的一句話：**追溯性修正在本報表的可見延遲 ≤ 7 天**。
+
+### 7.5 fan-out 的處置：配平用的可加度量
+
+`rpt_quality_backlog` 攤平到 `error_code`（一張訂單可能多碼）→ 跨 code 加總會重複計數。處置是同一張表放**兩個語意不同的度量**：
+
+- `orders_with_code`：帶此 code 的訂單數（**不可加**，Top N 圖用）
+- `orders_primary_code`：以此 code 為主要碼的訂單數（**可加**，「總共卡幾筆」KPI 用）
+
+主要碼＝`error_codes` 去重排序後的第一個。**只**為確定性與配平，**不**代表嚴重性排序——嚴重性優先級是業務定義，目前沒有，不憑空造（同 §6.6）。
+
+> 被否決的替代方案：加一列 `error_code = '__TOTAL__'` 的彙總列。它讓「不小心把 `__TOTAL__` 也加進去」變成新的誤用面，比 fan-out 本身更危險。
+
+陣列**去重不可省**：同一個 code 可能因多個 item 各觸發一次而重複（同 §5.3 那條「不可用 `array_length(codes) = 1` 判斷」），不去重會讓 `orders_with_code` 把一張訂單算成多張。
+
+### 7.6 刻意先不做的
+
+| 項目 | 為什麼不做 | 觸發點 |
+|---|---|---|
+| **金額曝險**（被卡住的訂單值多少錢） | `int_order_items` 的來源是 `int_orders`（乾淨路徑），quarantine 的 items **從未被攤平**（§5.7 已預告） | 需要 `int_order_items_quarantine`；啟用時機＝品質報表需要業務曝險金額 |
+| **HLL sketch** | Looker Studio 計算欄位呼叫不了 `HLL_COUNT.MERGE` | 出現需要跨維度彙總 distinct 的圖表 |
+| **逐格金額對帳測試** | 在 `table` 全量重建下是**同義反覆**（用同一段 SQL 驗自己，恆綠、零資訊） | ⭐ 見 §8 |
+| `order_status` 進 grain | 值域未定義，不知道有沒有「未成立」狀態 | 確認值域後決定要不要過濾 |
+
+## 8. 測試策略
 
 | 測試 | 對象 | severity | 說明 |
 |---|---|---|---|
@@ -386,21 +484,33 @@ warn 而非 error，因為這是**上游契約訊號**而非本層的正確性�
 | `unique` + `not_null` | `dim_customer`/`dim_product` 的維度鍵；`fct_orders.order_id`；`fct_order_items.order_item_key` | error | 維度 grain 與事實表代理鍵唯一性 |
 | `relationships` | 兩張 `fct_` 的 `customer_id`/`product_id` → `dim_*`；`fct_order_items.order_id` → `fct_orders` | error | 星狀模型的 FK 完整性。配 `not_null`（unknown member 保證 FK 不為 NULL，§6.5）|
 | `dbt_utils.unique_combination_of_columns` | `fct_order_items` 的 `(order_id, item_index)` | error | 宣告的 grain |
+| **`assert_rpt_sales_no_item_loss`**（singular）⭐ | `rpt_sales` 的 `sum(items)` vs `fct_order_items` 列數（窗內，逐日） | error | `rpt_sales` 引入了整條 DAG 唯一一組**新的 join**（× `dim_product`、× `fct_orders`）。join 悄悄變 INNER 的表現是「營收慢慢變小」，不報錯。用 full outer join 才抓得到「多了」（維度扇出） |
+| **`assert_rpt_quality_events_split`**（singular）⭐ | `initial_clean + initial_quarantined = initial_evaluations` | error | **寬表的值域擴張警報器**：寬表的代價是「上游多一個 `to_state`，下游要改 schema 才看得到」。多出來的狀態會讓 `count(*)` 漲而 `countif` 不漲 → 立刻紅，而不是靜默蒸發。寬表能安心用靠的就是這支 |
+| `assert_rpt_backlog_primary_code_balances`（singular） | `sum(orders_primary_code)` vs `int_orders_quarantine` 實際訂單數 | error | §7.5 配平度量的安全網。失效的症狀是 BI 上 backlog 總數直接錯掉，不自癒 |
+| `dbt_utils.unique_combination_of_columns` + `not_null` | 三張 `rpt_` 各自宣告的 grain | error | 預聚合表 grain 破裂＝所有數字直接翻倍，且無聲 |
+| `dbt_utils.expression_is_true` | `orders <= items`、`items_missing_amount <= items`、`orders_with_code >= orders_primary_code` | error | 便宜的合理性下限 |
 
 > 自訂 generic test 與部分內建測試的參數需巢狀在 `arguments:` 下（dbt 1.11 要求，否則 `MissingArgumentsPropertyInGenericTestDeprecation`）。
 
-## 8. 常見操作 runbook
+> ⚠️ **刻意先不寫的測試**：`assert_rpt_sales_matches_fct` 這類**逐格金額對帳**。在 `table` 全量重建下它是同義反覆（`rpt_` 的 sum 就是把 `fct_` 的欄位加起來），恆綠、零資訊，價值要到切增量那天才兌現（抓漏分區）。
+>
+> **→「`rpt_sales` 改增量」與「加逐格對帳測試」是同一件事的兩半，不得只做前者。** 與 §5.4「改增量的那一刻就是收斂觸發點被觸發的時刻」同構。
+>
+> 對照組：`assert_rpt_sales_no_item_loss` 現在就寫，因為它測的是**列數跨兩個 join**，與物化策略無關——那是真實可能發生的失效。
+
+## 9. 常見操作 runbook
 
 - **何時 `--full-refresh`**：改分區/叢集、改去重邏輯、回看窗外的歷史需重算、或首次建表。走 DDL、不受 sandbox 限制。（僅適用 `stg_` 的增量模型；`int_` 為 `table` 全量重建，每次 run 本就重建。）
 - **Proposal C targeted refresh**：修正列落在舊分區、回看窗看不到 → 修復 runbook 最後一步對災區分區做 targeted refresh（`--full-refresh` 或未來對單分區 `insert_overwrite`）。見 [CLOUD_LAYER-TW §7.4](../CLOUD_LAYER-TW.md)、DQ C-2 #7。
 - **改動 `int_orders` 或 `int_orders_quarantine` 前**：先過一遍 §5.2 對齊清單；改完跑 `dbt build --select intermediate+`，確認 `assert_orders_split_is_partition` 為綠。
+- **調 `rpt_quality_events_daily` 的回看窗**：`rpt_quality_events_lookback_days` 必須 ≥ `stg_quality_events_lookback_days`，兩個 var 一起調（§7.4）。
 
-## 9. 相依與版本
+## 10. 相依與版本
 
 - dbt-core 1.11 / dbt-bigquery 1.11
 - `packages.yml`：`dbt-labs/dbt_utils >=1.1.0,<2.0.0`（實裝 1.4.1）
 
-## 10. 現況與待辦
+## 11. 現況與待辦
 
 - ✅ `stg_orders`（去重 + Hard Gate + freshness，增量）
 - ✅ `stg_quality_events`（以 `id` 為 grain 去重，保留完整狀態機歷史）
@@ -408,7 +518,10 @@ warn 而非 error，因為這是**上游契約訊號**而非本層的正確性�
 - ✅ `int_order_items`（items 攤平到 item 粒度）
 - ✅ `dim_customer`、`dim_product`（SCD1 + unknown member）
 - ✅ `fct_orders`、`fct_order_items`（雙事實表；rollup 一致性與無損投影皆有測試把關）
+- ✅ `rpt_quality_events_daily`（事件軸，增量）、`rpt_quality_backlog`（快照）、`rpt_sales_daily_by_category`
 - ⬜ 場景專用 `int_orders_*`（設計已備妥，待真實分析場景出現才啟用——見 §5.3）
 - ⬜ SCD2 `dim_customer`（設計已備妥，觸發點＝啟用帳單——見 §6.3）
-- ⬜ `rpt_quality_*`
+- ⬜ `rpt_sales_*` 切增量（路徑＝日增量 + 週全量；**必須同時補逐格對帳測試**——見 §7.4、§8）
+- ⬜ 金額曝險度量（需 `int_order_items_quarantine`——見 §7.6）
 - ⬜ Proposal B（Airflow 重評估寫 `quality_events`）——下游回流路徑已就緒，只等事件產生端
+- ⚠️ Proposal B 事件產生端未實作 → `rpt_quality_events_daily` 的 `promotions` / `rejections` / `re_quarantines` 目前**恆為 0**（欄位已備妥，事件一產生即有值）

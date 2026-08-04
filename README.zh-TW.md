@@ -532,7 +532,7 @@ Looker Studio（直連 BigQuery）
 - `stg_*`：資料清洗的入口，1:1 對應 BigQuery staging，不做業務邏輯
 - `int_*`：中間建材層，處理跨表 join 與複雜衍生邏輯，供 dim/fct 引用
 - `dim_* / fct_*`：Star Schema 的維度與事實表，適合彈性的 ad-hoc 查詢
-- `rpt_*`：在 dim/fct 之上進一步聚合，粒度固定，專為 Dashboard 效能與成本最佳化
+- `rpt_*`：在 dim/fct 之上進一步聚合，粒度固定，專為 Dashboard 效能與成本最佳化。分**兩個資料域**：業務報表上游一律走 `dim_`/`fct_`（口徑單一、不繞過 Gold 的語意決定與測試）；品質報表讀 `int_orders_quarantine` 與 `stg_quality_events`——被隔離的列按定義永遠不在 Gold。比率一律不落地、`COUNT(DISTINCT)` 標死不可加，理由見 [ecommerce_dbt/README.zh-TW §7](./ecommerce_dbt/README.zh-TW.md)
 
 ---
 
@@ -547,7 +547,7 @@ Looker Studio（直連 BigQuery）
 
 **Phase 2 — 可驗證性**
 - [v] Pytest — 248 個測試，8 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
-- [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）待 Phase 4 實作
+- [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）除 Airflow 重評估外皆已實作
 
 **Phase 3 — 工程化**
 - [v] 服務對服務驗證（API Key）— 靜態 `X-API-Key`（`.env` 載入 `key:client_id` 對應，支援同 client 多把 key 做輪替），`secrets.compare_digest` constant-time 比對；掛載於全部端點，缺失/無效回 401；驗證出的 `client_id` 落地為 `source_client_id`（Raw + ODS），作為資料血緣起點。**未採 JWT 使用者登入**——本服務是內部攝取單元、無人類使用者（見〈服務對服務驗證〉設計決策）
@@ -560,7 +560,7 @@ Looker Studio（直連 BigQuery）
 - [v] dbt Core `stg_` 層（`stg_orders`：`raw_id` 去重 + Hard Gate + source freshness；`stg_quality_events`：以 `id` 為 grain 去重、保留完整狀態機歷史；incremental + `insert_overwrite` + `copy_partitions`）— 見 [ecommerce_dbt/README.zh-TW.md](./ecommerce_dbt/README.zh-TW.md)
 - [v] dbt Core `int_` 層（Gold 入口，攔截發生於此）：`int_orders`（Row Filter，判定基準為「ODS 快照 ⊕ `quality_events` 最新事件」合成的**有效品質狀態**，非 `has_clean_error` 字面值）、`int_orders_quarantine`（含 `error_codes` 攤平、`quarantined_at` 取事件時間）、`int_order_items`（items 攤平到 item 粒度）。**劃分不變式**（兩表對 `stg_orders` 互斥 + 窮盡）由 singular test 把關；物化刻意採 `table` 全量重建而非 `received_at` 增量——Proposal B 的 promotion 事件落當天分區、受影響訂單卻在舊分區，增量會靜默切斷回流路徑
 - [v] dbt Core：dim_*/fct_*（Kimball header/line 雙事實表 + 兩張 SCD1 維度，見 [ecommerce_dbt/README.zh-TW](./ecommerce_dbt/README.zh-TW.md) §6）
-- [ ] dbt Core：rpt_*；含 `rpt_quality_*`（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）。場景專用 `int_orders_*` 與 SCD2 `dim_customer` 設計已備妥，各有明確觸發點才啟用
+- [v] dbt Core：rpt_*（三張：`rpt_quality_events_daily` 事件軸增量、`rpt_quality_backlog` 快照、`rpt_sales_daily_by_category` 業務聚合；見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md) 與 [ecommerce_dbt/README.zh-TW §7](./ecommerce_dbt/README.zh-TW.md)）。⚠️ Proposal B 事件產生端未實作，故回流相關欄位目前恆為 0。場景專用 `int_orders_*`、SCD2 `dim_customer`、`rpt_sales_*` 切增量、品質報表的金額曝險度量，設計皆已備妥，各有明確觸發點才啟用
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — 自動化 + Queue 升級**

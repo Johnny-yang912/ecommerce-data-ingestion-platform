@@ -1,0 +1,483 @@
+"""seed_demo.py — 產生 BI 展示用的訂單資料，走真實攝入路徑。
+
+與 load_test.py 的關係
+──────────────────────
+兩支腳本【目的不同、刻意不共用】：
+
+    load_test.py   壓吞吐：高併發、短時間、只關心 latency 與 status code 分佈
+    seed_demo.py   造資料：低速率、可重現、關心【落地後的資料長什麼樣】
+
+不 import load_test 的產生器，是因為兩者的取樣需求已經分岔——本檔要控制
+分類權重、日期分佈、以及刻意注入的髒資料比例，這些都是壓測不需要的。
+共用會讓「調壓測參數」與「調 demo 資料形狀」互相干擾。
+payload 的【結構】真相仍然只有一份，在 schema.py（OrderIN），不因此重複。
+
+為什麼走 POST /orders 而不是直接 INSERT 進 ODS
+─────────────────────────────────────────────
+資料必須走完整條真實路徑才有展示價值：
+    Pydantic 驗證 → format_clean → business_clean → CAS claim → idempotency
+    → ODS + quality_events
+直接 INSERT 進 ODS 等於【繞過品質架構去展示品質架構】，產出的 quality_events
+是假的，rpt_quality_* 上的每個數字都失去意義。
+
+⚠️ 限流：POST /orders 是 60/minute（main.py 的 @limiter.limit，key 為 client_id）
+─────────────────────────────────────────────────────────────────────────
+所以 --rps 預設 0.8（48/min）留安全邊際。灌 n 筆約需 n / (rps * 60) 分鐘，
+例如 800 筆 ≈ 17 分鐘。這是刻意的：seeding 不是壓測，跑快沒有好處，
+反而會把 CAS 競爭與背景任務佇列攪進來，讓「這批資料為什麼長這樣」變得難以解釋。
+腳本會自動處理 429（指數退避重送），不會靜默掉單。
+
+> 若要更快：在 .env 的 API_KEYS 加一組獨立的 seeding 身分（例如
+>   demo_seed_key:demo-seeder），限流是 per client_id，新身分有自己的配額。
+> 附帶好處是 ODS.source_client_id 從此能區分「demo 資料」與「上游真實資料」，
+> 資料血緣多一個維度。本腳本不自動改 .env——那是你的環境設定。
+
+⚠️ received_at 無法回填
+──────────────────────
+order_date 在 payload 裡，本腳本可以自由灑；但 received_at / event_at 是
+伺服器在攝入當下產生的。也就是說：
+
+    今天灌一萬筆，rpt_quality_events_daily 的時間軸上仍然只有【一個點】。
+
+品質趨勢圖需要跨日的資料，唯一的做法是【分幾天各跑一次】（或掛排程）。
+這同時也是 CLOUD_LAYER §1.7.7 說的「持續攝入」——一併把 source freshness
+從「預期紅」變成有意義的 gate。
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import os
+import random
+import time
+from collections import Counter
+from datetime import date, datetime, timedelta
+
+import httpx
+
+# ── 值域 ─────────────────────────────────────────────────────────────────────
+# 分類刻意給不均勻權重：真實電商的分類分佈是長尾的，均勻分佈會讓 BI 上的
+# 堆疊圖每條一樣高，看起來像假資料（事實上也就是假資料）。
+CATEGORIES = [
+    ("Electronics", 30), ("Clothing", 25), ("Home & Kitchen", 18),
+    ("Books", 14), ("Sports", 8), ("Beauty", 5),
+]
+SUB_CATEGORIES = ["General", "Premium", "Budget", "Seasonal"]
+BRANDS         = ["Acme", "Globex", "Initech", "Umbrella", "Soylent"]
+CONDITIONS     = ["New", "Refurbished", "Open Box"]
+
+GENDERS   = ["male", "female", "other"]
+TIERS     = ["bronze", "silver", "gold", "platinum"]
+CHANNELS  = ["organic", "paid_search", "referral", "social_media", "email"]
+DEVICES   = ["mobile", "desktop", "tablet"]
+PAYMENTS  = ["credit_card", "paypal", "bank_transfer", "cash_on_delivery"]
+SHIP_MODES = ["Standard Class", "Second Class", "First Class", "Same Day"]
+STATUSES   = ["Shipped", "Pending", "Delivered", "Cancelled"]
+
+COUNTRY = "Taiwan"
+REGIONS = ["North", "Central", "South", "East"]
+CITIES  = ["Taipei", "Kaohsiung", "Taichung", "Tainan", "Hsinchu", "Taoyuan"]
+
+
+def _weighted(rng: random.Random, pairs: list[tuple[str, int]]) -> str:
+    vals, weights = zip(*pairs)
+    return rng.choices(vals, weights=weights, k=1)[0]
+
+
+def make_product(pid_num: int) -> dict:
+    """商品屬性一律【由 product_id 決定】，不吃訂單的 rng。
+
+    同一個 product_id 在不同訂單必須帶相同的 name/category/brand，否則
+    dim_product 無法以 product_id 為 grain（load_test.py 早期就踩過這個坑：
+    342 個 product_id 裡 163 個屬性衝突）。用 product_id 當 seed 另開一個
+    Random，就結構性地保證了這件事。
+    """
+    prng = random.Random(pid_num)
+    return {
+        "product_id":   f"P{pid_num:04d}",
+        "product_name": f"Product {pid_num:04d}",
+        "category":     _weighted(prng, CATEGORIES),
+        "sub_category": prng.choice(SUB_CATEGORIES),
+        "brand":        prng.choice(BRANDS),
+        "condition":    prng.choice(CONDITIONS),
+    }
+
+
+def make_order(rng: random.Random, order_id: str, lookback_days: int) -> dict:
+    """產生一筆【乾淨】的訂單 payload。髒資料由 inject_dirty() 事後注入。
+
+    order_date 貼近今天（預設回看 45 天）：Gold 的 fct_* 按 order_date 分區，
+    而 BQ sandbox 對每張分區表無條件套 60 天過期（見 CLOUD_LAYER §1.7.8）。
+    order_date 離今天太遠的訂單【一進 Gold 就被回收】，等於白灌。
+    """
+    order_dt = date.today() - timedelta(days=rng.randint(0, lookback_days))
+    delivery_dt = order_dt + timedelta(days=rng.randint(1, 14))
+    cust_num = rng.randint(1, 400)
+
+    return {
+        "order_id":      order_id,
+        "order_date":    order_dt.isoformat(),
+        "ship_mode":     rng.choice(SHIP_MODES),
+        "order_status":  rng.choice(STATUSES),
+        "delivery_date": delivery_dt.isoformat(),
+        "delivery_days": (delivery_dt - order_dt).days,
+        # 退貨率 ~12%：is_returned 進了 rpt_sales 的 grain，全 false 會讓那個
+        # 維度失去意義；給一個像樣的比例，BI 上「扣不扣退貨」才是個真問題。
+        "returned":      rng.random() < 0.12,
+        "customer": {
+            "customer_id":              f"C{cust_num:04d}",
+            "customer_name":            f"Customer {cust_num:04d}",
+            "age":                      rng.randint(18, 75),
+            "gender":                   rng.choice(GENDERS),
+            "membership_tier":          rng.choice(TIERS),
+            "registration_date":        (date.today() - timedelta(days=rng.randint(30, 1500))).isoformat(),
+            "acquisition_channel":      rng.choice(CHANNELS),
+            "newsletter_subscribed":    rng.random() < 0.4,
+            "preferred_payment_method": rng.choice(PAYMENTS),
+            "preferred_device":         rng.choice(DEVICES),
+        },
+        "address": {
+            "country":     COUNTRY,
+            "region":      rng.choice(REGIONS),
+            "state":       rng.choice(CITIES),
+            "city":        rng.choice(CITIES),
+            "postal_code": f"{rng.randint(10000, 99999)}",
+        },
+        "payment": {
+            "payment_method": rng.choice(PAYMENTS),
+            "tax_pct":        rng.choice([0, 5, 5, 5, 8, 10]),
+        },
+        "behavior": {
+            "device_used":        rng.choice(DEVICES),
+            "is_repeat_customer": rng.random() < 0.35,
+            "customer_rating":    rng.choice([None, 1, 2, 3, 4, 4, 5, 5]),
+        },
+        "items": [
+            {
+                "product":      make_product(rng.randint(1, 300)),
+                "quantity":     rng.randint(1, 8),
+                "unit_price":   round(rng.uniform(10.0, 500.0), 2),
+                "cost_price":   round(rng.uniform(5.0, 200.0), 2),
+                "discount_pct": rng.choice([0, 0, 0, 5, 10, 15, 20, 30]),
+                "shipping_fee": round(rng.uniform(0.0, 25.0), 2),
+            }
+            for _ in range(rng.randint(1, 4))
+        ],
+    }
+
+
+# ── 髒資料注入 ───────────────────────────────────────────────────────────────
+#
+# 每個注入器對應 clean.py 的一個 DQCode，回傳它預期會觸發的 code 名稱
+# （回傳值僅供本腳本統計與事後對帳；真正的判定永遠是 business_clean 說了算）。
+#
+# 為什麼要刻意注入：現有 554 筆裡只有 14 筆髒（~2.5%），而且是隨機撞出來的，
+# 10 個 DQCode 實際只碰得到一兩個 → rpt_quality_backlog 的「Top N 錯誤碼」
+# 那張圖近乎空白，而那正是最能展示 RCA 能力的一張。
+
+def _dirty_quantity_non_positive(p: dict, rng: random.Random) -> str:
+    rng.choice(p["items"])["quantity"] = rng.choice([0, -1, -5])
+    return "quantity_non_positive"
+
+
+def _dirty_unit_price_negative(p: dict, rng: random.Random) -> str:
+    rng.choice(p["items"])["unit_price"] = -round(rng.uniform(1.0, 200.0), 2)
+    return "unit_price_negative"
+
+
+def _dirty_discount_pct_out_of_range(p: dict, rng: random.Random) -> str:
+    rng.choice(p["items"])["discount_pct"] = rng.choice([-10.0, 120.0, 150.5])
+    return "discount_pct_out_of_range"
+
+
+def _dirty_non_finite_number(p: dict, rng: random.Random) -> str:
+    """NaN / Infinity 注入 items（不是訂單層欄位）。
+
+    items 的值不經 Pydantic 型別強轉（ODSOrder.items 是 Any，直接吃 payload
+    原始 dict），所以非有限值進得來、由 business_clean 攔下並正規化為 None。
+    訂單層的 tax_pct/customer_rating 走 Pydantic float 欄位，行為不同，
+    這裡刻意只打 items，讓觸發路徑單一可預期。
+
+    json.dumps 預設 allow_nan=True 會輸出 NaN / Infinity 字面值，
+    伺服器端 json.loads 同樣預設接受——這條路徑是通的（clean.py 的
+    NON_FINITE_NUMBER 規則本來就是為它而寫）。
+    """
+    item = rng.choice(p["items"])
+    field = rng.choice(["unit_price", "quantity", "discount_pct"])
+    item[field] = rng.choice([float("nan"), float("inf"), float("-inf")])
+    return "non_finite_number"
+
+
+def _dirty_tax_pct_out_of_range(p: dict, rng: random.Random) -> str:
+    p["payment"]["tax_pct"] = rng.choice([-5.0, 120.0, 250.0])
+    return "tax_pct_out_of_range"
+
+
+def _dirty_delivery_before_order(p: dict, rng: random.Random) -> str:
+    od = date.fromisoformat(p["order_date"])
+    p["delivery_date"] = (od - timedelta(days=rng.randint(1, 10))).isoformat()
+    return "delivery_before_order"
+
+
+def _dirty_customer_rating_out_of_range(p: dict, rng: random.Random) -> str:
+    p["behavior"]["customer_rating"] = rng.choice([0, -2, 7.5, 11])
+    return "customer_rating_out_of_range"
+
+
+def _dirty_age_out_of_range(p: dict, rng: random.Random) -> str:
+    p["customer"]["age"] = rng.choice([-3, 150, 999])
+    return "age_out_of_range"
+
+
+def _dirty_field_too_long(p: dict, rng: random.Random) -> str:
+    """長度必須落在【軟性上限與 DB 硬牆之間】。
+
+    clean.py 的 SOFT_MAX_LENGTHS 是 customer_name 100 / city 80；
+    models.py 的欄位硬牆是 customer_name 255 / city 128。
+    超過硬牆會撞 DataError 被 process.py fast-fail 成終態 error——那筆資料
+    【不會進 quarantine】，也就不會出現在品質報表裡，注入就白做了。
+    """
+    if rng.random() < 0.5:
+        p["customer"]["customer_name"] = "Customer " + "x" * rng.randint(110, 200)   # 100 < len < 255
+    else:
+        p["address"]["city"] = "Taipei " + "y" * rng.randint(80, 110)                # 80 < len < 128
+    return "field_too_long"
+
+
+def _dirty_order_date_in_future(p: dict, rng: random.Random) -> str:
+    """⚠️ 權重刻意壓到最低（見 DIRTY_WEIGHTS）。
+
+    未來日期超出 BQ 分區合法區間時會靜默落進 __UNPARTITIONED__
+    （CLOUD_LAYER §1.7.3），在 BI 的日期軸上會變成一個突兀的空桶。
+    保留極小比例是為了讓這條規則在 demo 裡「存在且可被查到」，
+    而不是為了讓它在圖上被看見。
+    """
+    p["order_date"] = (date.today() + timedelta(days=rng.randint(2, 20))).isoformat()
+    return "order_date_in_future"
+
+
+# 權重刻意做成長尾：真實系統的錯誤分佈從來不是均勻的，均勻分佈會讓
+# 「Top N 錯誤碼」那張圖變成一排等高的長條，反而不像真的。
+DIRTY_WEIGHTS: list[tuple] = [
+    (_dirty_quantity_non_positive,        22),
+    (_dirty_discount_pct_out_of_range,    18),
+    (_dirty_unit_price_negative,          15),
+    (_dirty_customer_rating_out_of_range, 12),
+    (_dirty_delivery_before_order,        10),
+    (_dirty_tax_pct_out_of_range,          8),
+    (_dirty_age_out_of_range,              6),
+    (_dirty_field_too_long,                5),
+    (_dirty_non_finite_number,             3),
+    (_dirty_order_date_in_future,          1),   # ⚠️ 見該函式 docstring
+]
+
+# 一筆訂單同時帶多個錯誤的機率。這不只是為了擬真——rpt_quality_backlog 的
+# orders_with_code（不可加）與 orders_primary_code（可加）之所以要分成兩個
+# 度量，前提就是「一張訂單可能有多個 code」。全部單碼的話這個設計在 demo 上
+# 看不出差別，assert_rpt_backlog_primary_code_balances 也驗不到有意義的東西。
+MULTI_ERROR_RATE = 0.25
+
+
+def inject_dirty(payload: dict, rng: random.Random) -> list[str]:
+    """對 payload 就地注入 1~2 個違規，回傳預期觸發的 code 清單。"""
+    funcs, weights = zip(*DIRTY_WEIGHTS)
+    codes = [rng.choices(funcs, weights=weights, k=1)[0](payload, rng)]
+    if rng.random() < MULTI_ERROR_RATE:
+        codes.append(rng.choices(funcs, weights=weights, k=1)[0](payload, rng))
+    return codes
+
+
+# ── 送出 ─────────────────────────────────────────────────────────────────────
+
+def resolve_api_key(explicit: str | None) -> str:
+    """優先用 --api-key；否則取 .env 的 API_KEYS 第一組的 key 部分。"""
+    if explicit:
+        return explicit
+    raw = os.getenv("API_KEYS")
+    if not raw:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(".env")
+            raw = os.getenv("API_KEYS")
+        except ImportError:
+            pass
+    if not raw:
+        raise SystemExit("找不到 API 金鑰：請用 --api-key 指定，或在 .env 設定 API_KEYS")
+    return raw.split(",")[0].split(":")[0].strip()
+
+
+async def post_one(client: httpx.AsyncClient, url: str, headers: dict,
+                   payload: dict, max_retries: int = 5) -> tuple[str, int | None]:
+    """送一筆；429 指數退避重送。回傳 (結果標籤, raw_id)。
+
+    429 必須重送而不是放棄——靜默掉單會讓「我灌了 n 筆」與實際落地筆數對不上，
+    而這個腳本存在的意義就是產出一批【可解釋的】資料。
+    """
+    # allow_nan=True（預設）讓 NaN/Infinity 以字面值送出，供 non_finite_number 注入。
+    body = json.dumps(payload)
+    delay = 2.0
+    for attempt in range(max_retries):
+        try:
+            r = await client.post(url, content=body, headers=headers)
+        except httpx.RequestError as e:
+            return f"neterr:{type(e).__name__}", None
+        if r.status_code == 429:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+            continue
+        if r.status_code in (200, 201, 202):
+            try:
+                return "ok", r.json().get("raw_id")
+            except Exception:
+                return "ok", None
+        return f"http:{r.status_code}", None
+    return "http:429_giveup", None
+
+
+async def run(args) -> None:
+    rng = random.Random(args.seed)
+    api_key = resolve_api_key(args.api_key)
+    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+    batch = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if args.dry_run:
+        p = make_order(rng, f"SEED-{batch}-0001", args.order_date_days)
+        codes = inject_dirty(p, rng) if args.dirty_rate > 0 else []
+        print(f"[dry-run] 預期觸發 code: {codes or '(clean)'}")
+        print(json.dumps(p, indent=2, ensure_ascii=False))
+        return
+
+    interval = 1.0 / args.rps
+    eta_min = args.n * interval / 60
+    print(f"目標 {args.n} 筆 → {args.url}")
+    print(f"髒資料比例 {args.dirty_rate:.0%}｜速率 {args.rps}/s（{args.rps*60:.0f}/min，上限 60/min）"
+          f"｜預估 {eta_min:.1f} 分鐘")
+    print(f"批次標記 SEED-{batch}-*｜order_date 回看 {args.order_date_days} 天\n")
+
+    results, expected_codes = Counter(), Counter()
+    raw_ids: list[int] = []
+    started = time.monotonic()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i in range(1, args.n + 1):
+            payload = make_order(rng, f"SEED-{batch}-{i:04d}", args.order_date_days)
+            if rng.random() < args.dirty_rate:
+                for c in inject_dirty(payload, rng):
+                    expected_codes[c] += 1
+
+            tag, raw_id = await post_one(client, args.url, headers, payload)
+            results[tag] += 1
+            if raw_id is not None:
+                raw_ids.append(raw_id)
+
+            if i % 25 == 0 or i == args.n:
+                elapsed = time.monotonic() - started
+                print(f"  {i}/{args.n}  ok={results['ok']}  "
+                      f"其他={sum(v for k, v in results.items() if k != 'ok')}  "
+                      f"({elapsed/60:.1f} 分)")
+
+            if i < args.n:
+                # 依「應該送到第幾筆」對齊，避免每筆的處理時間累積成漂移
+                target = started + i * interval
+                drift = target - time.monotonic()
+                if drift > 0:
+                    await asyncio.sleep(drift)
+
+    print(f"\n送出結果：{dict(results)}")
+    if raw_ids:
+        print(f"raw_id 範圍：{min(raw_ids)} .. {max(raw_ids)}")
+    if expected_codes:
+        print("\n預期觸發的錯誤碼（腳本端統計，非權威——以 business_clean 實判為準）：")
+        for code, n in expected_codes.most_common():
+            print(f"  {code:32s} {n}")
+
+    print("\n⚠️ POST 回傳 pending 只代表 Raw 已落地，ODS 由背景任務非同步寫入。")
+    print("   請等背景處理完再抽取；用 --verify 可直接查 DB 確認。")
+    if args.verify:
+        await asyncio.sleep(args.verify_wait)
+        verify(batch)
+
+
+def verify(batch: str) -> None:
+    """查 DB 確認這批資料的落地狀況。失敗不影響已灌的資料，只是看不到報告。"""
+    try:
+        from dotenv import load_dotenv
+        from sqlalchemy import create_engine, text
+    except ImportError:
+        print("（跳過 verify：缺 sqlalchemy / python-dotenv）")
+        return
+
+    load_dotenv(".env")
+    db_url = os.getenv("DB_URL")
+    if not db_url:
+        print("（跳過 verify：.env 沒有 DB_URL）")
+        return
+
+    prefix = f"SEED-{batch}-%"
+    try:
+        with create_engine(db_url).connect() as c:
+            print(f"\n── 落地確認（order_id LIKE '{prefix}'）──")
+            print("raw.status：")
+            for status, n in c.execute(text(
+                "select status, count(*) from raw where order_id like :p group by status order by 1"
+            ), {"p": prefix}):
+                print(f"  {status:14s} {n}")
+
+            row = c.execute(text(
+                "select count(*), count(*) filter (where has_clean_error), "
+                "       min(raw_id), max(raw_id) "
+                "from ods where order_id like :p"
+            ), {"p": prefix}).one()
+            total, dirty, lo, hi = row
+            if total:
+                print(f"ods：{total} 筆，其中髒 {dirty} 筆（{dirty/total:.1%}）"
+                      f"，raw_id {lo}..{hi}")
+
+            print("實際觸發的錯誤碼：")
+            # jsonb_typeof 守衛不可省：乾淨列的 clean_error_message 存的是 JSON null
+            # （scalar，不是 SQL NULL 也不是空陣列），jsonb_array_elements 對 scalar
+            # 會直接報 "cannot extract elements from a scalar" 而不是回零列。
+            for code, n in c.execute(text(
+                "select e->>'code' code, count(*) "
+                "from ods, lateral jsonb_array_elements(clean_error_message) e "
+                "where order_id like :p and jsonb_typeof(clean_error_message) = 'array' "
+                "group by code order by 2 desc"
+            ), {"p": prefix}):
+                print(f"  {code:32s} {n}")
+    except Exception as e:
+        print(f"（verify 失敗，不影響已灌資料）{type(e).__name__}: {e}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="產生 BI 展示用訂單資料（走 POST /orders 真實攝入路徑）")
+    ap.add_argument("--url", default="http://localhost:8000/orders")
+    ap.add_argument("--n", type=int, default=200, help="訂單筆數（預設 200）")
+    ap.add_argument("--dirty-rate", type=float, default=0.12,
+                    help="髒資料比例（預設 0.12——刻意壓在 Hard Gate 的 "
+                         "warn@5%%/error@10%% 附近，讓門檻線在 BI 上真的有意義）")
+    ap.add_argument("--rps", type=float, default=0.8,
+                    help="每秒送出筆數（預設 0.8＝48/min；API 限流上限 60/min）")
+    ap.add_argument("--order-date-days", type=int, default=45,
+                    help="order_date 往回散佈的天數（預設 45；須 < BQ 的 60 天分區過期）")
+    ap.add_argument("--api-key", default=None, help="X-API-Key；預設取 .env 的 API_KEYS 第一組")
+    ap.add_argument("--seed", type=int, default=None, help="亂數種子（給定則可重現）")
+    ap.add_argument("--dry-run", action="store_true", help="只印一筆樣本 payload，不送出")
+    ap.add_argument("--verify", action=argparse.BooleanOptionalAction, default=True,
+                    help="灌完查 DB report 落地狀況（預設開啟）")
+    ap.add_argument("--verify-wait", type=float, default=10.0,
+                    help="verify 前等待背景任務的秒數（預設 10）")
+    args = ap.parse_args()
+
+    if args.rps > 1.0:
+        print(f"⚠️ --rps {args.rps} 超過 API 限流 60/min，將大量觸發 429 退避，"
+              f"實際只會更慢。建議 ≤ 1.0。\n")
+
+    asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    main()

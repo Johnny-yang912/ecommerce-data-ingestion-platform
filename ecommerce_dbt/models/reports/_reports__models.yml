@@ -9,7 +9,7 @@ models:
   #   rpt_quality_backlog       快照軸，會變的現況（「現在還剩什麼」）
   #   rpt_sales_daily_by_category  業務聚合，上游一律走 Gold（fct_/dim_）
   #
-  # ⭐ 三個貫穿全層的紀律：
+  # ⭐ 四個貫穿全層的紀律：
   #   1. 【不落地任何比率】——只落地可加的分子與分母。BI 一 roll up，
   #      預存的 rate 會變成「比率的平均」而非「總和的比率」（分母永遠不相等）。
   #   2. 【COUNT(DISTINCT) 標死不可加】——預聚合層的結構性限制，無法靠命名補救。
@@ -17,6 +17,9 @@ models:
   #   3. 【rpt_ 只做 GROUP BY / window】——不做新的 join 語意、不做新的清洗、
   #      不引入新的業務定義。若某張 rpt_ 需要 dim_/fct_ 給不出的 join，
   #      那是星狀模型缺東西的訊號，該補的是 Gold，不是在這裡湊。
+  #   4. 每一條獨立的 NULL 傳播鏈都要有一隻金絲雀。 
+  #      新增可加度量時，先判斷它是否在既有金絲雀的下游（下游＝該欄為 NULL 時既有金絲雀必然亮）；
+  #      不是的話就要加一隻。SUM() 靜默忽略 NULL 是 BQ 的行為，不是可以靠紀律記住的事。
   #
   # ⚠️ 刻意【先不寫】的測試：assert_rpt_sales_matches_fct 這類逐格金額對帳。
   #    在 table 全量重建下它是同義反覆（用同一段 SQL 驗自己，恆綠、零資訊），
@@ -186,7 +189,7 @@ models:
       - name: items
         description: ✅ 可加。品項列數。與 fct_order_items 的列數配平，由 assert_rpt_sales_no_item_loss 把關。
       - name: total_quantity
-        description: ✅ 可加。品項數量加總。
+        description: ✅ 可加。品項數量加總。本欄的可信度由 items_missing_amount 代理（quantity 缺必然導致 net 缺）。
       - name: gross_amount
         description: ✅ 可加。quantity × unit_price 的加總。
       - name: net_amount
@@ -194,15 +197,29 @@ models:
           ✅ 可加。折後金額加總。承自上游的嚴格 NULL 傳播，刻意不 coalesce——
           可信度請一併看 items_missing_amount。
       - name: cost_amount
-        description: ✅ 可加。成本加總。
+        description: >
+          ✅ 可加。成本加總。可信度請一併看 items_missing_cost——
+          ⚠️ 此欄整格為 NULL 代表該切片【所有】品項都沒有成本資料（Looker Studio 顯示空白）。
       - name: shipping_amount
-        description: ✅ 可加。運費加總。
+        description: ✅ 可加。運費加總。可信度請一併看 items_missing_shipping。
       - name: items_missing_amount
         description: >
-          ⭐ ✅ 可加。該切片有幾個品項的 net_amount 算不出來（safe_cast 失敗 → NULL）。
+          ⭐ ✅ 可加。該切片有幾個品項的 net_amount 算不出來（safe_cast 失敗或缺值 → NULL）。
           BQ 的 SUM() 靜默忽略 NULL，一個壞 item 會讓金額少算一筆而不報錯；
-          沿用 fct_orders.items_missing_amount 的手法把不完整性顯性化，
+          沿用 fct_orders 的手法把不完整性顯性化，
           讓 BI 端自己判斷這個加總可不可信，而不是替它把 NULL 當 0（有損且單向）。
+          ⚠️ 本欄【只】涵蓋 gross → net 這一條鏈，不是「金額完整度」的總表；
+          名字沒改成 items_missing_net 的理由見 fct_orders.sql 檔頭。
+      - name: items_missing_cost
+        description: >
+          ⭐ ✅ 可加。該切片有幾個品項的 cost_amount 為 NULL。
+          cost_price 在攝入層完全沒有規則（缺值合法、不產生 quality_event、不會被隔離），
+          本 counter 是它唯一會現形的地方——2026-08 實測 dev 有 207/631 個品項屬此類，
+          而當時的 items_missing_amount 對它們的偵測率是 0%。
+      - name: items_missing_shipping
+        description: >
+          ⭐ ✅ 可加。該切片有幾個品項的 shipping_fee 為 NULL。
+          shipping_fee 不是衍生值、不在任何一條鏈的下游，故必須自己一隻金絲雀。
     tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:
@@ -216,3 +233,9 @@ models:
       - dbt_utils.expression_is_true:
           arguments:
             expression: "items_missing_amount <= items"
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "items_missing_cost <= items"
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "items_missing_shipping <= items"

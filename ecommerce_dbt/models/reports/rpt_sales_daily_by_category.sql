@@ -119,11 +119,19 @@ select
     sum(cost_amount)    as cost_amount,
     sum(shipping_fee)   as shipping_amount,
 
-    -- ⭐ 沿用 fct_orders.items_missing_amount 的顯性化手法：BQ 的 SUM() 靜默忽略 NULL，
-    --    一個 safe_cast 失敗的 item 會讓上面的加總少算一筆而不報錯。
+    -- ⭐ 沿用 fct_orders 的顯性化【手法】（不是取用它的欄位——這三個 counter 在本層
+    --    重新算，fct_ 的同名欄位是兄弟不是父母）：BQ 的 SUM() 靜默忽略 NULL，
+    --    一個 safe_cast 失敗或根本沒送的 item 會讓上面的加總少算一筆而不報錯。
     --    不 COALESCE（有損單向），改成把不完整性攤在陽光下，讓 BI 端自己判斷
     --    這個分類的金額加總可不可信。
-    countif(net_amount is null) as items_missing_amount
+    --
+    -- ⚠️【一條 NULL 傳播鏈一隻】，理由與實測數字見 fct_orders.sql 檔頭。
+    --    本層特別容易踩：整格 sum 為 NULL 時 Looker Studio 只顯示一個空白，
+    --    而【部分】缺失更危險——sum 會回一個看起來完全正常的數字，只是少算幾筆，
+    --    連空白都不會有。這三個 counter 是分辨兩者的唯一依據。
+    countif(net_amount is null)   as items_missing_amount,
+    countif(cost_amount is null)  as items_missing_cost,
+    countif(shipping_fee is null) as items_missing_shipping
 
 from items
 group by order_date, category, is_returned

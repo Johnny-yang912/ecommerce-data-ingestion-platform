@@ -16,9 +16,13 @@ with items as (
 
     select
         order_id,
-        count(*)                    as item_count,
-        countif(net_amount is null) as items_missing_amount,
-        sum(quantity)               as total_quantity,
+        count(*)                      as item_count,
+        -- 三隻金絲雀都要比：counter 也是 rollup 欄位，同樣「同一個數字存在兩處」，
+        -- 漏掉哪一隻，哪一隻就是本表唯一沒有機制保證的 rollup 欄位。
+        countif(net_amount is null)   as items_missing_amount,
+        countif(cost_amount is null)  as items_missing_cost,
+        countif(shipping_fee is null) as items_missing_shipping,
+        sum(quantity)                 as total_quantity,
         sum(gross_amount)           as gross_amount,
         sum(net_amount)             as net_amount,
         sum(cost_amount)            as cost_amount,
@@ -40,7 +44,9 @@ left join items i
     on o.order_id = i.order_id
 where
        o.item_count           is distinct from coalesce(i.item_count, 0)
-    or o.items_missing_amount is distinct from coalesce(i.items_missing_amount, 0)
+    or o.items_missing_amount   is distinct from coalesce(i.items_missing_amount, 0)
+    or o.items_missing_cost     is distinct from coalesce(i.items_missing_cost, 0)
+    or o.items_missing_shipping is distinct from coalesce(i.items_missing_shipping, 0)
     or o.total_quantity       is distinct from i.total_quantity
     or o.gross_amount         is distinct from i.gross_amount
     or o.net_amount           is distinct from i.net_amount

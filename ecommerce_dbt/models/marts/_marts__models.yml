@@ -84,10 +84,33 @@ models:
           該訂單中 net_amount 為 NULL 的品項數。⭐ 加總可信度的顯性標記——
           BQ 的 SUM() 靜默忽略 NULL，此欄 > 0 代表 net_amount 少算了品項。
           刻意不 COALESCE 金額（有損且單向，CLOUD_LAYER-TW §5.5.5），改讓下游自行判斷。
+          ⚠️【名字有歷史包袱】：本欄【只】涵蓋 gross → net 這一條 NULL 傳播鏈
+          （quantity / unit_price / discount_pct），不是「這張表的金額完整度」。
+          cost 與 shipping 是獨立的鏈，各有自己的 counter，見下兩欄。
+          未改名為 items_missing_net 是刻意的——改名要同步動 rollup 測試、rpt_ 層
+          與 Looker 既有報表，換到的只有命名整潔（見 fct_orders.sql 檔頭）。
+        tests:
+          - not_null
+      - name: items_missing_cost
+        description: >
+          該訂單中 cost_amount 為 NULL 的品項數（＝quantity 或 cost_price 缺）。
+          ⚠️ cost_price 在攝入層【完全沒有規則】：schema.py 是 Optional、clean.py 只把它
+          列入 non-finite 檢查，缺值合法、不產生 quality_event、不會被 quarantine。
+          整條 DQ 管線在設計上不管這個欄位，本 counter 是它唯一會現形的地方。
+        tests:
+          - not_null
+      - name: items_missing_shipping
+        description: >
+          該訂單中 shipping_fee 為 NULL 的品項數。shipping_fee 不是衍生值、
+          不在任何一條鏈的下游，故必須自己一隻金絲雀。缺值在攝入層同樣合法。
         tests:
           - not_null
       - name: net_amount
         description: 訂單淨額＝Σ(品項 net_amount)。items_missing_amount > 0 時此值不完整。
+      - name: cost_amount
+        description: 訂單成本＝Σ(品項 cost_amount)。items_missing_cost > 0 時此值不完整。
+      - name: shipping_amount
+        description: 訂單運費＝Σ(品項 shipping_fee)。items_missing_shipping > 0 時此值不完整。
       - name: tax_pct
         description: >
           稅率（訂單層）。⚠️ 是【比率】，非可加度量，不要 SUM。

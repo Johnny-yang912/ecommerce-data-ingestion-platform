@@ -14,8 +14,29 @@
 --   而 BQ 的 SUM() 【會靜默忽略 NULL】——一筆訂單裡只要有一個 item 的 discount_pct
 --   safe_cast 失敗，訂單總額就會少算一個品項，不報錯、不留痕跡。
 --   處置刻意【不】用 COALESCE（那是有損且單向的，一旦壓成 0 就分不出「沒收集」與
---   「真的是 0」），改成把不完整性【顯性化】：items_missing_amount 讓下游自己判斷
---   這個加總可不可信。填值是業務決定，屬 rpt_ 或消費端的高度，不是本層。
+--   「真的是 0」），改成把不完整性【顯性化】，讓下游自己判斷這個加總可不可信。
+--   填值是業務決定，屬 rpt_ 或消費端的高度，不是本層。
+--
+-- ⭐ 金絲雀必須【一條 NULL 傳播鏈養一隻】，不能只養一隻（2026-08 實測後改）：
+--   int_order_items.sql:106-108 是三條【互相獨立】的鏈——
+--     gross → net：quantity × unit_price × (1 - discount_pct / 100)
+--     cost       ：quantity × cost_price
+--     shipping   ：直接欄位，不衍生
+--   本檔原本只有 items_missing_amount（盯 net），並在此處論證「net 是最末端的
+--   衍生值（吃三個輸入），故用它當金絲雀」。那句話在【net 這條鏈上】成立——
+--   gross 為 NULL ⇒ net 必為 NULL，故 net 涵蓋 gross——但它被錯誤地推廣成
+--   「整張表的金絲雀」，而 cost_price 與 shipping_fee 根本不在 net 的上游。
+--   實測代價（dev, 2026-08）：631 個品項中 207 個 cost_amount 為 NULL，
+--   items_missing_amount 對它們的偵測率是 0%；反映到 rpt_ 是整整 27 個切片
+--   成本欄空白卻沒有任何旗標，靠人眼在 Looker Studio 上看見才發現。
+--   ⚠️ 根因值得記一筆：cost_price 在攝入層【完全沒有規則】（schema.py:46 是
+--   Optional、clean.py:118 只把它列入 non-finite 檢查），缺值合法、不產生
+--   quality_event、不會 has_clean_error、不會被 quarantine——整條 DQ 管線在設計上
+--   就不管它。所以這裡的 counter 是它唯一可能現形的地方，不是錦上添花。
+--
+--   命名刻意【不】對稱：items_missing_amount 沒有跟著改名為 items_missing_net。
+--   改名要同步動 rollup 測試、rpt_ 層與 Looker 既有報表，換到的只有命名整潔；
+--   歧義改用文件補（見 _marts__models.yml 該欄描述）。
 --
 -- 分區（決策：見 README.zh-TW §6.2）：按 order_date(DAY)，因為 Gold 服務分析師，
 --   最常、最貴的查詢是按業務時間過濾（CLOUD_LAYER-TW §1.2）。
@@ -56,10 +77,14 @@ with item_rollup as (
     select
         order_id,
 
-        count(*)                    as item_count,
-        -- 加總可信度的顯性標記（見檔頭）。net_amount 是最末端的衍生值
-        -- （吃 quantity / unit_price / discount_pct 三個輸入），故用它當金絲雀。
-        countif(net_amount is null) as items_missing_amount,
+        count(*)                      as item_count,
+
+        -- 加總可信度的顯性標記，【一條 NULL 傳播鏈一隻金絲雀】（見檔頭）。
+        -- net 這隻涵蓋 gross（gross 為 NULL ⇒ net 必為 NULL），
+        -- 但 cost 與 shipping 是獨立的鏈，不在它的下游，故各自需要一隻。
+        countif(net_amount is null)   as items_missing_amount,
+        countif(cost_amount is null)  as items_missing_cost,
+        countif(shipping_fee is null) as items_missing_shipping,
 
         sum(quantity)      as total_quantity,
         sum(gross_amount)  as gross_amount,
@@ -110,8 +135,13 @@ select
     o.is_repeat_customer,
 
     -- ── rollup 度量（來自 fct_order_items，見檔頭與 rollup 一致性測試）──────
-    coalesce(i.item_count, 0)           as item_count,
-    coalesce(i.items_missing_amount, 0) as items_missing_amount,
+    -- 三個 counter 一律 coalesce 到 0：沒有任何品項的訂單（LEFT JOIN 未命中）
+    -- 缺的不是「金額算不出來」而是「根本沒有品項」，那個事實由 item_count = 0 表達；
+    -- 讓 counter 留 NULL 會讓下游把兩件事混為一談。
+    coalesce(i.item_count, 0)             as item_count,
+    coalesce(i.items_missing_amount, 0)   as items_missing_amount,
+    coalesce(i.items_missing_cost, 0)     as items_missing_cost,
+    coalesce(i.items_missing_shipping, 0) as items_missing_shipping,
     i.total_quantity,
     i.gross_amount,
     i.net_amount,

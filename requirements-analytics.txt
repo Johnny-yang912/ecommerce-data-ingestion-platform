@@ -1,0 +1,10 @@
+# 分析管線（Phase 4–5）的執行期依賴：ODS → BigQuery 抽取、Proposal B 重評估。
+#
+# 為什麼與 requirements.txt 分開：API server 不碰 BQ（見 config.py 對
+# google_application_credentials / bq_project 給空字串預設的理由），把 BQ client
+# 塞進 API 映像只是讓它變大、攻擊面變寬。
+#
+# 為什麼與 requirements-dev.txt 分開：Phase 5 的 Airflow 容器要「跑得動抽取腳本」，
+# 但不該裝 pytest。過去這條線混在 dev 依賴裡，容器化時才會暴露。
+-r requirements.txt
+google-cloud-bigquery==3.41.0

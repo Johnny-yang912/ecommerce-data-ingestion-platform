@@ -17,8 +17,19 @@
 獨立 load job。跨表無 BQ 交易（load job 只保證單表原子），故一致性靠：
   ① 各表 watermark 獨立、失敗不推進 → 下輪 `>=` 自動補抽（append-only + dbt stg_ 去重）；
   ② main() 的 gate：任一張失敗即整體失敗（非零 exit），下游 dbt(T) 不得在半套資料上開跑。
+
+執行方式（`--table`，預設 all）：
+    python extract_ods_to_bq.py                      # 兩張表，gate 在腳本內
+    python extract_ods_to_bq.py --table orders       # 單表，供 Airflow 一表一 task
+
+  單表模式是 Phase 5 的形狀：gate 從「腳本內彙整後 raise」搬到「Airflow 的依賴邊」——
+  dbt task 的上游＝兩個 extract task 都 success，語意與 ② 完全相同（見 CLOUD_LAYER-TW §3.2）。
+  之所以值得拆，是因為 ① 的自癒本來就是【逐表】的：一張失敗只該重試那一張，
+  合成一個 task 會讓重試連帶重跑已經成功的另一張，也看不出是哪張壞了。
 """
 
+import argparse
+import sys
 import time
 from dataclasses import dataclass
 
@@ -154,6 +165,11 @@ QUALITY_EVENTS_SPEC = TableSpec(
 
 SPECS = [ORDERS_SPEC, QUALITY_EVENTS_SPEC]
 
+# CLI 的 --table 值域直接由 SPECS 推導，不另外維護一份清單：延續 §5.4「每加一張表
+# 只需在 SPECS 掛一份 spec」的單一真相原則——新表自動有 CLI 與一致性守衛，不會漏掛。
+SPECS_BY_TABLE = {spec.table: spec for spec in SPECS}
+ALL = "all"
+
 
 def _bq_schema(fields: list[tuple[str, str, str]]) -> list[bigquery.SchemaField]:
     """由 fields 推出 BQ schema；建表與 load job 共用同一份（單一真相來源）。"""
@@ -283,16 +299,33 @@ def extract_and_load_one(client: bigquery.Client, spec: TableSpec) -> int:
     return loaded
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="ODS（PostgreSQL）→ BigQuery staging 抽取（E/L）",
+    )
+    parser.add_argument(
+        "--table",
+        choices=[*SPECS_BY_TABLE, ALL],
+        default=ALL,
+        help=f"要抽哪張表；預設 {ALL}（兩張都抽，gate 留在腳本內）。"
+             "指定單表時 gate 由呼叫端負責（Airflow 的依賴邊）。",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    specs = SPECS if args.table == ALL else [SPECS_BY_TABLE[args.table]]
+
     if not PROJECT:
         raise RuntimeError("BQ_PROJECT 未設定：請在 .env 設定 BQ_PROJECT=<你的 GCP 專案 ID>")
 
     t0 = time.monotonic()
     client = get_bq_client()
 
-    # 盡力兩張都試（一張失敗不擋另一張各自推進 watermark），失敗彙整後最後 gate。
+    # 選中的表逐一盡力抽取（多表時一張失敗不擋另一張各自推進 watermark），失敗彙整後 gate。
     failures: list[tuple[str, Exception]] = []
-    for spec in SPECS:
+    for spec in specs:
         try:
             extract_and_load_one(client, spec)
         except Exception as e:  # noqa: BLE001 — 逐表隔離失敗，最後統一 gate
@@ -302,6 +335,8 @@ def main() -> None:
     # ── GATE ────────────────────────────────────────────────────────────────
     # 任一表失敗即整體失敗（非零 exit）→ 下游 dbt(T) 不得在半套資料上開跑。
     # 失敗那張的 watermark 未推進（方案 A），下輪 `>=` 自動補抽（append-only + stg_ 去重）。
+    # 單表模式下這條只剩「把失敗轉成非零 exit」，跨表 gate 改由 Airflow 的依賴邊承擔——
+    # 語意相同，只是判斷點從腳本內搬到 DAG 上（見檔頭〈執行方式〉）。
     if failures:
         raise RuntimeError(
             "E/L gate 未通過，dbt 不應開跑；失敗表："
@@ -310,11 +345,11 @@ def main() -> None:
 
     logger.info(
         "extract_all_done",
-        tables=[s.table for s in SPECS],
+        tables=[s.table for s in specs],
         elapsed_s=round(time.monotonic() - t0, 2),
     )
     # 方案 A：無 advance_watermark —— staging 本身即 watermark
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

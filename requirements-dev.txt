@@ -1,6 +1,7 @@
--r requirements.txt
+# 開發／CI 依賴 = 分析管線（已含 API 執行期）+ 測試工具。
+# httpx 供 fastapi.testclient.TestClient 使用（seed_demo.py 也用它送請求）。
+-r requirements-analytics.txt
 pytest==9.0.3
 pytest-asyncio==1.3.0
 pytest-cov==7.1.0
 httpx==0.28.1
-google-cloud-bigquery==3.41.0

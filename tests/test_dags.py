@@ -107,3 +107,64 @@ class TestOrdersAnalyticsDaily:
         它獨立成 source_freshness_watch DAG。"""
         for task in dag.tasks:
             assert "source freshness" not in task.bash_command
+
+
+class TestFreshnessIsolation:
+
+    def test_only_the_watch_dag_runs_freshness(self, dagbag):
+        """訊號的價值不等於它該有的權限：freshness 既不能阻斷下游，也不該污染別人的
+        成功率。任何一條有實際產出的 DAG 混進 freshness，這支測試就紅。"""
+        owners = {
+            dag_id for dag_id, dag in dagbag.dags.items()
+            for t in dag.tasks if "source freshness" in getattr(t, "bash_command", "")
+        }
+        assert owners == {"source_freshness_watch"}
+
+    def test_watch_dag_is_a_single_leaf(self, dagbag):
+        dag = dagbag.dags["source_freshness_watch"]
+        assert len(dag.tasks) == 1
+        assert dag.tasks[0].retries == 0     # stale 是 deterministic，重跑答案一樣
+
+
+class TestDqReevaluation:
+
+    @pytest.fixture
+    def dag(self, dagbag):
+        return dagbag.dags["dq_reevaluation"]
+
+    def test_never_scheduled(self, dag):
+        """Proposal B 的觸發條件是「規則放寬了」——那是人為的部署事件，不是週期。
+        規則沒變時重評估必然無事件產出，排成日批＝364 天的全歷史白工。"""
+        assert dag.schedule is None
+
+    def test_dry_run_is_the_default(self, dag):
+        """append-only 表寫錯刪不掉；手動觸發的 UI 很容易一路點下去。"""
+        assert dag.params["commit"] is False   # DAG.params 已解析成預設值，非 Param 物件
+
+    def test_flags_are_omitted_unless_asked(self, dag):
+        """指令模板必須是「留空就不加旗標」，讓預設值只存在於腳本裡——
+        DAG 與腳本各留一份預設值就是漂移的來源。"""
+        cmd = dag.get_task("reevaluate").bash_command
+        assert "reevaluate_quality.py" in cmd
+        for flag in ("--commit", "--limit", "--expect-rule-version"):
+            assert f"' {flag}" in cmd or f"' {flag} '" in cmd
+        # 不得寫死成無條件帶上 --commit
+        assert not cmd.rstrip().endswith("--commit")
+
+    def test_downstream_refresh_is_gated_on_commit(self, dag):
+        """dry-run 沒有寫入，就沒有東西需要傳播；無條件觸發主 DAG 會製造假動作。"""
+        assert dag.get_task("reevaluate").downstream_task_ids == {"should_refresh"}
+        assert dag.get_task("should_refresh").downstream_task_ids == {"refresh_gold"}
+
+    def test_refresh_targets_the_main_dag(self, dagbag, dag):
+        """重評估只寫 PG；要回流 Gold 還需要 extract → int_ 重建。少了這一步，
+        使用者會看到「我跑了 Proposal B 但什麼都沒發生」。"""
+        target = dag.get_task("refresh_gold").trigger_dag_id
+        assert target == "orders_analytics_daily"
+        assert target in dagbag.dags          # 觸發目標必須真的存在
+
+    def test_no_retries(self, dag):
+        """人工觸發、有人盯著；失敗當下「先看清楚發生什麼」比自動再寫一次
+        append-only 表更重要。"""
+        for task in dag.tasks:
+            assert task.retries == 0

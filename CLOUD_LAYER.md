@@ -212,12 +212,33 @@ Ingestion in this project is **manual** (loaded through the API; `load_test.py` 
 | Rule | Why |
 |---|---|
 | **Phase 5's Airflow DAG must not place `dbt source freshness` ahead of extraction / `dbt build` as a pre-check** | The very same red instantly turns from "an acceptable alert" into "a permanently blocked DAG" — while all it reflects is "you haven't hand-loaded data for a few days" |
-| If it goes into the DAG at all, it must be a **side-channel observability task** (its failure must not affect downstream), or have its `severity` lowered first | Keeps the signal visible without granting it blocking authority |
+| ~~If it goes into the DAG at all, it must be a **side-channel observability task** (its failure must not affect downstream), or have its `severity` lowered first~~ → **tightened one notch at implementation time: it becomes its own `source_freshness_watch` DAG** | A side-channel task is not enough — see 〈Implementation outcome〉 below |
 | If ingestion ever becomes **continuous** (e.g. a seeding task at the head of the DAG posting a small batch of orders periodically), this stance lapses and freshness should be restored as a meaningful gate | Only then does red genuinely mean "broken" rather than "unfed" |
 
 > This is isomorphic to how the DQ architecture treats `has_schema_drift`: **a signal's value is not the same as the authority it should hold.** Drift may alert but never intercept; under the "manual ingestion" premise, freshness likewise may only alert. Authority comes from "is it actually broken when it goes red", not from "is this metric important."
 
 Aside: continuous ingestion is simultaneously the fix for §1.7.6's "rolling 60-day ingestion window" problem — the two share **the same root cause** (no continuous ingestion), so a future decision to add seeding resolves both at once.
+
+**Implementation outcome (Phase 5): a side-channel task is not enough — it needs its own DAG** ⭐
+
+The table above originally said "a side-channel observability task (its failure must not affect
+downstream)". Implementing it revealed that this is still insufficient: **an Airflow DAG run's state
+is the aggregate of its tasks**, so an expected-red leaf task leaves `orders_analytics_daily`
+permanently failed — which zeroes out the value of "main pipeline success rate" as a signal and
+buries real pipeline failures under noise that is red every single day.
+
+So this section's principle goes one step further: **freshness has neither the authority to block
+downstream nor the authority to pollute someone else's success rate.** The landed shape is a
+standalone `source_freshness_watch` DAG (`orchestration/dags/`), so that each DAG's success rate
+means exactly one thing:
+
+| DAG | Red means |
+|---|---|
+| `orders_analytics_daily` | The pipeline is broken |
+| `source_freshness_watch` | The source is stale (under manual ingestion = the expected state) |
+
+`tests/test_dags.py::TestFreshnessIsolation` pins this isolation down: if any DAG that produces
+real output ever picks up `dbt source freshness`, the test goes red.
 
 #### 1.7.8 The sandbox's 60-day partition expiration is **unconditional**, not just a cap on explicit settings ⭐
 

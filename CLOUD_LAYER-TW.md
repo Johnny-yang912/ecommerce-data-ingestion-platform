@@ -212,12 +212,31 @@ ODS 在 PostgreSQL 仍是永久且完整的錨點（`raw`/`ods`/`quality_events`
 | 規則 | 為什麼 |
 |---|---|
 | **Phase 5 的 Airflow DAG 不得把 `dbt source freshness` 放在抽取／`dbt build` 之前當前置檢查** | 同一個紅會立刻從「可接受的告警」變成「DAG 永久卡死」，而它反映的只是「你這幾天沒手動灌資料」 |
-| 要納入 DAG 的話，只能是**旁路的觀測 task**（失敗不影響下游），或先降 `severity` | 保留訊號可見性，但不給它阻斷權限 |
+| ~~要納入 DAG 的話，只能是**旁路的觀測 task**（失敗不影響下游），或先降 `severity`~~ → **實作時再收緊一階：獨立成 `source_freshness_watch` DAG** | 旁路 task 還不夠——見下方〈實作結果〉 |
 | 若日後改成**持續攝入**（例如 DAG 前面加 seeding task 定期打一小批訂單進 API），本立場即失效，freshness 應恢復為有意義的 gate | 那時紅才真的代表「壞了」而非「沒餵」 |
 
 > 這與 DQ 架構對 `has_schema_drift` 的處理同構：**訊號的價值不等於它該有的權限**。drift 只能告警不能攔截；freshness 在「手動攝入」這個前提下同樣只能告警。權限來自「紅的時候是不是真的壞了」，而不是來自「這個指標重不重要」。
 
 附帶：持續攝入同時也是 §1.7.6 那個「滾動 60 天攝入視窗」問題的解方——兩者**根因相同**（沒有持續攝入），所以未來若決定加 seeding，一次解決兩件事。
+
+**實作結果（Phase 5）：旁路 task 不夠，必須獨立成一條 DAG** ⭐
+
+上表原本寫「旁路的觀測 task（失敗不影響下游）」。真的要落地時發現這還不夠：
+**Airflow 的 DAG run 狀態是所有 task 的彙總**，一個預期會紅的 leaf task 會讓
+`orders_analytics_daily` 恆為 failed —— 於是「主管線成功率」這個訊號的價值歸零，
+真正的管線故障被淹沒在每天都紅的噪音裡。
+
+所以本節那句話要再往前推一步：**freshness 不只沒有「阻斷下游」的權限，也沒有
+「污染別人成功率」的權限。** 落地形態是獨立的 `source_freshness_watch` DAG
+（`orchestration/dags/`），兩條 DAG 的成功率各自代表一件事：
+
+| DAG | 紅代表 |
+|---|---|
+| `orders_analytics_daily` | 管線壞了 |
+| `source_freshness_watch` | 資料源不新鮮（目前的手動攝入下＝預期狀態）|
+
+`tests/test_dags.py::TestFreshnessIsolation` 把這條隔離釘住：任何有實際產出的 DAG
+混進 `dbt source freshness`，測試就紅。
 
 #### 1.7.8 sandbox 的 60 天分區過期是【無條件】的，不是只鎖顯式設定 ⭐
 

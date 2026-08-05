@@ -261,6 +261,22 @@ UI at `http://localhost:8080` (SimpleAuthManager for local practice, no login).
 The two compose files must be layered into one project so the DAGs can reach the business
 database at the hostname `db`.
 
+#### ⚠️ When the business DB is not in the compose project (found while running it for real)
+
+The default above assumes **postgres also runs inside compose**. If your business DB lives on the
+**host** (common in local development), `db` does not resolve inside the container and `localhost`
+points at the container itself, so `extract_*` fails with
+`OperationalError: could not translate host name`. Two options:
+
+| Approach | Steps |
+|---|---|
+| **A. Put the business DB in compose too** (self-contained; the default path) | `docker compose -f docker-compose.yml -f docker-compose.airflow.yml up` brings `db` up as well. ⚠️ That is a **separate, empty database** — the `raw_id`s it mints overlap with the host DB's, so extracting both into the same BQ staging **collides on the dedup key**. Never mix them in one dataset |
+| **B. Point back at the host postgres** | ① set `AIRFLOW_TASK_DB_URL=postgresql://user:pw@host.docker.internal:5432/<db>` in `.env`; ② the host postgres listens on **`127.0.0.1` only** by default, so `listen_addresses` in `postgresql.conf` and `pg_hba.conf` must be widened for the docker network, or it still cannot connect |
+
+A's warning is worth internalising: **`raw_id` is a surrogate key minted by the landing layer, and
+two independent ODS instances both start numbering at 1.** Extract them into one staging table and
+`stg_`'s `raw_id`-grained dedup will collapse unrelated orders into "copies" of each other.
+
 ### 3.2 ⚠️ Consecutive DAG failures exceeding the lookback window → widen it on the first run after the fix
 
 **A single failure is safe**: staging has appended, the watermark has advanced, and `stg_`'s
@@ -335,9 +351,17 @@ have convenient buttons.**
 - ✅ `source_freshness_watch` (standalone observability)
 - ✅ Image (two isolated venvs), compose overlay, env_var-driven `profiles.yml`
 - ✅ `tests/test_dags.py` (20 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
-- ⬜ First real `docker compose up` verification (needs a GCP key and BQ project)
+- ✅ Verified live (2026-08-05): image builds, all four services healthy, three DAGs parsed by the
+  real dag-processor with **zero import errors**, both venvs working (dbt 1.11.12 / bigquery 1.11.3),
+  the env_var profile connecting to BQ from inside the container, a full successful
+  `source_freshness_watch` run, and `dbt_intermediate` passing in-container with PASS=27
+- ⬜ `extract_*` executed in-container (blocked by "business DB on the host listening on 127.0.0.1
+  only" — see the A/B options in §3.1)
 - ✅ The v3 rule loosening (`age` cap 120→130) — Proposal B now has genuine promote candidates
-- ⬜ One live pass of the §3.3 demo script (needs a GCP key and BQ project)
+- ✅ The §3.3 demo script walked end to end (2026-08-05): 20 records quarantined under v2 → v3
+  loosening → re-evaluation promoted 15 → flowed back into `fct_orders`, `promotions` 0→15; the
+  5 control records (age -3/150/999) correctly stayed quarantined; a second consecutive run wrote
+  0 events (idempotency); ODS was never modified (Bounded Writeback)
 - ⬜ Seeding DAG (see §4)
 - ⬜ Celery + Redis, OpenTelemetry (other roadmap Phase 5 items)
 

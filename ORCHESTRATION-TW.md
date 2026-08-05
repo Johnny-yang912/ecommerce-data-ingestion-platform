@@ -237,6 +237,20 @@ docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build
 UI 在 `http://localhost:8080`（本機練習用 SimpleAuthManager，免登入）。
 兩個 compose 檔必須疊加成同一個 project，DAG 才能以 `db` 這個 hostname 連到業務資料庫。
 
+#### ⚠️ 業務 DB 不在 compose 裡的話（實跑踩到的）
+
+上面的預設假設 **postgres 也跑在 compose 內**。若你的業務 DB 在**主機**上（本機開發常見），
+容器內 `db` 解析不到、`localhost` 又指向容器自己，`extract_*` 會以
+`OperationalError: could not translate host name` 失敗。兩個選擇：
+
+| 做法 | 步驟 |
+|---|---|
+| **A. 業務 DB 也進 compose**（自給自足，預設路徑） | `docker compose -f docker-compose.yml -f docker-compose.airflow.yml up` 連 `db` 一起起。⚠️ 那是一個**獨立的空資料庫**——它產生的 `raw_id` 會與主機 DB 的重疊，抽到同一個 BQ staging 會**撞去重鍵**，切勿與既有資料混用同一個 dataset |
+| **B. 指回主機 postgres** | ① `.env` 設 `AIRFLOW_TASK_DB_URL=postgresql://user:pw@host.docker.internal:5432/<db>`；② 主機 postgres 預設**只監聽 `127.0.0.1`**，必須放寬 `postgresql.conf` 的 `listen_addresses` 與 `pg_hba.conf` 允許 docker 網段，否則仍連不到 |
+
+A 的那個警告值得記住：**`raw_id` 是 landing 層發的代理鍵，兩個獨立的 ODS 各自從 1 開始編號。**
+把它們抽進同一張 staging，`stg_` 以 `raw_id` 為 grain 的去重會把不同訂單當成同一筆的副本收斂掉。
+
 ### 3.2 ⚠️ DAG 連續失敗超過回看窗 → 修好後第一次跑必須放大回看窗
 
 **單次失敗是安全的**：staging 已 append、watermark 已推進，`stg_` 的回看窗下輪會把那幾天重算。
@@ -303,9 +317,14 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 - ✅ `source_freshness_watch`（獨立觀測）
 - ✅ 映像（兩個隔離 venv）、compose overlay、env_var 版 `profiles.yml`
 - ✅ `tests/test_dags.py`（20 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
-- ⬜ 首次 `docker compose up` 的實機驗證（需要 GCP 金鑰與 BQ 專案）
+- ✅ 實機驗證（2026-08-05）：映像建成、四個服務健康、3 條 DAG 由真實 dag-processor 解析且**零 import 錯誤**、
+  兩個 venv 可用（dbt 1.11.12 / bigquery 1.11.3）、env_var 版 profile 在容器內連上 BQ、
+  `source_freshness_watch` 完整 run 成功、`dbt_intermediate` 於容器內 PASS=27
+- ⬜ `extract_*` 於容器內實跑（受阻於「業務 DB 在主機且只監聽 127.0.0.1」，見 §3.1 的 A/B 選項）
 - ✅ v3 規則放寬（`age` 上限 120→130）——Proposal B 第一次有真的可 promote 的對象
-- ⬜ §3.3 demo 劇本實機走一次（需 GCP 金鑰與 BQ 專案）
+- ✅ §3.3 demo 劇本實機走完（2026-08-05）：20 筆以 v2 落 quarantine → v3 放寬 → 重評估 promote 15
+  → 回流 `fct_orders`，`promotions` 0→15；對照組 5 筆（age -3/150/999）正確留在 quarantine；
+  連跑兩次第二次 `written=0`（冪等）；ODS 全程未被修改（Bounded Writeback）
 - ⬜ Seeding DAG（見 §4）
 - ⬜ Celery + Redis、OpenTelemetry（藍圖 Phase 5 的其他項）
 

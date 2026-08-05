@@ -706,7 +706,7 @@ BQ `dim_*/fct_*` 反映目前最新評估下的乾淨狀態。
 `promotion` 與 `re_quarantination` 的寫入邏輯已落地，觸發方式是**手動／規則升版時**而非日排程——規則沒變時重評估必然是 no-op，排成日批只是對全歷史 quarantine 做一次白工。`rejection`（→ `permanently_rejected`）刻意**不做進自動任務**，維持「人工放棄」的語意。  
 **下游回流路徑本來就已就緒**：`int_orders` 的有效狀態合成早有測試把關，事件一產生，下次 dbt run 即自然生效，`int_` 層一行都沒改——這是當初「先把消費端做對」這個順序的回報。
 
-> ⚠️ **目前跑一次會 promote 0 筆**：v1→v2 是**變嚴**，而現有資料都是 v2 攝入的，拿 v2 重評估 v2 是同義反覆。要看到回流，必須先有一次真實的**規則放寬**（bump v3）。完整 demo 劇本見 `PHASE5_ORCHESTRATION.md`。
+> ⚠️ **目前跑一次會 promote 0 筆**：v1→v2 是**變嚴**，而現有資料都是 v2 攝入的，拿 v2 重評估 v2 是同義反覆。要看到回流，必須先有一次真實的**規則放寬**（bump v3）。完整 demo 劇本見 `ORCHESTRATION-TW.md`。
 
 **BQ sandbox 的 60 天過期會讓 promoted 記錄回退（帳號層限制）**  
 sandbox 強制套 60 天分區＋表過期（見 [CLOUD_LAYER-TW §1.6](./CLOUD_LAYER-TW.md)），`quality_events` staging 亦繼承。若某筆 `promotion` 事件過期消失，`int_orders` 的 LEFT JOIN 會 fall back 到 ODS 快照（`has_clean_error=TRUE`）→ 該筆**從 Gold 掉回 quarantine**。  

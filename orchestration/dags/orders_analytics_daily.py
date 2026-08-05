@@ -5,7 +5,7 @@
     extract_quality_events ─┘      (Hard Gate)
 
 取代的是過去手動跑的 `python extract_ods_to_bq.py` + `dbt build`。
-完整決策與理由見 PHASE5_ORCHESTRATION.md；以下只記「讀這個檔時會想問的為什麼」。
+完整決策與理由見 ORCHESTRATION-TW.md；以下只記「讀這個檔時會想問的為什麼」。
 
 ────────────────────────────────────────────────────────────────────────────
 ① 這個檔【不得】import 專案模組 ⭐

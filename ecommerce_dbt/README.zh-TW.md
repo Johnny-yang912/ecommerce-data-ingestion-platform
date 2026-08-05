@@ -535,5 +535,5 @@ DQ 文件原規劃的 `rpt_quality_daily` 混了兩件性質相反的事，實�
 - ⬜ SCD2 `dim_customer`（設計已備妥，觸發點＝啟用帳單——見 §6.3）
 - ⬜ `rpt_sales_*` 切增量（路徑＝日增量 + 週全量；**必須同時補逐格對帳測試**——見 §7.4、§8）
 - ⬜ 金額曝險度量（需 `int_order_items_quarantine`——見 §7.6）
-- ⬜ Proposal B（Airflow 重評估寫 `quality_events`）——下游回流路徑已就緒，只等事件產生端
-- ⚠️ Proposal B 事件產生端未實作 → `rpt_quality_events_daily` 的 `promotions` / `rejections` / `re_quarantines` 目前**恆為 0**（欄位已備妥，事件一產生即有值）
+- ✅ Proposal B 事件產生端（`reevaluate_quality.py` + `dq_reevaluation` DAG）——**本層一行都沒改**：`int_orders` 的有效狀態合成早有測試把關，事件一產生下次 run 即自然生效。這是「先把消費端做對」這個順序的回報
+- ⚠️ `rpt_quality_events_daily` 的 `promotions` / `re_quarantines` **目前仍為 0**，但原因已從「沒有事件產生端」變成「還沒有過規則放寬」——v1→v2 是變嚴，拿 v2 重評估 v2 是同義反覆。要看到非零值需先 bump 一次放寬的 v3（劇本見 [ORCHESTRATION-TW §3.3](../ORCHESTRATION-TW.md)）

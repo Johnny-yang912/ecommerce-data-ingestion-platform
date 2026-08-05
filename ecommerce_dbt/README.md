@@ -538,5 +538,5 @@ Primary code = the first entry of the deduplicated, sorted `error_codes` array. 
 - ⬜ SCD2 `dim_customer` (designed; trigger = enabling billing — see §6.3)
 - ⬜ Make `rpt_sales_*` incremental (path = daily incremental + weekly full refresh; **must land the cell-by-cell reconciliation test at the same time** — see §7.4, §8)
 - ⬜ Monetary exposure measures (requires `int_order_items_quarantine` — see §7.6)
-- ⬜ Proposal B (Airflow re-evaluation writing `quality_events`) — the downstream reinstatement path is ready, only the event producer is missing
-- ⚠️ With Proposal B's event producer unimplemented, `rpt_quality_events_daily`'s `promotions` / `rejections` / `re_quarantines` are currently **always 0** (the columns are ready and will populate as soon as events exist)
+- ✅ Proposal B event producer (`reevaluate_quality.py` + the `dq_reevaluation` DAG) — **not one line changed in this layer**: `int_orders`'s effective-state composition was already test-guarded, so events take effect on the next run automatically. That is the payoff of having built the consumer side first
+- ⚠️ `rpt_quality_events_daily`'s `promotions` / `re_quarantines` are **still 0**, but the reason has changed from "no event producer" to "no rule loosening has happened yet" — v1→v2 was a tightening, and re-evaluating v2 against v2 is a tautology. Non-zero values require a loosening v3 bump first (script in [ORCHESTRATION §3.3](../ORCHESTRATION.md))

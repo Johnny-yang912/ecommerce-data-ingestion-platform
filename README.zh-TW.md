@@ -41,7 +41,7 @@ POST /orders
     ├── first-write-wins idempotency check
     └── [ODS] + [quality_events]  ← 不可變錨點，含品質標記與事件日誌
 
-[ODS] → 增量抽取（現手動，Phase 5 交 Airflow）→ BigQuery staging
+[ODS] → 增量抽取（Airflow 每日排程）→ BigQuery staging
     ↓
 dbt stg_*   Hard Gate tests                 ← Silver 入口，仍含全部資料
     ↓
@@ -321,7 +321,9 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 ## 持續整合（CI）
 
-每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（248 個測試，原始碼 100% 覆蓋）。
+每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（333 個測試，受管模組 100% 覆蓋）。
+
+另有一條**獨立的 DAG workflow**（`.github/workflows/dags.yml`，20 個測試）：以官方 constraints 安裝 Airflow 並用 DagBag 解析 `orchestration/dags/`。刻意不併進主 job——Airflow 安裝很重且 pin 了大量套件版本，會毀掉主 job「mock DB、數秒跑完」的速度優勢。它不需要 `DB_URL`，因為 DAG 檔刻意不 top-level import 專案模組（見 [ORCHESTRATION-TW §2.2](./ORCHESTRATION-TW.md)）。
 
 - 測試全為單元/整合層（mock DB），不需真實資料庫即可執行，數秒內完成。
 - 測試依賴集中於 `requirements-dev.txt`（`-r requirements.txt` + pytest 等）。
@@ -411,11 +413,22 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 │   ├── test_scan.py       # scan_and_recover、lifespan startup、periodic scan
 │   ├── test_timeout.py    # Pool 耗盡、/process_raw、GET /raw、DB 設定
 │   ├── test_rate_limit.py # per-client 限流
-│   └── test_auth.py       # API Key 驗證、輪替、source_client_id 落地
+│   ├── test_auth.py       # API Key 驗證、輪替、source_client_id 落地
+│   ├── test_extract_cli.py        # 抽取腳本的 --table 分派與 gate
+│   ├── test_reevaluate_quality.py # Proposal B：狀態轉移矩陣、反序列化保真、CLI 閘門
+│   └── test_dags.py       # DAG 結構（需 Airflow，跑在獨立 CI job；本機自動 skip）
+├── extract_ods_to_bq.py   # E/L：ODS → BQ staging（--table orders|quality_events|all）
+├── reevaluate_quality.py  # Proposal B 事件產生端（候選讀 BQ int_、狀態讀 PG、預設 dry-run）
+├── seed_demo.py           # 走真實攝入路徑產生 BI 展示資料
+├── orchestration/         # Airflow：Dockerfile、dags/、env_var 版 dbt profiles
+├── docker-compose.airflow.yml     # Airflow overlay（與 docker-compose.yml 疊加）
+├── requirements-analytics.txt     # 分析管線執行期依賴（Airflow 容器裝這個）
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture（English）
 ├── CLOUD_LAYER-TW.md      # 雲端層架構：ODS → BigQuery（繁體中文）
 ├── CLOUD_LAYER.md         # Cloud Layer Architecture: ODS → BigQuery（English）
+├── ORCHESTRATION-TW.md    # 編排層架構：Airflow（繁體中文）
+├── ORCHESTRATION.md       # Orchestration Layer Architecture: Airflow（English）
 ├── ecommerce_dbt/         # dbt 轉換層（stg_/int_/dim_/fct_/rpt_）；操作與實作決策見其 README
 ├── .env           # DB_URL、API_KEYS（不進版控）
 ├── .env.example   # 環境變數範本（進版控）
@@ -430,6 +443,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 |---|---|
 | [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、場景補值策略、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
 | [雲端層架構](./CLOUD_LAYER-TW.md) | ODS → BigQuery 抽取與 staging：分區/叢集/保險絲設計、watermark 策略（方案 A 與 `get_watermark()` 接縫）、批次載入與 JSON 落地決策、ODS schema 演進策略（staging 只做加法 + dbt 吸收 + `FIELDS` 一致性測試）|
+| [編排層架構](./ORCHESTRATION-TW.md) | Airflow 的三條 DAG 與決策：Airflow ≠ 任務佇列的邊界、DAG 檔不得 import 專案模組、extract 一表一 task、dbt 分層執行與 `--indirect-selection=buildable`、`catchup=False` 的結構性理由、retry 不對稱、freshness 獨立成 DAG、Proposal B 的手動觸發語意；含 runbook 與 Proposal B 完整 demo 劇本 |
 | [轉換層（dbt）](./ecommerce_dbt/README.zh-TW.md) | dbt 轉換層的操作與實作決策：分層與命名慣例、物化策略（table vs view、incremental + insert_overwrite + `copy_partitions` 繞過 sandbox 禁 DML）、回看窗、去重鍵與不變式、Hard Gate 自訂 generic test、freshness 繞保險絲；`int_` 層的有效品質狀態合成（刻意複製 + 對齊清單）、全量重建的必要性、劃分不變式測試、`int_order_items` 的 `safe_cast` 與嚴格 NULL 傳播。層契約見 DQ_ARCHITECTURE、staging 基建見 CLOUD_LAYER |
 
 ---
@@ -485,6 +499,18 @@ docker compose up --build
 - API 刻意以 `--workers 1` 啟動：`BackgroundTasks` 與週期恢復掃描是行程內狀態，多 worker 會各跑一份掃描迴圈。水平擴展留待 Phase 5 的佇列（Redis/Celery）。
 
 API 位於 `http://localhost:8000`（文件 `/docs`，健康檢查 `/health`）。
+
+### 加上 Airflow（分析管線排程）
+
+```bash
+# .env 需有 BQ_PROJECT 與 GOOGLE_APPLICATION_CREDENTIALS（主機上的金鑰路徑）
+echo "AIRFLOW_UID=$(id -u)" >> .env
+
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build
+```
+
+兩個 compose 檔**必須疊加成同一個 project**，DAG 才能以 `db` 這個 hostname 連到業務資料庫。
+Airflow UI 在 `http://localhost:8080`。完整決策與 runbook 見 [ORCHESTRATION-TW.md](./ORCHESTRATION-TW.md)。
 
 ---
 
@@ -546,7 +572,7 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-client 限流（slowapi，以認證 `client_id` 為 key、IP fallback），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 248 個測試，8 個原始碼檔案全部 100% 覆蓋（`pytest --cov`）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] Pytest — 333 個測試，9 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 20 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）除 Airflow 重評估外皆已實作
 
 **Phase 3 — 工程化**
@@ -564,9 +590,10 @@ Looker Studio（直連 BigQuery）
 - [ ] Looker Studio 接 BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — 自動化 + Queue 升級**
-- [ ] Airflow（本地）定期排程 ODS → BigQuery 抽取 → dbt run/test（stg_* → int_* → dim_/fct_ → rpt_*）；含 Proposal B 重評估 task（寫回 `quality_events`）
+- [v] Airflow（本地，3.0.0 + LocalExecutor）三條 DAG——`orders_analytics_daily`（2 個 extract task → 4 層 `dbt build` → 完整 `dbt test`）、`dq_reevaluation`（Proposal B，手動觸發、預設 dry-run、commit 後自動接主 DAG）、`source_freshness_watch`（獨立觀測，不污染主管線成功率）。dbt 與分析腳本各自獨立 venv；DAG 檔不 import 專案模組故可進 CI；決策見 [ORCHESTRATION-TW.md](./ORCHESTRATION-TW.md)
+- [v] Proposal B 事件產生端（`reevaluate_quality.py`）——候選讀 BQ `int_` 層（與 Row Filter 同一份有效品質狀態定義）、狀態判定讀 PG（冪等不能建立在有保留期的鏡射上）、只在狀態改變時 append；`business_clean` 加 `as_of` 讓時間相依規則可重現，`NON_REPRODUCIBLE_CODES` 擋掉「證據消失式」的偽 promote
 - [ ] Celery + Redis（取代 BackgroundTasks）
-- [ ] Docker 擴展：補上 Redis + Celery Worker 與 Airflow 服務
+- [ ] Docker 擴展：補上 Redis + Celery Worker
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
   - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）
   - **Metrics**：透過 OTel Metrics API 量化業務指標——訂單寫入量、ODS 處理成功 / 失敗 / duplicate 比率、processing 延遲分佈（P50/P95/P99）、DB pool 壓力、Retry 次數分佈

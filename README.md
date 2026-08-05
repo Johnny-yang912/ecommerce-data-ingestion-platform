@@ -41,7 +41,7 @@ POST /orders
     ├── first-write-wins idempotency check
     └── [ODS] + [quality_events]  ← immutable anchor, with quality flag and event log
 
-[ODS] → incremental extraction (manual today, Airflow in Phase 5) → BigQuery staging
+[ODS] → incremental extraction (Airflow, daily schedule) → BigQuery staging
     ↓
 dbt stg_*   Hard Gate tests                 ← Silver entry, all records retained
     ↓
@@ -321,7 +321,9 @@ Result: ODS always contains exactly one record per `order_id`; all subsequent du
 
 ## Continuous Integration (CI)
 
-Every push to `main` and every Pull Request automatically triggers GitHub Actions (`.github/workflows/ci.yml`), which installs dependencies and runs the full test suite (248 tests, 100% source coverage) across a **Python 3.10 and 3.12** matrix.
+Every push to `main` and every Pull Request automatically triggers GitHub Actions (`.github/workflows/ci.yml`), which installs dependencies and runs the full test suite (333 tests, 100% coverage of the gated modules) across a **Python 3.10 and 3.12** matrix.
+
+A **separate DAG workflow** (`.github/workflows/dags.yml`, 20 tests) installs Airflow under the official constraints and parses `orchestration/dags/` with DagBag. It is deliberately not folded into the main job — Airflow's install is heavy and pins many package versions, which would destroy the main job's "mock DB, done in seconds" property. It needs no `DB_URL`, because DAG files deliberately import no project module (see [ORCHESTRATION §2.2](./ORCHESTRATION.md)).
 
 - All tests are unit/integration level (mock DB) — no real database is required, and they finish in seconds.
 - Test dependencies are pinned in `requirements-dev.txt` (`-r requirements.txt` + pytest, etc.).
@@ -411,11 +413,22 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 │   ├── test_scan.py       # scan_and_recover, lifespan startup, periodic scan
 │   ├── test_timeout.py    # Pool exhaustion, /process_raw, GET /raw, DB settings
 │   ├── test_rate_limit.py # per-client rate limiting
-│   └── test_auth.py       # API Key auth, rotation, source_client_id persistence
+│   ├── test_auth.py       # API Key auth, rotation, source_client_id persistence
+│   ├── test_extract_cli.py        # Extraction script --table dispatch and gate
+│   ├── test_reevaluate_quality.py # Proposal B: transition matrix, deserialization fidelity, CLI gates
+│   └── test_dags.py       # DAG structure (needs Airflow; separate CI job, auto-skipped locally)
+├── extract_ods_to_bq.py   # E/L: ODS → BQ staging (--table orders|quality_events|all)
+├── reevaluate_quality.py  # Proposal B event producer (candidates from BQ int_, state from PG, dry-run by default)
+├── seed_demo.py           # Generates BI demo data through the real ingestion path
+├── orchestration/         # Airflow: Dockerfile, dags/, env_var-driven dbt profiles
+├── docker-compose.airflow.yml     # Airflow overlay (layered onto docker-compose.yml)
+├── requirements-analytics.txt     # Analytics runtime deps (what the Airflow image installs)
 ├── DQ_ARCHITECTURE.md     # Data Quality Control Architecture (English)
 ├── DQ_ARCHITECTURE-TW.md  # 資料品質控管架構設計文件（繁體中文）
 ├── CLOUD_LAYER.md         # Cloud Layer Architecture: ODS → BigQuery (English)
 ├── CLOUD_LAYER-TW.md      # 雲端層架構：ODS → BigQuery（繁體中文）
+├── ORCHESTRATION.md       # Orchestration Layer Architecture: Airflow (English)
+├── ORCHESTRATION-TW.md    # 編排層架構：Airflow（繁體中文）
 ├── ecommerce_dbt/         # dbt transformation layer (stg_/int_/dim_/fct_/rpt_); ops & decisions in its README
 ├── .env           # DB_URL, API_KEYS (not committed)
 ├── .env.example   # Environment variable template (committed)
@@ -430,6 +443,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 |---|---|
 | [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), scenario repair strategy, quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
 | [Cloud Layer Architecture](./CLOUD_LAYER.md) | ODS → BigQuery extraction and staging: partition/clustering/fuse design, watermark strategy (Approach A + the `get_watermark()` seam), batch-load and JSON landing decisions, and the ODS schema evolution strategy (additive staging + dbt absorption + `FIELDS` consistency test) |
+| [Orchestration Layer Architecture](./ORCHESTRATION.md) | Airflow's three DAGs and their decisions: the Airflow-is-not-a-task-queue boundary, why DAG files must not import project modules, one extract task per table, layered dbt execution with `--indirect-selection=buildable`, the structural reason for `catchup=False`, asymmetric retries, freshness as its own DAG, and the manual-trigger semantics of Proposal B; includes the runbook and the full Proposal B demo script |
 | [Transformation Layer (dbt)](./ecommerce_dbt/README.md) | dbt transformation ops & implementation decisions: layering/naming conventions, materialization (table vs view, incremental + insert_overwrite + `copy_partitions` to bypass the sandbox DML ban), lookback window, dedup key & invariant, Hard Gate custom generic test, freshness fuse bypass; the `int_` layer's effective-quality-state composition (deliberate duplication + alignment checklist), why full rebuilds are required, the partition invariant test, and `int_order_items`'s `safe_cast` + strict NULL propagation. Layer contracts in DQ_ARCHITECTURE, staging infra in CLOUD_LAYER |
 
 ---
@@ -485,6 +499,19 @@ docker compose up --build
 - The API runs with `--workers 1` on purpose: `BackgroundTasks` and the periodic recovery scan are in-process state, so multiple workers would each run their own scan loop. Horizontal scaling waits on the Phase 5 queue (Redis/Celery).
 
 API available at `http://localhost:8000` (docs at `/docs`, health at `/health`).
+
+### Adding Airflow (analytics pipeline scheduling)
+
+```bash
+# .env needs BQ_PROJECT and GOOGLE_APPLICATION_CREDENTIALS (host path to the key)
+echo "AIRFLOW_UID=$(id -u)" >> .env
+
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build
+```
+
+The two compose files **must be layered into one project** so the DAGs can reach the business
+database at the hostname `db`. Airflow UI at `http://localhost:8080`. Full decisions and runbook
+in [ORCHESTRATION.md](./ORCHESTRATION.md).
 
 ---
 
@@ -546,7 +573,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Rate limiting — per-client limits via slowapi (keyed on the authenticated `client_id`, IP fallback): `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
-- [v] Pytest — 248 tests, 100% coverage across all 8 source files (`pytest --cov`); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
+- [v] Pytest — 333 tests, 100% coverage across all 9 gated modules (`pytest --cov`; plus 20 DAG tests in a separate CI job); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
 - [v] Data quality control architecture (ODS layer) — full design document (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md)); ODS layer implemented: `DQ_RULE_VERSION` rule version constant, `dq_rule_version` column (ODS), `quality_events` table (append-only quality event log, state machine anchor), structlog `quality_metric` event; BQ Analytics layer (Hard Gate, Row Filter, `int_orders_quarantine`, Airflow re-evaluation, `rpt_quality_*`) all implemented except the Airflow re-evaluation
 
 **Phase 3 — Operability**
@@ -564,9 +591,10 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [ ] Looker Studio connected to BigQuery dim_*/fct_*/rpt_*
 
 **Phase 5 — Automation + Queue Upgrade**
-- [ ] Airflow (local) scheduled ODS → BigQuery extraction → dbt run/test（stg_* → int_* → dim_/fct_ → rpt_*）; includes Proposal B re-evaluation task (writes back to `quality_events`)
+- [v] Airflow (local, 3.0.0 + LocalExecutor), three DAGs — `orders_analytics_daily` (2 extract tasks → 4 layered `dbt build`s → a full `dbt test`), `dq_reevaluation` (Proposal B: manual trigger, dry-run by default, chains into the main DAG on commit), and `source_freshness_watch` (standalone observability that cannot pollute the main pipeline's success rate). dbt and the analytics scripts live in separate venvs; DAG files import no project module and are therefore CI-covered. Decisions in [ORCHESTRATION.md](./ORCHESTRATION.md)
+- [v] Proposal B event producer (`reevaluate_quality.py`) — candidates read from BQ's `int_` layer (the same effective-quality-state definition the Row Filter uses), state decided against PG (idempotency cannot rest on a mirror that expires), and events appended only on an actual state change; `business_clean` gains `as_of` so time-dependent rules are reproducible, and `NON_REPRODUCIBLE_CODES` blocks "evidence disappeared" spurious promotions
 - [ ] Celery + Redis (replace BackgroundTasks)
-- [ ] Docker extension: add Redis + Celery Worker and Airflow services
+- [ ] Docker extension: add Redis + Celery Worker
 - [ ] OpenTelemetry — extend the existing structlog foundation to cover all three observability pillars:
   - **Logs**: route structlog output through the OTel Log Exporter; `trace_id` / `span_id` are injected into every log entry automatically, enabling cross-service log correlation
   - **Metrics**: quantify business signals via the OTel Metrics API — order ingestion throughput, ODS processed / error / duplicate rates, processing latency distribution (P50/P95/P99), DB pool pressure, retry attempt counts

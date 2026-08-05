@@ -3,7 +3,7 @@
 # 為什麼不把 dbt 與專案依賴直接 pip 進 Airflow 本體：Airflow 與 dbt-bigquery 都重度依賴
 # google-cloud-* / protobuf / jinja2，裝在同一個環境是典型的版本衝突來源，且每次升
 # Airflow 都可能炸掉 dbt。官方也建議不要。這裡用兩個 venv 隔離，DAG 以 BashOperator
-# 呼叫各自的直譯器——零額外基建，故障域乾淨（見 PHASE5_ORCHESTRATION.md 決策 A2）。
+# 呼叫各自的直譯器——零額外基建，故障域乾淨（見 ORCHESTRATION-TW.md 決策 A2）。
 #
 #   /home/airflow/venvs/analytics   extract_ods_to_bq.py / reevaluate_quality.py
 #   /home/airflow/venvs/dbt         dbt build / test / source freshness

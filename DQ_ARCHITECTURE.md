@@ -311,6 +311,8 @@ A, B and C fix **different types of problems**. It is essential to know which pa
 > **Important**: `force=True` does **not** work on quarantine records (`status = "processed"` → returns 400).  
 > Quarantine records have a **rule evaluation problem**, not a pipeline failure — re-running the pipeline cannot fix them.  
 > And when the values themselves were corrupted by a production defect, neither A nor B can help: B's input *is* the corrupted ODS values, and Bounded Writeback forbids B from writing values. That is Proposal C's territory.
+>
+> **The same boundary has a second, more common shape: the value was normalised away at ingestion by the rule itself.** `NON_FINITE_NUMBER` sets NaN/Inf to `None` as it flags them (PostgreSQL's JSONB/TEXT cannot store NaN). Such records necessarily "pass" on re-evaluation — but that is evidence disappearing, not a rule loosening, and promoting on it would push an order whose amounts are actually missing into Gold. **B is powerless here for exactly the same reason as above** (its input is the already-modified ODS value), so `clean.NON_REPRODUCIBLE_CODES` pins these codes down and `reevaluate_quality.py` never auto-promotes them, only counts and reports them. The only real recovery is re-deriving from Raw = Proposal C.
 
 ### Proposal B: re-evaluation without re-running the pipeline
 
@@ -343,11 +345,15 @@ On the next dbt run, `int_orders` composes the effective quality from "ODS snaps
 ```
 [ODS] has_clean_error=TRUE, dq_rule_version=v1   ← always this snapshot, never modified
    │
-   │  Airflow re-evaluation task (Proposal B, Phase 5)
-   ├─ 1. pull staging records with has_clean_error=TRUE (column values already normalized)
-   ├─ 2. re-run v2 business_clean on those existing ODS column values   ← no raw, no pipeline re-run
-   ├─ 3a. passes v2      → append quality_events: promotion (quarantined → promoted, v2)
-   └─ 3b. still fails v2 / manually written off → append rejection (→ permanently_rejected)
+   │  Airflow re-evaluation task (Proposal B) ── reevaluate_quality.py
+   ├─ 1. candidates = BQ int_orders_quarantine ∪ int_orders, has_clean_error=TRUE
+   │       and effective quality state ≠ permanently_rejected (values already normalized)
+   ├─ 2. re-run the current business_clean on those existing ODS values (as_of=received_at)
+   │       ← no raw, no pipeline re-run
+   ├─ 3a. passes            → append promotion        (quarantined/re_quarantined → promoted)
+   ├─ 3b. still fails       → **write no event**; stays put, waits for the next rule version
+   ├─ 3c. fails after a tightening → append re_quarantination (promoted → re_quarantined)
+   └─ 3d. manually written off → append rejection (→ permanently_rejected)  ← human path, not this task
    │
    ▼
 [quality_events]  append-only; the new fact lives here (ODS is not changed)
@@ -356,6 +362,22 @@ On the next dbt run, `int_orders` composes the effective quality from "ODS snaps
 next dbt run: int_orders composes effective quality from "ODS + latest quality_events state"
    → records whose latest state is promoted flow into int_orders → dim_*/fct_*
 ```
+
+**Why candidates come from BQ's `int_` layer, not from `staging`'s literal `has_clean_error`** ⭐
+The correct basis for "who is still stuck" is the **effective quality state**, not the ODS snapshot — which is exactly what 〈Why the Row Filter cannot just read `has_clean_error`〉 argues. `int_orders_quarantine` / `int_orders` already compute it, and reading them buys two things: ① re-evaluation and the Row Filter **cannot, by construction, disagree** about who is quarantined; ② no need to re-implement "latest event per `raw_id`" outside dbt — that would be a **third copy** of the shared block, living where `assert_orders_split_is_partition` cannot guard it (see the convergence trigger in [ecommerce_dbt/README §5.3](./ecommerce_dbt/README.md)). It is also an analytical full scan; running it against ODS would contend with the `POST /orders` hot path, and moving exactly that kind of read away is why the cloud layer exists.
+
+The `int_orders` arm is **not optional**: promoted records live there, and dropping it makes the state machine's `promoted → re_quarantined` edge permanently unreachable.
+
+**But "did the state change?" must be read from PG, never from BQ** ⭐
+BQ is a **mirror with a retention policy** (60 days, forced in sandbox — see [CLOUD_LAYER §1.7](./CLOUD_LAYER.md)). Judging state change from it means that once an event expires it reads as "no event" → a second promotion gets appended for an already-promoted record → polluting the very `promotions` figure that 〈Why historical metrics are never retroactively rewritten〉 exists to protect, and append-only means it cannot be deleted. **Idempotency can only be guaranteed by the write target itself, never by its mirror.** The `permanently_rejected` filter on the BQ side is therefore only a cheap fast path; the guarantee lives in the PG-side transition decision — the same pre-check + UNIQUE division of labour used in the ingestion layer.
+
+**Why 3b writes nothing (the entire source of idempotency)** ⭐
+Append only when the state **actually changes**. That single rule buys four things: re-runs cannot inflate `promotions`; every state-machine edge stays reachable (including `re_quarantined`); no fourth state container is needed to remember "who has been evaluated"; and `quality_events` remains a log of **state transitions** rather than of job executions — the latter belongs to structlog / Airflow task logs, matching the tier-1 / tier-2 split in 〈Historical quality metrics〉.
+
+The original design folded "still fails" and "manually written off" into one 3b branch, which would have let **the very first run burn the entire backlog into `permanently_rejected`** (a state with no outgoing edge — never looked at again from v3 onward), and that value is documented in the `int_` column description as meaning "written off by a human". Hence the split: the automated task only produces 3a/3c; `rejection` stays a human path.
+
+**Irreproducible verdicts must not be auto-promoted**
+Records carrying an error code in `clean.NON_REPRODUCIBLE_CODES` (currently `NON_FINITE_NUMBER`) are never promoted: those rules normalise the value in place as they flag it, so re-evaluation necessarily "passes" — but that is **evidence disappearing**, not a rule being loosened. The original value survives only verbatim in Raw, so recovering it means re-deriving from Raw, which is by definition Proposal C's territory (see the note under 〈Remediation: A + B + C〉). Such records are only counted and reported, making "a batch stuck between B and C" a visible number.
 
 > **Applicability boundary**: this v1→v2 bump is **stricter** (flags more), so it applies going forward only and needs **no retroactive re-evaluation**. Retroactive re-evaluation (B's promote path) only triggers when rules are **loosened** to pull old quarantine back; tightening rules can instead push existing `promoted` records to `re_quarantined` on re-evaluation (the state-machine edge case).
 
@@ -366,13 +388,24 @@ initial_evaluation
   ├── passes all rules           → to_state: "clean"
   └── has_clean_error = TRUE     → to_state: "quarantined"
 
-quarantined
-  ├── Proposal B re-eval passes  → to_state: "promoted"
-  └── manually written off       → to_state: "permanently_rejected"
+quarantined / re_quarantined
+  ├── Proposal B re-eval passes  → to_state: "promoted"              event_type: promotion
+  ├── Proposal B re-eval fails   → **no event written**; stays put
+  └── manually written off       → to_state: "permanently_rejected"  event_type: rejection
 
 promoted
-  └── stricter rules re-eval fails → to_state: "re_quarantined"  (edge case)
+  ├── stricter rules re-eval fails → to_state: "re_quarantined"      event_type: re_quarantination
+  └── re-eval still passes         → **no event written**; stays put
+
+permanently_rejected             ← terminal, no outgoing edge; the automated task
+                                   never writes it and never overrides it
 ```
+
+Three things to read together:
+
+- **`event_type` domain is `initial_evaluation | promotion | re_quarantination | rejection`.** `re_quarantination` was added later — the original document defined the `re_quarantined` `to_state` without a matching event type. Downstream is safe: `rpt_quality_events_daily` explicitly counts by `to_state`, not `event_type`, and the `int_` CASE folds `re_quarantined` into `else 'quarantined'`, so the new type breaks no existing model or test.
+- **"No event written" is a design decision, not an omission.** Appending only on an actual state change makes the event table its own idempotency gate (see the 3b discussion under Proposal B above).
+- **`permanently_rejected` can only come from a human.** That is enforced at the write target (PG), not merely by the BQ-side filter — see "did the state change?" above.
 
 ---
 
@@ -494,7 +527,7 @@ quality_events
 ├── id:           Integer (PK)
 ├── raw_id:       Integer
 ├── order_id:     String
-├── event_type:   String     "initial_evaluation" | "promotion" | "rejection"
+├── event_type:   String     "initial_evaluation" | "promotion" | "re_quarantination" | "rejection"
 ├── from_state:   String?    null | "quarantined" | "promoted"
 ├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected" | "re_quarantined"
 ├── rule_version: String     "v1" | "v2" | ...
@@ -649,7 +682,7 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | `dim_customer`/`dim_product` (SCD1 + unknown member) | BQ Analytics | ✅ Done |
 | `fct_orders`/`fct_order_items` (Kimball header/line dual fact tables) | BQ Analytics | ✅ Done (rollup consistency + lossless projection both covered by singular tests) |
 | Scenario-specific `int_orders_*` models (JSONB filter + imputation) | BQ Analytics | ⬜ Designed; enable only when a real analytical scenario appears (see the status note under Mechanism 3) |
-| Airflow re-evaluation task (Proposal B) | BQ Analytics | ⬜ Phase 5 — **the downstream flow-back path is already in place**, only the event producer is missing |
+| Airflow re-evaluation task (Proposal B) | BQ Analytics | ✅ Implemented (`reevaluate_quality.py`: candidates from BQ `int_`, state decided against PG, appends only on an actual state change; dry-run by default). Scheduling and the manual `rejection` runbook belong to Phase 5 orchestration |
 | `rpt_quality_*` dbt models | BQ Analytics | ✅ Implemented (split into `rpt_quality_events_daily` + `rpt_quality_backlog`) |
 
 ---
@@ -671,10 +704,11 @@ This divergence is an intentional design decision. Traceability is provided by `
 Suggested starting values: error rate > 10% blocks the run; > 5% warns.  
 Actual thresholds should be calibrated once real traffic data is available. Initial values are conservative estimates.
 
-**`quality_events` does not yet cover BQ-layer promotion events**  
-Proposal B (Airflow re-evaluation) is not yet implemented. Currently `quality_events` only records `initial_evaluation` events written at ingestion time.  
-When Airflow is introduced in Phase 4, the write logic for `promotion` and `permanently_rejected` events must be added alongside it.  
-**The downstream flow-back path is, however, already in place**: `int_orders`'s effective-state composition is implemented and test-guarded, so once Proposal B starts emitting `promotion` events they take effect on the next dbt run, with no further changes to the `int_` layer.
+**Promotion events are produced by `reevaluate_quality.py` (implemented)**  
+The write logic for `promotion` and `re_quarantination` is in place. It is triggered **manually / on a rule-version bump**, not on a daily schedule — with unchanged rules a re-evaluation is necessarily a no-op, so scheduling it daily would just full-scan the entire quarantine backlog for nothing. `rejection` (→ `permanently_rejected`) is deliberately **not** part of the automated task, preserving its "written off by a human" meaning.  
+**The downstream flow-back path was already in place**: `int_orders`'s effective-state composition has been test-guarded all along, so the moment events appear they take effect on the next dbt run with **zero changes to the `int_` layer** — the payoff of having built the consumer side correctly first.
+
+> ⚠️ **A run today would promote 0 records**: v1→v2 was a **tightening**, and all existing data was ingested under v2, so re-evaluating v2 against v2 is a tautology. Seeing flow-back requires a real **rule loosening** first (a v3 bump). Full demo script in `PHASE5_ORCHESTRATION.md`.
 
 **BQ sandbox's 60-day expiration can push promoted records back to quarantine (an account-level limit)**  
 The sandbox forces 60-day partition and table expiration (see [CLOUD_LAYER §1.6](./CLOUD_LAYER.md)), which the `quality_events` staging table inherits. If a `promotion` event expires and disappears, `int_orders`'s LEFT JOIN falls back to the ODS snapshot (`has_clean_error=TRUE`) → that record **drops out of Gold back into quarantine**.  

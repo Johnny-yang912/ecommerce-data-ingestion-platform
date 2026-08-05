@@ -308,6 +308,8 @@ A、B、C 修的是**不同類型**的問題，需明確知道用哪個：
 > **注意**：`force=True` 對 quarantine 記錄無效（status="processed" → 回 400）。  
 > Quarantine 記錄的問題是**規則評估**，不是 pipeline 失敗，不需要重跑 pipeline。  
 > 而值本身被產製缺陷洗壞時，A 和 B 都修不了：B 的輸入正是被汙染的 ODS 值，且 Bounded Writeback 禁止 B 寫值。那是 Proposal C 的領域。
+>
+> **同一條邊界還有一個更常見的形態：值在攝入時就被【規則自己】正規化掉了。** `NON_FINITE_NUMBER` 標記 NaN/Inf 的同時把值設成 `None`（PostgreSQL 的 JSONB/TEXT 存不下 NaN）。這類記錄重評估時必然「通過」——但那是證據消失，不是規則放寬，據此 promote 會讓一筆金額其實是缺的訂單流進 Gold。**B 對它無能為力的理由與上一段完全相同**（B 的輸入是被改過的 ODS 值），故 `clean.NON_REPRODUCIBLE_CODES` 把這類碼標死、`reevaluate_quality.py` 一律不自動 promote，只計數回報。要真的救回來，唯一的路是從 Raw 重產值＝Proposal C。
 
 ### Proposal B：不重跑的重評估流程
 
@@ -340,11 +342,15 @@ reason:       null（或本次仍殘留、但不再阻斷的訊息）
 ```
 [ODS] has_clean_error=TRUE, dq_rule_version=v1   ← 永遠是這個快照，不動
    │
-   │  Airflow 重評估 task（Proposal B，Phase 5）
-   ├─ 1. 撈 staging 中 has_clean_error=TRUE 的記錄（欄位值已標準化）
-   ├─ 2. 對這些現成的 ODS 欄位值重跑 v2 business_clean   ← 不碰 raw、不重跑 pipeline
-   ├─ 3a. v2 通過      → append quality_events: promotion (quarantined → promoted, v2)
-   └─ 3b. v2 仍不過 / 人工放棄 → append rejection (→ permanently_rejected)
+   │  Airflow 重評估 task（Proposal B）── reevaluate_quality.py
+   ├─ 1. 候選＝BQ 的 int_orders_quarantine ∪ int_orders，has_clean_error=TRUE
+   │       且有效品質狀態 ≠ permanently_rejected（欄位值已標準化）
+   ├─ 2. 對這些現成的 ODS 欄位值重跑當前版 business_clean（as_of=received_at）
+   │       ← 不碰 raw、不重跑 pipeline
+   ├─ 3a. 通過        → append promotion        (quarantined/re_quarantined → promoted)
+   ├─ 3b. 仍不過      → 【不寫事件】，留在原狀態等下一版
+   ├─ 3c. 變嚴後不過  → append re_quarantination (promoted → re_quarantined)
+   └─ 3d. 人工決定放棄 → append rejection        (→ permanently_rejected)  ← 人工路徑，非本 task
    │
    ▼
 [quality_events]  append-only，新事實住這裡（ODS 不被改）
@@ -353,6 +359,22 @@ reason:       null（或本次仍殘留、但不再阻斷的訊息）
 下次 dbt run：int_orders 以「ODS + quality_events 最新狀態」合成有效品質
    → 最新狀態為 promoted 的記錄流入 int_orders → dim_*/fct_*
 ```
+
+**候選為什麼讀 BQ 的 `int_` 層，而不是 `staging` 的 `has_clean_error` 字面值** ⭐
+「誰還卡著」的正確基準是**有效品質狀態**，不是 ODS 快照——這正是〈為什麼 Row Filter 不能只讀 `has_clean_error`〉整節在說的事。`int_orders_quarantine` / `int_orders` 已經把它算好了，直接讀有兩個好處：① 重評估與 Row Filter 對「誰被隔離」的認定**在定義上不可能分歧**；② 不必在 dbt 之外再實作一次「每個 `raw_id` 取最新事件」——那會是那段共用邏輯的**第三份複製**，且住在 `assert_orders_split_is_partition` 管不到的地方（見 [ecommerce_dbt/README.zh-TW §5.3](./ecommerce_dbt/README.zh-TW.md) 的收斂觸發點）。另外它是分析型全掃，打在 ODS 上會與 `POST /orders` 的熱路徑搶資源，而把這種讀取移走本來就是雲端層存在的理由。
+
+`int_orders` 那一支**不可省**：被 promote 的記錄住在那裡，漏掉它，狀態機的 `promoted → re_quarantined` 這條邊永遠不可達。
+
+**但「狀態變了沒」必須讀 PG，不能讀 BQ** ⭐
+BQ 是**有保留期的鏡射**（sandbox 強制 60 天，見 [CLOUD_LAYER-TW §1.7](./CLOUD_LAYER-TW.md)）。拿它判斷狀態是否改變，會在事件過期時誤判成「沒有事件」→ 對已 promote 的記錄再 append 一次 promotion → 污染〈歷史指標為何不會被追溯性改寫〉要保護的 `promotions` 數字，而 append-only 刪不掉。**冪等的保證只能來自寫入目標本身，不能來自它的鏡射。** 故 BQ 端的 `permanently_rejected` 過濾只是省流量的快路徑，真正的保證在 PG 端的轉移判定——這對分工與攝入層的 `pre-check + UNIQUE` 是同一個手法。
+
+**3b 為什麼不寫事件（冪等的全部來源）** ⭐
+只在**狀態真的改變**時才 append。這一條規則同時買到四件事：重跑不會灌水 `promotions`；狀態機每條邊都可達（含 `re_quarantined`）；不需要第四個狀態容器來記「誰被評估過」；`quality_events` 維持「**狀態轉移**日誌」而非「作業執行日誌」——後者屬 structlog／Airflow task log，正好對應〈歷史品質指標〉層次一與層次二的分工。
+
+原設計把「仍不過」與「人工放棄」併在同一支 3b，會讓**第一次執行就把整批 backlog 燒成 `permanently_rejected`**（該狀態沒有出邊，v3 之後永遠不會再被看一眼），而且那個值在 `int_` 的欄位描述裡明寫是「人工放棄」。故拆開：自動任務只產生 3a/3c，`rejection` 保留為人工路徑。
+
+**不可重現的判定不得自動 promote**
+帶有 `clean.NON_REPRODUCIBLE_CODES` 內錯誤碼（目前為 `NON_FINITE_NUMBER`）的記錄一律不 promote：那些規則在標記時把值就地正規化掉了，重評估必然「通過」，但那是**證據消失**而非規則放寬。原始值只逐字留在 Raw——要救它得從 Raw 重產值，按定義是 Proposal C 的領域（見〈Remediation：A + B + C 並用〉的註）。這類記錄只計數回報，讓「有一批卡在 B 與 C 之間」成為可見的數字。
 
 > **適用邊界**：本次 v1→v2 是**變嚴**（標記更多），只往後生效、**不需回溯重評估**。回溯重評估（B 的 promote 路徑）只在**規則放寬**、要把舊 quarantine 撈回來時才觸發；規則變嚴反而可能讓既有 `promoted` 記錄在重評估時落到 `re_quarantined`（狀態機邊緣情況）。
 
@@ -363,13 +385,23 @@ initial_evaluation
   ├── 通過所有規則           → to_state: "clean"
   └── has_clean_error=TRUE  → to_state: "quarantined"
 
-quarantined
-  ├── B 重評估，新規則通過   → to_state: "promoted"
-  └── 人工決定放棄           → to_state: "permanently_rejected"
+quarantined / re_quarantined
+  ├── B 重評估，新規則通過   → to_state: "promoted"            event_type: promotion
+  ├── B 重評估，仍不通過     → 【不寫事件】，留在原狀態
+  └── 人工決定放棄           → to_state: "permanently_rejected"  event_type: rejection
 
 promoted
-  └── 規則變嚴後重評估失敗   → to_state: "re_quarantined"（邊緣情況）
+  ├── 規則變嚴後重評估失敗   → to_state: "re_quarantined"        event_type: re_quarantination
+  └── 重評估仍通過           → 【不寫事件】，留在原狀態
+
+permanently_rejected        ← 終局狀態，無出邊；自動任務永不寫入、也永不改動
 ```
+
+三件事需要一併看：
+
+- **`event_type` 值域為 `initial_evaluation | promotion | re_quarantination | rejection`。** `re_quarantination` 是後補的——原文件定義了 `re_quarantined` 這個 `to_state`，卻沒有對應的事件類型。下游安全：`rpt_quality_events_daily` 明寫「只看 `to_state` 不看 `event_type`」，`int_` 的 CASE 也把 `re_quarantined` 收進 `else 'quarantined'`，故新增類型不影響任何既有模型或測試。
+- **「不寫事件」不是省略，是設計。** 只在狀態改變時 append，讓事件表自己成為冪等閘（見上方 Proposal B 的 3b 說明）。
+- **`permanently_rejected` 只有人給得起。** 這條在寫入端（PG）強制，而非只靠 BQ 端過濾——見上方「狀態變了沒必須讀 PG」。
 
 ---
 
@@ -491,8 +523,8 @@ quality_events
 ├── id:           Integer (PK)
 ├── raw_id:       Integer
 ├── order_id:     String
-├── event_type:   String     "initial_evaluation" | "promotion" | "rejection"
-├── from_state:   String?    null | "quarantined" | "promoted"
+├── event_type:   String     "initial_evaluation" | "promotion" | "re_quarantination" | "rejection"
+├── from_state:   String?    null | "quarantined" | "promoted" | "re_quarantined"
 ├── to_state:     String     "clean" | "quarantined" | "promoted" | "permanently_rejected" | "re_quarantined"
 ├── rule_version: String     "v1" | "v2" | ...
 ├── event_at:     DateTime
@@ -501,7 +533,9 @@ quality_events
 
 **寫入時機：**
 - `process.py` 成功寫 ODS 後 → 寫一筆 `initial_evaluation` 事件
-- Airflow 重評估促進記錄後 → 寫一筆 `promotion` 或 `rejection` 事件
+- `reevaluate_quality.py`（Proposal B）判定狀態改變後 → 寫一筆 `promotion` 或 `re_quarantination` 事件；
+  **狀態沒變則不寫**（冪等閘，見上方 Proposal B 的 3b）
+- 人工放棄某筆 → 寫一筆 `rejection` 事件（runbook 驅動，非自動任務）
 
 **語意邊界：**
 此表嚴格限定為全局狀態機，只記錄攝入層事件與跨層（PG → BQ）的 Proposal B 評估事件。BQ 內場景專用模型的補值決策**不寫回**此表——場景補值屬於分析層內部的業務邏輯，不是資料品質狀態的演進。
@@ -646,7 +680,7 @@ WHERE event_type = 'promotion' AND rule_version = 'v2'
 | `dim_customer`/`dim_product`（SCD1 + unknown member）| BQ Analytics | ✅ 已完成 |
 | `fct_orders`/`fct_order_items`（Kimball header/line 雙事實表）| BQ Analytics | ✅ 已完成（rollup 一致性 + 無損投影皆有 singular test）|
 | 場景專用 `int_orders_*` 模型（JSONB 過濾 + 補值） | BQ Analytics | ⬜ 設計已備妥，待真實分析場景出現才啟用（見機制三的實作狀態註）|
-| Airflow 重評估 task（Proposal B） | BQ Analytics | ⬜ Phase 5——**下游回流路徑已就緒**，只等事件產生端 |
+| Airflow 重評估 task（Proposal B） | BQ Analytics | ✅ 已實作（`reevaluate_quality.py`：候選讀 BQ `int_` 層、狀態判定讀 PG、只在狀態改變時 append；預設 dry-run）。排程與人工 `rejection` runbook 屬 Phase 5 編排 |
 | `rpt_quality_*` dbt 模型 | BQ Analytics | ✅ 已實作（拆為 `rpt_quality_events_daily` + `rpt_quality_backlog`）|
 
 ---
@@ -668,10 +702,11 @@ BQ `dim_*/fct_*` 反映目前最新評估下的乾淨狀態。
 目前建議值：error rate > 10% 擋住，> 5% 告警。  
 實際閾值應在有真實流量資料後調整，初始值為保守估計。
 
-**`quality_events` 目前不覆蓋 BQ 層的促進事件**  
-Proposal B（Airflow 重評估）尚未實作。目前 `quality_events` 只有攝入時的 `initial_evaluation` 事件。  
-Phase 4 Airflow 建立後，促進（`promotion`）與永久拒絕（`rejection`）的事件寫入邏輯需一併補上。  
-**但下游的回流路徑已經就緒**：`int_orders` 的有效狀態合成已實作並有測試把關，Proposal B 一旦開始產生 `promotion` 事件，下次 dbt run 即自然生效，無需再改 `int_` 層。
+**`quality_events` 的促進事件由 `reevaluate_quality.py` 產生（已實作）**  
+`promotion` 與 `re_quarantination` 的寫入邏輯已落地，觸發方式是**手動／規則升版時**而非日排程——規則沒變時重評估必然是 no-op，排成日批只是對全歷史 quarantine 做一次白工。`rejection`（→ `permanently_rejected`）刻意**不做進自動任務**，維持「人工放棄」的語意。  
+**下游回流路徑本來就已就緒**：`int_orders` 的有效狀態合成早有測試把關，事件一產生，下次 dbt run 即自然生效，`int_` 層一行都沒改——這是當初「先把消費端做對」這個順序的回報。
+
+> ⚠️ **目前跑一次會 promote 0 筆**：v1→v2 是**變嚴**，而現有資料都是 v2 攝入的，拿 v2 重評估 v2 是同義反覆。要看到回流，必須先有一次真實的**規則放寬**（bump v3）。完整 demo 劇本見 `PHASE5_ORCHESTRATION.md`。
 
 **BQ sandbox 的 60 天過期會讓 promoted 記錄回退（帳號層限制）**  
 sandbox 強制套 60 天分區＋表過期（見 [CLOUD_LAYER-TW §1.6](./CLOUD_LAYER-TW.md)），`quality_events` staging 亦繼承。若某筆 `promotion` 事件過期消失，`int_orders` 的 LEFT JOIN 會 fall back 到 ODS 快照（`has_clean_error=TRUE`）→ 該筆**從 Gold 掉回 quarantine**。  

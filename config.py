@@ -50,5 +50,9 @@ class Settings(BaseSettings):
     # 腳本啟動時自行檢查缺值並 fail-fast（見 extract_ods_to_bq.main）。
     bq_project: str = ""
 
+    # dbt 產出的 dataset：Proposal B 重評估要讀 int_ 層取候選（見 reevaluate_quality.py）。
+    # 與 dbt profile 的 target dataset 對應，dev/prod 不同 → 屬「會因部署環境而異」的值。
+    bq_dbt_dataset: str = "dbt_dev"
+
 
 settings = Settings()

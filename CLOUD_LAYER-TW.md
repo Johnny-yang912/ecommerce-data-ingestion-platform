@@ -251,6 +251,25 @@ fct_orders   207 筆（order_date 2026-06-05 ~ 2026-07-01，剛好 60 天窗）
 啟用帳單後這個強制值解除，`gold_partition_expiration_days` 才真正生效（屆時
 `gold_projection_window_days` 應一併調整為與保留政策一致）。
 
+#### 1.7.9 staging 的保留期不是自由參數——Proposal B 對它有硬性下限 ⭐
+
+前面幾節把 60 天當成「sandbox 加諸的限制」。但實作 Proposal B（`reevaluate_quality.py`）時
+浮現一件事：**就算啟用帳單、限制解除，staging 的保留期也不能隨便設短。**
+
+理由是重評估的候選來自 BQ 的 `int_` 層，而 `int_` ← `stg_` ← `staging.orders`。
+Proposal B 的典型觸發是「規則放寬 → 撈回**跨全歷史**的舊 quarantine」——保留期一旦短於
+「最舊的、還可能被撈回的 quarantine」，那批記錄在 BQ 這一側就不存在，重評估掃不到它，
+而且**不會報錯**：查詢正常回傳、任務正常成功、只是少了一批。這與 §1.7.6 的「綠燈說謊」同型。
+
+所以本專案的立場是：**staging 是有保留期的鏡射，但那個保留期是被 Proposal B 的
+回溯範圍決定的，不是儲存成本說了算。** 決定值時的判準是一句話——
+「我們願意回溯重評估多久以前的資料？」保留期至少要等於那個答案。
+
+> 對照：ODS（PostgreSQL）永久且完整，所以 `permanently_rejected` 這類**永不回頭**的決定
+> 即使超出 staging 保留期也不會出問題；會出問題的只有「還想撈回來」的那些。
+> 這也是為什麼重評估的**狀態判定**讀 PG 而非 BQ（見 DQ_ARCHITECTURE-TW 的 Proposal B 段）——
+> 冪等的保證不能建立在一個有保留期的鏡射上。
+
 ---
 
 ## 2. Watermark 策略

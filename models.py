@@ -98,12 +98,14 @@ class QualityEvent(Base):
     raw_id = Column(Integer, nullable=False, index=True)
     order_id = Column(String(50), nullable=False, index=True)
 
-    # 事件類型：initial_evaluation | promotion | rejection
+    # 事件類型：initial_evaluation | promotion | re_quarantination | rejection
+    #   promotion / re_quarantination 由 reevaluate_quality.py（Proposal B）產生；
+    #   rejection（→ permanently_rejected）是【人工放棄】的路徑，自動任務永不產生。
     event_type = Column(String(30), nullable=False)
 
     # 狀態機轉移
     from_state = Column(String(30), nullable=True)
-    # to_state: clean | quarantined | promoted | permanently_rejected
+    # to_state: clean | quarantined | promoted | re_quarantined | permanently_rejected
     to_state = Column(String(30), nullable=False)
 
     rule_version = Column(String(10), nullable=False)

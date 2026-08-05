@@ -253,6 +253,30 @@ is guaranteed to stay red forever under the sandbox.
 Enabling billing lifts this forced value, at which point `gold_partition_expiration_days` finally
 takes effect (and `gold_projection_window_days` should be adjusted to match the retention policy).
 
+#### 1.7.9 staging retention is not a free parameter — Proposal B imposes a hard floor ⭐
+
+The sections above treat 60 days as "a limit the sandbox imposes". Implementing Proposal B
+(`reevaluate_quality.py`) surfaced something else: **even with billing enabled and the limit
+lifted, staging retention cannot be set arbitrarily short.**
+
+Re-evaluation candidates come from BQ's `int_` layer, and `int_` ← `stg_` ← `staging.orders`.
+Proposal B's canonical trigger is "rules loosened → pull back old quarantine **across all
+history**" — the moment retention is shorter than "the oldest quarantine we might still want
+back", those records simply do not exist on the BQ side. Re-evaluation cannot see them, and
+**nothing errors**: the query returns fine, the task succeeds, a batch is just missing. Same
+shape as the "green light lying" failure in §1.7.6.
+
+Hence this project's stance: **staging is a mirror with a retention policy, but that policy is
+determined by Proposal B's retroactive reach, not by storage cost.** The criterion when picking
+the value is one sentence — "how far back are we willing to re-evaluate?" Retention must be at
+least that.
+
+> Contrast: ODS (PostgreSQL) is permanent and complete, so decisions that **never look back** —
+> `permanently_rejected` and the like — are safe even beyond staging retention; only the records
+> we might still want to pull back are at risk. This is also why re-evaluation reads its **state
+> decision** from PG rather than BQ (see the Proposal B section in DQ_ARCHITECTURE) — idempotency
+> cannot rest on a mirror that expires.
+
 ---
 
 ## 2. Watermark Strategy

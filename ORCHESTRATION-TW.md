@@ -310,7 +310,118 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 
 ---
 
-## 5. 現況與待辦
+## 5. 實機驗證記錄（2026-08-05）⭐
+
+本節記錄兩次實跑。**下面每一項都是量出來的**，不是設計時的推論——這正是它值得單獨成節的
+理由：前面六節有好幾個決策當初只能靠推理定案，這裡是它們第一次被資料驗證或推翻。
+
+### 5.1 Proposal B 完整回流（§3.3 劇本走一次）
+
+環境：ODS 774 筆（髒 57，7.364%）、BQ sandbox、dbt 1.11。
+
+**刻意的順序**：先以 **v2** 灌 20 筆 `V3DEMO-*`（15 筆 age 落在 121/123/125/127/130，
+5 筆對照組 age ∈ {-3, 150, 999}），再切 v3。順序顛倒的話 age=125 會直接被判乾淨、
+永遠不會進 quarantine——**只有在舊規則下攝入的資料，才有被新規則撈回的資格。**
+
+| 階段 | 結果 |
+|---|---|
+| v2 攝入 | 20 筆全部 `has_clean_error=TRUE`、`quality_events` → `quarantined`(v2) |
+| 抽取 | orders 220 列 / quality_events 220 列（首次含當日分區重抽）|
+| dbt 分層 build | staging PASS=21 WARN=1／intermediate PASS=27 WARN=1／marts PASS=31／reports PASS=24 |
+| promote 前 | `int_orders_quarantine` 20、`fct_orders` **0**、`promotions` **0** |
+| 重評估 dry-run | 候選 57 → `would_write=15`、`unchanged=42`、`blocked_non_reproducible=0` |
+| 重評估 `--commit` | `written=15` |
+| **緊接著再跑一次** | **`promoted=0`、`unchanged=57`、`written=0`** |
+| 回流後 | `int_orders` promoted **15**、quarantine 剩 **5**、`fct_orders` **15**、`promotions` **0→15** |
+| 完整 `dbt test` | 93 支：PASS=91 / WARN=2 / **ERROR=0** |
+
+#### 被實測證實的四件事
+
+**① 冪等從「宣稱」變成「量到的」** ⭐
+連跑兩次，第二次 `written=0`。「只在狀態改變時 append」確實讓 `promotions` 這個
+〈歷史指標為何不會被追溯性改寫〉要保護的數字不會被重跑灌水。這條當初只有單元測試，
+現在有真實資料的證據。
+
+**② 放寬是有邊界的，不是把規則關掉**
+對照組 5 筆（age -3/150/999）一動不動留在 quarantine，回流後精確分佈為
+`age=121/123/125/127/130 各 3 筆` 進 Gold。
+
+**③ Bounded Writeback 守住了，而且留下 15 筆活的「永久分歧」樣本** ⭐
+ODS 那 20 筆至今仍是 `dq_rule_version=v2, has_clean_error=TRUE`，一個欄位都沒被改；
+事件鏈是乾淨的 `initial_evaluation(None→quarantined, v2)` → `promotion(quarantined→promoted, v3)`。
+[DQ_ARCHITECTURE-TW](./DQ_ARCHITECTURE-TW.md)〈ODS 與 BQ 品質狀態永久分歧〉講了很久的東西，
+現在資料庫裡有 15 筆可以直接指給人看：**ODS 說髒（v2）、Gold 說乾淨（v3），
+靠 `dq_rule_version` + `quality_events` 完全可追溯。**
+
+**④ Hard Gate 的分級真的是分級**
+7.364% 讓 `error_rate_below_stg_orders_0_05` **WARN**、`_0_1` **PASS**——告警但不阻斷，
+`dbt build` 照常往下跑。這是「閾值分兩級」第一次在真實比率上被觸發。
+
+### 5.2 `--indirect-selection=buildable` 的行為驗證 ⭐
+
+§2.4 那個決策當初**只能靠推理**——三種模式的差異寫得出來，但沒有實例。這次觀察到：
+
+```
+dbt build --select path:models/staging       22 個節點，全是 stg_ 的測試
+                                             ← assert_orders_split_is_partition 不在其中
+dbt build --select path:models/intermediate  13 of 28 PASS assert_orders_split_is_partition
+dbt build --select path:models/marts         assert_fct_orders_complete_projection PASS
+                                             assert_fct_orders_rollup_matches_items PASS
+```
+
+跨層的 singular test **精準落在「所有輸入都新鮮」的那一層**：不在 staging 誤觸發
+（那時 `int_` 還是舊表，會誤紅），也沒有被 `cautious` 那樣整支跳過。推理成立。
+
+> 附帶：結尾那個完整 `dbt test`（93 支）仍然保留。它現在的價值不是「補跑漏掉的」——
+> 這次沒有漏——而是**當 selector 語意在未來版本改變時，它是唯一會發現的東西**。
+
+### 5.3 Airflow 容器實跑
+
+| 項目 | 結果 |
+|---|---|
+| 映像建置 | 成功（`apache/airflow:3.0.0-python3.12` + 兩個隔離 venv）|
+| 服務 | `airflow-db` / `init` / `apiserver` / `scheduler` / `dag-processor` 全部 healthy |
+| **DAG 解析** | 3 條全部載入，`list-import-errors` → **No data found** |
+| analytics venv | `sqlalchemy` / `google.cloud.bigquery` / `structlog` / `pydantic` 匯入正常 |
+| dbt venv | dbt-core **1.11.12**、dbt-bigquery **1.11.3** |
+| env_var profile | `dbt debug` → `Connection test: [OK connection ok]` |
+| `source_freshness_watch` | 完整 DAG run **success**，兩個 source 皆 PASS |
+| `dbt_intermediate` | 容器內 `airflow tasks test` → PASS=27 WARN=1 ERROR=0，SUCCESS |
+| `extract_orders` | **FAILED**：`OperationalError: could not translate host name`（見 §5.4）|
+| UI | `http://localhost:8080` HTTP 200 |
+
+**§2.2 那條紀律在真實 dag-processor 上被驗證了** ⭐
+容器裡沒有可用的 `DB_URL`（預設指向未啟動的 `db`），三條 DAG 仍全部解析成功、零 import
+錯誤。若當初在 DAG 檔頂層寫了 `from config import settings`，此刻的畫面會是**三條 DAG
+全部從 UI 消失**——不是三個紅色 task，是什麼都沒有。
+
+**freshness 的語意也順帶被證實**
+灌完料 15 分鐘後跑，兩個 source 皆 **PASS**。[CLOUD_LAYER-TW §1.7.7](./CLOUD_LAYER-TW.md)
+論證的「紅代表你最近沒餵它，不代表管線壞掉」不再只是論證——**餵了就綠**。
+
+### 5.4 實跑才發現的落差：`raw_id` 在兩個 ODS 之間會碰撞 ⭐
+
+`extract_orders` 在容器內失敗，表面原因是 compose 把「業務 DB 跑在 compose 內」寫死成
+假設，而本機的 postgres 在主機上、且只監聽 `127.0.0.1`。修法是開一個
+`AIRFLOW_TASK_DB_URL` 覆寫接縫（見 §3.1 的 A/B 選項）。
+
+**但真正值得記住的是選項 A 底下那個陷阱**，它比這次的失敗嚴重得多：
+
+> 讓 compose 的 `db` 服務一起起來，那是一個**獨立的空資料庫**。它 mint 出來的 `raw_id`
+> 從 1 開始編號，與主機 ODS 的**完全重疊**。兩者抽進同一張 BQ staging，
+> `stg_` 以 `raw_id` 為 grain 的去重會把**兩筆不相干的訂單當成彼此的副本**收斂掉一筆。
+> 不報錯、不留痕跡。
+
+這其實是 [README](./README.zh-TW.md)〈`raw_id` 是物理身分、`order_id` 是業務身分〉那條原則
+的一個推論，只是原文沒有把它推到底：**`raw_id` 的唯一性只在「單一 landing 實例」內成立。**
+去重鍵選 `raw_id` 是對的（物理去重就該用物理身分），但它同時把一個隱含前提焊進了管線——
+**一張 staging 表只能對應一個 ODS**。多實例上游若各自有 landing，去重鍵必須升級為
+`(source_instance, raw_id)` 之類的複合鍵。目前是單實例，前提成立，故不動；
+記在這裡是為了讓未來要擴展的人知道這條線在哪。
+
+---
+
+## 6. 現況與待辦
 
 - ✅ `orders_analytics_daily`（2 extract → 4 層 dbt build → 完整 `dbt test`）
 - ✅ `dq_reevaluation`（手動觸發，預設 dry-run，commit 後自動接主 DAG）
@@ -328,7 +439,7 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 - ⬜ Seeding DAG（見 §4）
 - ⬜ Celery + Redis、OpenTelemetry（藍圖 Phase 5 的其他項）
 
-## 6. 相依與版本
+## 7. 相依與版本
 
 - Airflow **3.0.0**（`apache/airflow:3.0.0-python3.12`），LocalExecutor
 - dbt-core / dbt-bigquery **1.11**（對齊 [ecommerce_dbt/README.zh-TW §10](./ecommerce_dbt/README.zh-TW.md)）

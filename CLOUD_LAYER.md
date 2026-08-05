@@ -215,6 +215,13 @@ Ingestion in this project is **manual** (loaded through the API; `load_test.py` 
 | ~~If it goes into the DAG at all, it must be a **side-channel observability task** (its failure must not affect downstream), or have its `severity` lowered first~~ → **tightened one notch at implementation time: it becomes its own `source_freshness_watch` DAG** | A side-channel task is not enough — see 〈Implementation outcome〉 below |
 | If ingestion ever becomes **continuous** (e.g. a seeding task at the head of the DAG posting a small batch of orders periodically), this stance lapses and freshness should be restored as a meaningful gate | Only then does red genuinely mean "broken" rather than "unfed" |
 
+> **Measured on 2026-08-05**: fifteen minutes after a data load, the `source_freshness_watch` DAG
+> ran `dbt source freshness` and both sources **PASSED**. So this section's stance is not "we
+> loosened the standard" but "feed it and it is green, starve it and it is red" — **the signal has
+> been honest all along**. When it goes red it really is saying something true; that something is
+> just "you have not fed it lately" rather than "the pipeline is broken". Full verification in
+> [ORCHESTRATION §5.3](./ORCHESTRATION.md).
+
 > This is isomorphic to how the DQ architecture treats `has_schema_drift`: **a signal's value is not the same as the authority it should hold.** Drift may alert but never intercept; under the "manual ingestion" premise, freshness likewise may only alert. Authority comes from "is it actually broken when it goes red", not from "is this metric important."
 
 Aside: continuous ingestion is simultaneously the fix for §1.7.6's "rolling 60-day ingestion window" problem — the two share **the same root cause** (no continuous ingestion), so a future decision to add seeding resolves both at once.

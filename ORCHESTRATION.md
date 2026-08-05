@@ -344,7 +344,133 @@ have convenient buttons.**
 
 ---
 
-## 5. Status and TODO
+## 5. Live Verification Record (2026-08-05) ⭐
+
+Two live runs, recorded here. **Every item below was measured**, not inferred at design time —
+which is precisely why it deserves its own section: several decisions in the six sections around
+it could only be settled by reasoning, and this is the first time they were confirmed or
+overturned by data.
+
+### 5.1 Full Proposal B flow-back (one pass of the §3.3 script)
+
+Environment: ODS at 774 rows (57 dirty, 7.364%), BQ sandbox, dbt 1.11.
+
+**The order is deliberate**: 20 `V3DEMO-*` records were ingested under **v2** first (15 with age
+in 121/123/125/127/130, and a 5-record control group with age ∈ {-3, 150, 999}), and only then
+was v3 switched on. Reversed, age=125 would be judged clean on arrival and never enter quarantine
+at all — **only data ingested under the old rule is eligible to be pulled back by the new one.**
+
+| Stage | Result |
+|---|---|
+| Ingested under v2 | all 20 `has_clean_error=TRUE`, `quality_events` → `quarantined`(v2) |
+| Extraction | 220 rows orders / 220 rows quality_events (first pass re-extracts the current day's partition) |
+| Layered dbt build | staging PASS=21 WARN=1 / intermediate PASS=27 WARN=1 / marts PASS=31 / reports PASS=24 |
+| Before promotion | `int_orders_quarantine` 20, `fct_orders` **0**, `promotions` **0** |
+| Re-evaluation dry-run | 57 candidates → `would_write=15`, `unchanged=42`, `blocked_non_reproducible=0` |
+| Re-evaluation `--commit` | `written=15` |
+| **Immediately run again** | **`promoted=0`, `unchanged=57`, `written=0`** |
+| After flow-back | `int_orders` promoted **15**, quarantine down to **5**, `fct_orders` **15**, `promotions` **0→15** |
+| Full `dbt test` | 93 tests: PASS=91 / WARN=2 / **ERROR=0** |
+
+#### Four things the run actually proved
+
+**① Idempotency went from "claimed" to "measured"** ⭐
+Two consecutive runs; the second wrote 0 events. "Append only on an actual state change" really
+does keep `promotions` — the figure 〈Why historical metrics are never retroactively rewritten〉
+exists to protect — from being inflated by a re-run. Previously this had unit tests only; now it
+has evidence from real data.
+
+**② A loosening has an edge; it is not switching the rule off**
+The 5 control records (age -3/150/999) stayed exactly where they were, and the flow-back landed
+precisely as `age=121/123/125/127/130, 3 records each` in Gold.
+
+**③ Bounded Writeback held — and left 15 live samples of the "permanent divergence"** ⭐
+Those 20 ODS rows still read `dq_rule_version=v2, has_clean_error=TRUE`; not one column was
+touched. The event chain is clean: `initial_evaluation(None→quarantined, v2)` →
+`promotion(quarantined→promoted, v3)`. What
+[DQ_ARCHITECTURE](./DQ_ARCHITECTURE.md)〈Permanent ODS/BQ quality-state divergence〉has argued at
+length is now 15 rows you can point at: **ODS says dirty (v2), Gold says clean (v3), and
+`dq_rule_version` + `quality_events` make it fully traceable.**
+
+**④ The Hard Gate's severity tiers really are tiers**
+7.364% made `error_rate_below_stg_orders_0_05` **WARN** while `_0_1` **PASSED** — alerting
+without blocking, and `dbt build` carried on downstream. This is the first time the two-tier
+threshold fired on a real ratio.
+
+### 5.2 Verifying `--indirect-selection=buildable` ⭐
+
+The §2.4 decision could originally **only be reasoned about** — the difference between the three
+modes was describable, but there was no instance of it. Observed this time:
+
+```
+dbt build --select path:models/staging       22 nodes, all stg_ tests
+                                             ← assert_orders_split_is_partition is NOT among them
+dbt build --select path:models/intermediate  13 of 28 PASS assert_orders_split_is_partition
+dbt build --select path:models/marts         assert_fct_orders_complete_projection PASS
+                                             assert_fct_orders_rollup_matches_items PASS
+```
+
+Cross-layer singular tests land **exactly in the layer where all their inputs are fresh**: not
+fired early in staging (where `int_` is still the previous table and they would go spuriously
+red), and not skipped entirely the way `cautious` would. The reasoning holds.
+
+> Aside: the closing full `dbt test` (93 tests) stays. Its value now is not "catching what was
+> skipped" — nothing was — but that **it is the only thing that would notice if selector
+> semantics change in a future version**.
+
+### 5.3 Airflow container, run for real
+
+| Item | Result |
+|---|---|
+| Image build | Success (`apache/airflow:3.0.0-python3.12` + two isolated venvs) |
+| Services | `airflow-db` / `init` / `apiserver` / `scheduler` / `dag-processor` all healthy |
+| **DAG parsing** | All 3 loaded; `list-import-errors` → **No data found** |
+| analytics venv | `sqlalchemy` / `google.cloud.bigquery` / `structlog` / `pydantic` import fine |
+| dbt venv | dbt-core **1.11.12**, dbt-bigquery **1.11.3** |
+| env_var profile | `dbt debug` → `Connection test: [OK connection ok]` |
+| `source_freshness_watch` | Full DAG run **success**, both sources PASS |
+| `dbt_intermediate` | In-container `airflow tasks test` → PASS=27 WARN=1 ERROR=0, SUCCESS |
+| `extract_orders` | **FAILED**: `OperationalError: could not translate host name` (see §5.4) |
+| UI | `http://localhost:8080` HTTP 200 |
+
+**The §2.2 discipline was validated against a real dag-processor** ⭐
+The container had no usable `DB_URL` (the default points at a `db` service that was not started),
+and all three DAGs still parsed with zero import errors. Had the DAG files carried a top-level
+`from config import settings`, the screen at that moment would have shown **all three DAGs missing
+from the UI** — not three red tasks, but nothing at all.
+
+**The meaning of freshness was incidentally confirmed too**
+Run 15 minutes after a data load, both sources **PASSED**. What
+[CLOUD_LAYER §1.7.7](./CLOUD_LAYER.md) argued — "red means you have not fed it lately, not that
+the pipeline is broken" — is no longer only an argument: **feed it and it goes green.**
+
+### 5.4 The gap only a live run exposed: `raw_id` collides across two ODS instances ⭐
+
+`extract_orders` failed in-container. The surface cause is that compose hard-codes the assumption
+that the business DB runs inside the compose project, while this machine's postgres runs on the
+host and listens on `127.0.0.1` only. The fix is an `AIRFLOW_TASK_DB_URL` override seam (see the
+A/B options in §3.1).
+
+**But the trap underneath option A is what deserves remembering**, and it is far worse than this
+failure:
+
+> Bringing compose's `db` service up gives you a **separate, empty database**. The `raw_id`s it
+> mints start at 1 and **overlap completely** with the host ODS's. Extract both into the same BQ
+> staging table and `stg_`'s `raw_id`-grained dedup will collapse **two unrelated orders into
+> "copies" of each other**, dropping one. No error, no trace.
+
+This is really a corollary of the [README](./README.md)〈`raw_id` is physical identity, `order_id`
+is business identity〉principle, which the original text simply did not push all the way:
+**`raw_id`'s uniqueness only holds within a single landing instance.** Choosing `raw_id` as the
+dedup key is correct (physical dedup should use physical identity), but it also welds an implicit
+premise into the pipeline — **one staging table can only correspond to one ODS**. If multi-instance
+upstreams ever get their own landing layers, the dedup key must be upgraded to something like
+`(source_instance, raw_id)`. Today there is a single instance, the premise holds, and nothing
+changes; this is recorded so whoever expands it later knows where the line is.
+
+---
+
+## 6. Status and TODO
 
 - ✅ `orders_analytics_daily` (2 extracts → 4 layered dbt builds → full `dbt test`)
 - ✅ `dq_reevaluation` (manual, dry-run by default, chains into the main DAG on commit)
@@ -365,7 +491,7 @@ have convenient buttons.**
 - ⬜ Seeding DAG (see §4)
 - ⬜ Celery + Redis, OpenTelemetry (other roadmap Phase 5 items)
 
-## 6. Dependencies and Versions
+## 7. Dependencies and Versions
 
 - Airflow **3.0.0** (`apache/airflow:3.0.0-python3.12`), LocalExecutor
 - dbt-core / dbt-bigquery **1.11** (aligned with [ecommerce_dbt/README §10](./ecommerce_dbt/README.md))

@@ -215,6 +215,12 @@ ODS 在 PostgreSQL 仍是永久且完整的錨點（`raw`/`ods`/`quality_events`
 | ~~要納入 DAG 的話，只能是**旁路的觀測 task**（失敗不影響下游），或先降 `severity`~~ → **實作時再收緊一階：獨立成 `source_freshness_watch` DAG** | 旁路 task 還不夠——見下方〈實作結果〉 |
 | 若日後改成**持續攝入**（例如 DAG 前面加 seeding task 定期打一小批訂單進 API），本立場即失效，freshness 應恢復為有意義的 gate | 那時紅才真的代表「壞了」而非「沒餵」 |
 
+> **2026-08-05 實測補充**：灌完一批資料 15 分鐘後，由 `source_freshness_watch` DAG 跑
+> `dbt source freshness`，兩個 source 皆 **PASS**。所以本節這個立場不是「我們調鬆了標準」，
+> 而是「餵了就綠、沒餵就紅」——**訊號本身一直是誠實的**，紅的時候確實在說一件真的事，
+> 只是那件事是「你最近沒餵它」而不是「管線壞了」。完整驗證見
+> [ORCHESTRATION-TW §5.3](./ORCHESTRATION-TW.md)。
+
 > 這與 DQ 架構對 `has_schema_drift` 的處理同構：**訊號的價值不等於它該有的權限**。drift 只能告警不能攔截；freshness 在「手動攝入」這個前提下同樣只能告警。權限來自「紅的時候是不是真的壞了」，而不是來自「這個指標重不重要」。
 
 附帶：持續攝入同時也是 §1.7.6 那個「滾動 60 天攝入視窗」問題的解方——兩者**根因相同**（沒有持續攝入），所以未來若決定加 seeding，一次解決兩件事。

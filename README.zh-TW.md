@@ -163,6 +163,8 @@ Raw 是 landing 層：**逐字保留原文**（直接存原始 request body，�
 **raw_id 是物理身分、order_id 是業務身分——連帶下游去重鍵的選擇**
 ODS 兩把唯一鍵分工不同：**`raw_id` 是物理／代理身分**（landing 層發的代理鍵，與一筆物理落地記錄 1:1、immutable、血緣錨點）；**`order_id` 是業務自然鍵**（其唯一性是「當前的業務約束」，可能隨業務演進而變——訂單版本化、退貨拆列、SCD 等）。
 這個區分直接決定**下游去重鍵的選擇**：去重的本質是「把同一筆物理記錄的多份副本收斂成一份」，屬物理身分操作，故 dbt `stg_` 去重以 **`raw_id`** 為 grain，而非 `order_id`。BQ staging 是 append-only 鏡射，Proposal C 修正列與例行重抽都會產生同一筆記錄的物理重複，收斂它們的依據是「同一物理列」＝ raw_id；若改用 order_id，等於把物理去重耦合到一條可能放寬的業務約束上，一旦 order_id 唯一性鬆動就會默默吃掉本該並存的列。下游 `int_*` 合成「有效品質狀態」時 JOIN `quality_events` 也以 raw_id 為鍵，與去重 grain 一致。
+⚠️ **但 `raw_id` 的唯一性只在「單一 landing 實例」內成立。** 兩個獨立的 ODS 各自從 1 開始編號，抽進同一張 BQ staging 會讓以 `raw_id` 為 grain 的去重把不相干的訂單當成彼此的副本收斂掉——不報錯、不留痕跡。這等於把「一張 staging 只對應一個 ODS」焊成了管線的隱含前提；多實例上游若各自有 landing，去重鍵需升級為 `(source_instance, raw_id)` 之類的複合鍵。實例見 [ORCHESTRATION-TW §5.4](./ORCHESTRATION-TW.md)。
+
 這也是 `raw_id` 必須 NOT NULL 的隱性理由：`UNIQUE` 在 PostgreSQL **不拒絕 NULL**（允許多筆 NULL 並存），`UNIQUE + nullable` 會讓「以 raw_id 為 grain 的去重」把多筆 NULL 列收斂成一列而靜默漏資料；收成 NOT NULL（+ FK）後此破口閉合。
 
 **`Raw.status` 與 `ODS.order_status` 無關**

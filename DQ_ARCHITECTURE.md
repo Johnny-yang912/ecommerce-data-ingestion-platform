@@ -724,7 +724,9 @@ Actual thresholds should be calibrated once real traffic data is available. Init
 The write logic for `promotion` and `re_quarantination` is in place. It is triggered **manually / on a rule-version bump**, not on a daily schedule — with unchanged rules a re-evaluation is necessarily a no-op, so scheduling it daily would just full-scan the entire quarantine backlog for nothing. `rejection` (→ `permanently_rejected`) is deliberately **not** part of the automated task, preserving its "written off by a human" meaning.  
 **The downstream flow-back path was already in place**: `int_orders`'s effective-state composition has been test-guarded all along, so the moment events appear they take effect on the next dbt run with **zero changes to the `int_` layer** — the payoff of having built the consumer side correctly first.
 
-> ⚠️ **A run today would promote 0 records**: v1→v2 was a **tightening**, and all existing data was ingested under v2, so re-evaluating v2 against v2 is a tautology. Seeing flow-back requires a real **rule loosening** first (a v3 bump). Full demo script in `ORCHESTRATION.md`.
+> **Verified live on 2026-08-05**: after v3 loosened the `age` bound, re-evaluation promoted 15 quarantine records from the v2 era back into Gold and `rpt_quality_events_daily.promotions` went from 0 to 15; a second consecutive run wrote 0 events (idempotency); ODS was never modified. Full figures in [ORCHESTRATION §5.1](./ORCHESTRATION.md).
+>
+> ⚠️ The "tautology" point still stands and is worth remembering: **with unchanged rules a re-evaluation run is necessarily a no-op** — which is exactly why it is `schedule=None` rather than a daily job.
 
 **BQ sandbox's 60-day expiration can push promoted records back to quarantine (an account-level limit)**  
 The sandbox forces 60-day partition and table expiration (see [CLOUD_LAYER §1.6](./CLOUD_LAYER.md)), which the `quality_events` staging table inherits. If a `promotion` event expires and disappears, `int_orders`'s LEFT JOIN falls back to the ODS snapshot (`has_clean_error=TRUE`) → that record **drops out of Gold back into quarantine**.  

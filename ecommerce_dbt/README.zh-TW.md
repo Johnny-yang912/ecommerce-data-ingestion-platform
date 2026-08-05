@@ -536,4 +536,4 @@ DQ 文件原規劃的 `rpt_quality_daily` 混了兩件性質相反的事，實�
 - ⬜ `rpt_sales_*` 切增量（路徑＝日增量 + 週全量；**必須同時補逐格對帳測試**——見 §7.4、§8）
 - ⬜ 金額曝險度量（需 `int_order_items_quarantine`——見 §7.6）
 - ✅ Proposal B 事件產生端（`reevaluate_quality.py` + `dq_reevaluation` DAG）——**本層一行都沒改**：`int_orders` 的有效狀態合成早有測試把關，事件一產生下次 run 即自然生效。這是「先把消費端做對」這個順序的回報
-- ⚠️ `rpt_quality_events_daily` 的 `promotions` / `re_quarantines` **目前仍為 0**，但原因已從「沒有事件產生端」變成「還沒有過規則放寬」——v1→v2 是變嚴，拿 v2 重評估 v2 是同義反覆。要看到非零值需先 bump 一次放寬的 v3（劇本見 [ORCHESTRATION-TW §3.3](../ORCHESTRATION-TW.md)）
+- ✅ `rpt_quality_events_daily.promotions` 已由 v3 的第一次回溯重評估填入實際值（2026-08-05：15 筆）。`re_quarantines` 仍為 0——它需要一次**規則變嚴**後的重評估，目前沒有那個場景（見 [ORCHESTRATION-TW §5.1](../ORCHESTRATION-TW.md)）

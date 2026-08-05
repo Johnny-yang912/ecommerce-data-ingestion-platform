@@ -508,6 +508,17 @@ Primary code = the first entry of the deduplicated, sorted `error_codes` array. 
 - **Proposal C targeted refresh**: correction rows land in old partitions the lookback window can't see → the last step of the repair runbook does a targeted refresh of the affected partitions (`--full-refresh`, or a future single-partition `insert_overwrite`). See [CLOUD_LAYER §7.4](../CLOUD_LAYER.md), DQ C-2 #7.
 - **Before changing `int_orders` or `int_orders_quarantine`**: walk the §5.2 alignment checklist; afterwards run `dbt build --select intermediate+` and confirm `assert_orders_split_is_partition` is green.
 - **Adjusting `rpt_quality_events_daily`'s lookback window**: `rpt_quality_events_lookback_days` must be ≥ `stg_quality_events_lookback_days`; change both vars together (§7.4).
+- ⚠️ **If the DAG fails for more consecutive days than the lookback window, the first run after the fix must widen it** ⭐
+  A single failure is safe: staging has already appended, the watermark has advanced, and `stg_`'s
+  lookback window recomputes those days on the next run. **Consecutive failures are the danger** —
+  with the default 3-day window, a DAG that has been down for 4 days looks back only 3 days on
+  recovery, so rows that landed in staging before that boundary **never reach `stg_orders`**, with
+  no error and no self-healing (silent data loss). On the first run after a fix, use
+  `--vars '{stg_orders_lookback_days: N}'` (N ≥ days down + margin) or `--full-refresh`.
+  The same applies to `stg_quality_events` and `rpt_quality_events_daily`; widen them together.
+  Prevention: Airflow failure alerts must be seen *before* cumulative downtime approaches the
+  window — which means **the lookback window is really a declaration of how much unattended
+  failure the pipeline tolerates**, not just a cost parameter.
 
 ## 10. Dependencies & Versions
 

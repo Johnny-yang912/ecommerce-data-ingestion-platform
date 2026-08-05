@@ -1,0 +1,107 @@
+# Airflow overlay —— 與 docker-compose.yml 疊加使用：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build
+#
+# 為什麼是獨立檔而不是併進 docker-compose.yml：只想跑 API 的人不必拉起四個 Airflow
+# 容器。疊加成同一個 compose project 讓兩邊共用預設網路，DAG 才能以 `db` 這個
+# hostname 連到業務資料庫。
+#
+# 【必要前置】.env 需有 BQ_PROJECT 與 GOOGLE_APPLICATION_CREDENTIALS（主機上的金鑰路徑，
+# 會被唯讀掛進容器）；建議一併設 AIRFLOW_UID=$(id -u)，否則容器以 uid 50000 寫入
+# bind mount，主機端會清不掉 dbt 產生的 target/ 與 logs/。
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: orchestration/Dockerfile
+  # uid 對齊主機使用者：容器要寫 bind mount 內的 dbt target/ 與 logs/。
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    # 各元件必須共用同一個 jwt_secret，否則彼此呼叫會認證失敗。
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-dev-only-change-me}
+    # LocalExecutor 的 task 透過 Execution API 回報狀態；scheduler 與 api-server
+    # 不同容器，故不能用預設的 localhost。
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # 本機練習用：免登入。正式環境請換掉 auth manager。
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+
+    # ── 交給 task 的專案設定（BashOperator 會繼承）──────────────────────────
+    # DB_URL 指向同一個 compose project 裡的 db 服務（來自 docker-compose.yml）。
+    DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
+    BQ_PROJECT: ${BQ_PROJECT}
+    BQ_DBT_DATASET: ${BQ_DBT_DATASET:-dbt_dev}
+    # 主機路徑掛進來後，容器內一律用這個固定路徑（bq.py 的 ADC setdefault 會讀它）。
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/secrets/sa-key.json
+    # dbt 讀版控中的 env_var 版 profile，你本機的 ~/.dbt/profiles.yml 不受影響。
+    DBT_PROFILES_DIR: /opt/project/orchestration/dbt_profiles
+    LOG_FORMAT: json
+  volumes:
+    - ./orchestration/dags:/opt/airflow/dags:ro
+    - ./:/opt/project:rw                       # 專案原始碼不烤進映像，改一行不必重 build
+    - ${GOOGLE_APPLICATION_CREDENTIALS}:/opt/secrets/sa-key.json:ro
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+
+services:
+  # Airflow 的 metadata 刻意【不】與業務 DB 共用實例：業務 DB 是資料錨點
+  # （Proposal C「從 Raw 重建」的前提），不該讓一個運維元件的歷史與它綁在同一次
+  # 備份／還原裡。多一個容器換故障域與備份語意的清爽。
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 一次性：建 schema。跑完即退出，其餘服務等它成功（同 docker-compose.yml 的 migrate 手法）。
+  airflow-init:
+    <<: *airflow-common
+    command: db migrate
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+  # Airflow 3 把 DAG 解析拆成獨立行程。這正是「DAG 檔不得 top-level import 專案模組」
+  # 更加重要的原因：解析行程的環境與 task 執行環境是分開的。
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+
+  # 刻意不起 triggerer：本 DAG 只用 BashOperator，沒有 deferrable operator。
+  # 日後若引入 sensor 的 deferrable 模式再補。
+
+volumes:
+  airflow-pgdata:
+  airflow-logs:

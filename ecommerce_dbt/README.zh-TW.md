@@ -508,6 +508,14 @@ DQ 文件原規劃的 `rpt_quality_daily` 混了兩件性質相反的事，實�
 - **Proposal C targeted refresh**：修正列落在舊分區、回看窗看不到 → 修復 runbook 最後一步對災區分區做 targeted refresh（`--full-refresh` 或未來對單分區 `insert_overwrite`）。見 [CLOUD_LAYER-TW §7.4](../CLOUD_LAYER-TW.md)、DQ C-2 #7。
 - **改動 `int_orders` 或 `int_orders_quarantine` 前**：先過一遍 §5.2 對齊清單；改完跑 `dbt build --select intermediate+`，確認 `assert_orders_split_is_partition` 為綠。
 - **調 `rpt_quality_events_daily` 的回看窗**：`rpt_quality_events_lookback_days` 必須 ≥ `stg_quality_events_lookback_days`，兩個 var 一起調（§7.4）。
+- ⚠️ **DAG 連續失敗超過回看窗天數 → 修好後第一次跑必須放大回看窗** ⭐
+  單次失敗是安全的：staging 已 append、watermark 已推進，而 `stg_` 的回看窗下輪會把那幾天重算。
+  **危險的是連續失敗**——回看窗預設 3 天，DAG 掛了 4 天再修好的話，那次跑批只回看 3 天，
+  第 4 天前已在 staging 的列**永遠不會進 `stg_orders`**，而且不報錯、不自癒（靜默漏資料）。
+  修好後首次執行請用 `--vars '{stg_orders_lookback_days: N}'`（N ≥ 中斷天數 + 安全邊際）
+  或 `--full-refresh`。`stg_quality_events` 與 `rpt_quality_events_daily` 的窗同理，要一起放大。
+  預防面：Airflow 的失敗告警必須在「累積中斷天數逼近回看窗」之前就被看見——
+  換句話說，**回看窗的天數其實是在宣告「可容忍多久的無人值守失敗」**，不只是成本參數。
 
 ## 10. 相依與版本
 

@@ -1,0 +1,28 @@
+# dbt profile（容器內使用）——【結構】入版控、【值】留環境。
+#
+# 為什麼放這裡而不是 ecommerce_dbt/profiles.yml：dbt 會在「當前工作目錄」找 profiles.yml，
+# 而且順序在 ~/.dbt 之前。放進 dbt 專案目錄會讓你本機 `cd ecommerce_dbt && dbt run` 時
+# 突然改吃這一份、並因為沒設環境變數而炸掉。放在專用目錄、由 DBT_PROFILES_DIR 明示指定，
+# 你既有的 ~/.dbt/profiles.yml 工作流完全不受影響。
+#   本機也想用這份：export DBT_PROFILES_DIR=$(pwd)/orchestration/dbt_profiles
+#
+# ⭐ 刻意重用 config.py 的同一組環境變數名（BQ_PROJECT / BQ_DBT_DATASET /
+#    GOOGLE_APPLICATION_CREDENTIALS）。這不只是省事：reevaluate_quality.py 讀的
+#    int_orders 就是 dbt 寫出來的那張表——兩邊若各自設定，會安靜地指向不同 dataset，
+#    重評估就掃到一個過期或不存在的表而不報錯。共用同一個變數讓這種分歧不可能發生。
+
+ecommerce_dbt:
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account
+      keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS') }}"
+      project: "{{ env_var('BQ_PROJECT') }}"
+      dataset: "{{ env_var('BQ_DBT_DATASET', 'dbt_dev') }}"
+      location: US                     # 所有 dataset 一致在 US（CLOUD_LAYER §1.5）
+      threads: 4
+      job_execution_timeout_seconds: 300
+      # BQ 的暫時性錯誤（5xx / rateLimitExceeded）在 adapter 層重試，比 Airflow
+      # 層的 task retry 精準——後者會把整個 dbt build 重跑一次。見 DAG 的 retries=0。
+      job_retries: 1

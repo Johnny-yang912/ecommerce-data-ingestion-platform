@@ -14,3 +14,10 @@ ecommerce_dbt/logs/
 ecommerce_dbt/target/
 logs/
 PHASE4_EXTRACTION.md
+*.json:Zone.Identifier
+# GCP service-account 金鑰：任何位置都不進版控
+*-key.json
+sa-key*.json
+secrets/
+# Airflow 本機產物
+orchestration/logs/

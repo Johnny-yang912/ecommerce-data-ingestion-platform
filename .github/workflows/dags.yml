@@ -1,0 +1,44 @@
+name: DAGs
+
+# 與主 CI 分開的獨立 job：Airflow 的安裝很重且 pin 了大量套件版本，塞進 ci.yml 那個
+# 「mock DB、數秒跑完」的 job 會毀掉它的速度優勢，也可能與專案既有的 pin 打架。
+#
+# 這個 job 不需要 DB_URL——因為 DAG 檔刻意不 top-level import 專案模組
+# （見 orchestration/dags/orders_analytics_daily.py 檔頭 ①）。那條紀律原本是為了
+# 避免 dag-processor 因缺環境變數而讓整條 DAG 消失，這裡是它的附帶收益。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "orchestration/**"
+      - "tests/test_dags.py"
+      - ".github/workflows/dags.yml"
+  pull_request:
+    paths:
+      - "orchestration/**"
+      - "tests/test_dags.py"
+      - ".github/workflows/dags.yml"
+
+jobs:
+  dagbag:
+    runs-on: ubuntu-latest
+    env:
+      AIRFLOW_VERSION: "3.0.0"
+      PYTHON_VERSION: "3.10"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      # 用官方 constraints 安裝：Airflow 的相依樹沒有它幾乎裝不起來。
+      - name: Install Airflow
+        run: |
+          pip install "apache-airflow==${AIRFLOW_VERSION}" pytest \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+      # -o addopts='' 蓋掉 pytest.ini 的 coverage 設定：那份 addopts 針對主套件的
+      # 八個模組，在這個 job 裡它們一個都不會被 import，只會產生一堆 not-imported 警告。
+      - name: Parse DAGs
+        run: pytest tests/test_dags.py -q -o addopts=''

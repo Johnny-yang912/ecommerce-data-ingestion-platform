@@ -228,7 +228,12 @@ def _dirty_customer_rating_out_of_range(p: dict, rng: random.Random) -> str:
 
 
 def _dirty_age_out_of_range(p: dict, rng: random.Random) -> str:
-    p["customer"]["age"] = rng.choice([-3, 150, 999])
+    # 125 是刻意加的【邊界附近】值：原本只注入 -3 / 150 / 999 這種離譜值，
+    # 產出的資料永遠只落在規則的遠端，測不到閾值本身合不合理。
+    # 而閾值正是最可能被調整的東西（見 DQ 文件〈Hard Gate 閾值為業務判斷〉），
+    # 所以資料裡要有「調一下上限就會改變判定」的樣本——它同時讓 Proposal B 的
+    # 回溯重評估有真實可 promote 的對象（見 ORCHESTRATION-TW §3.3 的 demo 劇本）。
+    p["customer"]["age"] = rng.choice([-3, 125, 150, 999])
     return "age_out_of_range"
 
 

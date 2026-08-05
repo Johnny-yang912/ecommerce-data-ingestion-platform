@@ -8,9 +8,12 @@ from pydantic import BaseModel
 
 from schema import ODSOrder, OrderIN
 
-DQ_RULE_VERSION = "v2"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
+DQ_RULE_VERSION = "v3"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
 # v2：新增 FIELD_TOO_LONG / NON_FINITE_NUMBER / ORDER_DATE_IN_FUTURE 規則，
 #     並以 sentinel 正規化影響值評估（同一筆 raw 重跑會得到不同 has_clean_error）。
+# v3：age 上限 120 → 130（見 AGE_MAX）。**本專案第一次「放寬」的規則改動**——
+#     v1→v2 都是變嚴、只往後生效即可；放寬則會讓舊 quarantine 有機會被撈回，
+#     這正是 Proposal B 回溯重評估存在的理由，也是它第一次真的有事可做。
 
 
 class DQCode:
@@ -55,6 +58,18 @@ SOFT_MAX_LENGTHS = {
 
 # order_date 晚於今天視為異常；容差吸收時區/時鐘偏移，避免邊界誤報。
 FUTURE_DATE_TOLERANCE_DAYS = 1
+
+# 顧客年齡的合理區間。這條規則的目的是攔【資料輸入錯誤】（-3、999、把郵遞區號填進來），
+# 不是判斷「這個年齡有沒有可能」——所以上限該取「任何真實值都不會超過」的保守高標，
+# 而不是「人類活得到的極限」。
+#
+# v2 的 120 是在沒有真實流量資料時訂的保守估計（DQ 文件〈Hard Gate 閾值為業務判斷〉
+# 早已預告這類閾值要在有資料後校準）。實務上有紀錄的最長壽命已達 122，120 會把
+# 合法的高齡值標成髒資料；v3 放寬到 130，留出真實值不可能觸及的餘裕，同時仍能攔下
+# 明顯的輸入錯誤。**放寬規則會讓既有 quarantine 記錄有機會被 promote，
+# 故此改動需 bump DQ_RULE_VERSION 並跑一次 Proposal B 重評估。**
+AGE_MIN = 0
+AGE_MAX = 130
 
 # 已知假空值：在 format_clean 正規化為 None（與 lowercase/strip 同屬正規化層，不標記）。
 # 刻意保守，排除 "na"（可能是 North America）與 "-"（可能是合法佔位）以免誤殺。
@@ -195,8 +210,8 @@ def business_clean(ods: ODSOrder, as_of: Optional[date] = None) -> tuple[ODSOrde
         elif not (1 <= ods.customer_rating <= 5):
             errors.append({"code": DQCode.CUSTOMER_RATING_OUT_OF_RANGE, "field": "customer_rating", "value": ods.customer_rating})
 
-    # age 0~120
-    if ods.age is not None and not (0 <= ods.age <= 120):
+    # age 合理區間（見 AGE_MIN / AGE_MAX 的閾值理由）
+    if ods.age is not None and not (AGE_MIN <= ods.age <= AGE_MAX):
         errors.append({"code": DQCode.AGE_OUT_OF_RANGE, "field": "age", "value": ods.age})
 
     # 自由文字欄位軟性長度上限（超過則標記，資料仍落地；硬牆與 fast-fail 為下一道防線）

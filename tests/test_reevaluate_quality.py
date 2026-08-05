@@ -216,6 +216,29 @@ class TestPlanEvents:
         assert events[0]["from_state"] is None
         assert events[0]["to_state"] == rq.STATE_PROMOTED
 
+    def test_v3_age_loosening_promotes_the_boundary_band(self):
+        """⭐ v3 的實際回流案例：age=125 在 v2（上限 120）被隔離，v3（上限 130）通過。
+
+        `seed_demo._dirty_age_out_of_range` 會注入 125，所以這條路徑在真實資料上
+        走得通——它是 ORCHESTRATION-TW §3.3 demo 劇本的自動化版本。
+        """
+        row = make_row(raw_id=125, age=125,
+                       clean_error_message=codes(DQCode.AGE_OUT_OF_RANGE))
+        events, stats = rq.plan_events([row], {125: rq.STATE_QUARANTINED}, self.EVENT_AT)
+        assert stats["promoted"] == 1
+        assert events[0]["to_state"] == rq.STATE_PROMOTED
+        assert events[0]["rule_version"] == DQ_RULE_VERSION
+
+    def test_v3_loosening_leaves_the_far_out_of_range_quarantined(self):
+        """對照組：同一次放寬**不**該把 -3 / 150 / 999 一起放進來。
+        放寬是有邊界的，不是把整條規則關掉。"""
+        rows = [make_row(raw_id=i, age=age,
+                         clean_error_message=codes(DQCode.AGE_OUT_OF_RANGE))
+                for i, age in enumerate([-3, 150, 999])]
+        states = {i: rq.STATE_QUARANTINED for i in range(3)}
+        events, stats = rq.plan_events(rows, states, self.EVENT_AT)
+        assert events == [] and stats["unchanged"] == 3
+
     def test_stats_account_for_every_candidate(self):
         """promoted + re_quarantined + unchanged 必須等於候選數，不能有列憑空消失。"""
         rows = [

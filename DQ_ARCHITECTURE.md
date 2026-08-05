@@ -154,7 +154,21 @@ That is fatal for Proposal B, whose promote criterion is precisely "passes when 
 
 > **A second kind of irreproducibility that `as_of` cannot fix**: some rules **normalise the value in place** as they flag it (`NON_FINITE_NUMBER` sets NaN/Inf to `None`, because PostgreSQL's JSONB/TEXT cannot store them). On re-evaluation the input is already the cleaned value, so the original condition is structurally unable to fire → the re-run necessarily "passes" — but that is **evidence disappearing**, not a rule being loosened. These codes are collected in `clean.NON_REPRODUCIBLE_CODES` and **Proposal B must not auto-promote on them**; the original value survives only verbatim in Raw, so recovering it means re-deriving from Raw — which is by definition Proposal C's territory (see 〈Remediation: A + B + C〉).
 
-**This v1 → v2 bump**: the ingestion hardening added three `business_clean` rules — `FIELD_TOO_LONG`, `NON_FINITE_NUMBER`, `ORDER_DATE_IN_FUTURE` — and sentinel normalization that affects evaluation; re-running the same raw payload yields a different `has_clean_error`, hence the bump. These rules are **stricter** (they flag more), so they apply going forward only and need **no retroactive re-evaluation**; retroactive re-evaluation only applies when rules are loosened to promote old quarantined rows (the `re_quarantined` edge case in the state machine).
+**The v1 → v2 bump (a tightening)**: the ingestion hardening added three `business_clean` rules — `FIELD_TOO_LONG`, `NON_FINITE_NUMBER`, `ORDER_DATE_IN_FUTURE` — and sentinel normalization that affects evaluation; re-running the same raw payload yields a different `has_clean_error`, hence the bump. These rules are **stricter** (they flag more), so they apply going forward only and need **no retroactive re-evaluation**; retroactive re-evaluation only applies when rules are loosened to promote old quarantined rows (the `re_quarantined` edge case in the state machine).
+
+**The v2 → v3 bump (a loosening) — the first time retroactive re-evaluation is actually triggered** ⭐
+`age`'s upper bound goes 120 → 130 (`clean.AGE_MAX`). This rule exists to catch **data entry errors** (-3, 999, a postcode typed into the age field), not to adjudicate whether an age is plausible — so the bound should be a conservative high-water mark that no real value could reach. v2's 120 was an estimate made without traffic data (exactly the kind of value 〈Hard Gate thresholds are a business judgement〉 below flags for later calibration), and with a documented maximum human lifespan of 122, a cap of 120 flags legitimate values as dirty.
+
+**A different direction means a completely different response**:
+
+| | v1 → v2 | v2 → v3 |
+|---|---|---|
+| Direction | Tightening (flags more) | **Loosening** (flags fewer) |
+| Effect on old data | Forward-only; no retroaction | **Must run one Proposal B re-evaluation**, or the 120–130 quarantine stays stuck forever |
+| State-machine edge exercised | None (new data simply lands `quarantined`) | `quarantined → promoted` |
+| Side effect | May push existing `promoted` rows to `re_quarantined` | None (loosening never turns clean into dirty) |
+
+In other words: **the bump only answers "should this be versioned"; the direction decides "must we go back and reprocess old data".** This is also the dividing line between Proposal B as a design and Proposal B with actual work to do — before v3, a re-evaluation run was necessarily a no-op. Operational steps in [ORCHESTRATION §3.3](./ORCHESTRATION.md).
 
 ### Observability and alerting
 
@@ -379,7 +393,9 @@ The original design folded "still fails" and "manually written off" into one 3b 
 **Irreproducible verdicts must not be auto-promoted**
 Records carrying an error code in `clean.NON_REPRODUCIBLE_CODES` (currently `NON_FINITE_NUMBER`) are never promoted: those rules normalise the value in place as they flag it, so re-evaluation necessarily "passes" — but that is **evidence disappearing**, not a rule being loosened. The original value survives only verbatim in Raw, so recovering it means re-deriving from Raw, which is by definition Proposal C's territory (see the note under 〈Remediation: A + B + C〉). Such records are only counted and reported, making "a batch stuck between B and C" a visible number.
 
-> **Applicability boundary**: this v1→v2 bump is **stricter** (flags more), so it applies going forward only and needs **no retroactive re-evaluation**. Retroactive re-evaluation (B's promote path) only triggers when rules are **loosened** to pull old quarantine back; tightening rules can instead push existing `promoted` records to `re_quarantined` on re-evaluation (the state-machine edge case).
+> **Applicability boundary**: the v1→v2 bump is **stricter** (flags more), so it applies going forward only and needs **no retroactive re-evaluation**. Retroactive re-evaluation (B's promote path) only triggers when rules are **loosened** to pull old quarantine back; tightening rules can instead push existing `promoted` records to `re_quarantined` on re-evaluation (the state-machine edge case).
+>
+> **v2→v3 (`age` cap 120→130) is the first loosening**, and therefore the first time B genuinely has work to do — before it, a re-evaluation run was necessarily a no-op (see 〈The v2 → v3 bump〉 above).
 
 ### State machine
 

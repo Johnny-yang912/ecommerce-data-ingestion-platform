@@ -291,8 +291,9 @@ ingested under v2 — re-evaluating v2 against v2 is a tautology. Seeing flow-ba
 1. Load a batch with dirty data   python seed_demo.py --n 200 --dirty-rate 0.12
 2. Run the main DAG               → confirm the record lands in int_orders_quarantine
                                     and is absent from fct_orders
-3. Loosen a rule + bump to v3     → clean.py (e.g. relax the age bound); by the bump
-                                    criterion this is a change that must bump
+3. Loosen a rule + bump to v3     → [DONE] age cap 120→130 (clean.AGE_MAX),
+                                  DQ_RULE_VERSION=v3. The dirty-data injector emits
+                                  age=125, which sits between the old and new caps
 4. Dry-run to size the impact     dq_reevaluation (commit=off) → check would_write
 5. Commit for real                dq_reevaluation (commit=on, expect_rule_version=v3)
                                   → triggers the main DAG automatically
@@ -335,7 +336,8 @@ have convenient buttons.**
 - ✅ Image (two isolated venvs), compose overlay, env_var-driven `profiles.yml`
 - ✅ `tests/test_dags.py` (20 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
 - ⬜ First real `docker compose up` verification (needs a GCP key and BQ project)
-- ⬜ A v3 rule loosening + one full pass of the §3.3 demo script
+- ✅ The v3 rule loosening (`age` cap 120→130) — Proposal B now has genuine promote candidates
+- ⬜ One live pass of the §3.3 demo script (needs a GCP key and BQ project)
 - ⬜ Seeding DAG (see §4)
 - ⬜ Celery + Redis, OpenTelemetry (other roadmap Phase 5 items)
 

@@ -15,7 +15,7 @@ import typing
 from clean import (
     format_clean, business_clean, clean_order,
     detect_schema_drift, DriftCode, _expected_kind, _type_compatible,
-    DQCode, NON_REPRODUCIBLE_CODES,
+    DQCode, NON_REPRODUCIBLE_CODES, AGE_MIN, AGE_MAX,
 )
 
 
@@ -216,16 +216,24 @@ class TestBusinessClean:
         _, errors = business_clean(ods)
         assert not any(e["field"] == "customer_rating" for e in errors)
 
-    @pytest.mark.parametrize("age", [-1, 121])
+    @pytest.mark.parametrize("age", [-1, 131])
     def test_age_out_of_range_is_invalid(self, age):
         ods = make_ods(age=age)
         _, errors = business_clean(ods)
         assert any(e["field"] == "age" for e in errors)
 
-    @pytest.mark.parametrize("age", [0, 120])
+    @pytest.mark.parametrize("age", [AGE_MIN, AGE_MAX])
     def test_age_boundaries_are_valid(self, age):
         ods = make_ods(age=age)
         _, errors = business_clean(ods)
+        assert not any(e["field"] == "age" for e in errors)
+
+    @pytest.mark.parametrize("age", [121, 125, 130])
+    def test_v3_loosening_makes_the_old_band_valid(self, age):
+        """v3 把上限從 120 放寬到 130。這一段區間在 v2 是髒的、在 v3 是乾淨的——
+        它就是 Proposal B 回溯重評估第一次真的有東西可 promote 的來源
+        （`seed_demo._dirty_age_out_of_range` 會注入 125）。"""
+        _, errors = business_clean(make_ods(age=age))
         assert not any(e["field"] == "age" for e in errors)
 
     # ── 自由文字欄位軟性長度上限（2b）────────────────────────────────────────

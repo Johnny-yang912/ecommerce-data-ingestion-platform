@@ -152,7 +152,21 @@ bump 判準：**同一筆 raw payload 重跑一次，`has_clean_error` / `clean_
 
 > **另一類無法用 `as_of` 修的不可重現**：有些規則在標記的同時把值**就地正規化**掉（`NON_FINITE_NUMBER` 把 NaN/Inf 設為 `None`，因為 PostgreSQL 的 JSONB/TEXT 存不下）。重評估時輸入已是清理後的值，原判定條件結構性地無法再觸發 → 重跑必然「通過」，但那是**證據消失**而非規則放寬。這類碼收在 `clean.NON_REPRODUCIBLE_CODES`，**Proposal B 不得據此自動 promote**；原始值只逐字留在 Raw，要救它必須從 Raw 重產值——按定義是 Proposal C 的領域（見〈Remediation：A + B + C 並用〉）。
 
-**本次 v1 → v2 的 bump**：攝入層強化新增了 `FIELD_TOO_LONG`、`NON_FINITE_NUMBER`、`ORDER_DATE_IN_FUTURE` 三條 `business_clean` 規則，並以 sentinel 正規化影響值評估——同一筆 raw 重跑會得到不同的 `has_clean_error`，故 bump。此次規則是**變嚴**（標記更多），只往後生效即可、**不需回溯重評估**；回溯只在規則放寬要 promote 舊 quarantine 時才做（對應狀態機的 `re_quarantined` 邊緣情況）。
+**v1 → v2 的 bump（變嚴）**：攝入層強化新增了 `FIELD_TOO_LONG`、`NON_FINITE_NUMBER`、`ORDER_DATE_IN_FUTURE` 三條 `business_clean` 規則，並以 sentinel 正規化影響值評估——同一筆 raw 重跑會得到不同的 `has_clean_error`，故 bump。此次規則是**變嚴**（標記更多），只往後生效即可、**不需回溯重評估**；回溯只在規則放寬要 promote 舊 quarantine 時才做（對應狀態機的 `re_quarantined` 邊緣情況）。
+
+**v2 → v3 的 bump（放寬）——本專案第一次觸發回溯重評估** ⭐
+`age` 上限 120 → 130（`clean.AGE_MAX`）。這條規則的目的是攔**資料輸入錯誤**（-3、999、把郵遞區號填進來），不是判斷「這個年齡有沒有可能」——所以上限該取「任何真實值都不會超過」的保守高標。v2 的 120 是在沒有真實流量資料時訂的估計（正是下方〈Hard Gate 閾值為業務判斷〉預告要校準的那類值），而有紀錄的最長壽命已達 122，120 會把合法的高齡值標成髒資料。
+
+**方向不同，處置就完全不同**：
+
+| | v1 → v2 | v2 → v3 |
+|---|---|---|
+| 方向 | 變嚴（標記更多） | **放寬**（標記更少） |
+| 對舊資料 | 只往後生效，不回溯 | **必須跑一次 Proposal B 重評估**，否則 120–130 的舊 quarantine 會永遠卡著 |
+| 狀態機動到哪條邊 | 無（新資料直接落 `quarantined`） | `quarantined → promoted` |
+| 副作用 | 可能讓既有 `promoted` 落到 `re_quarantined` | 無（放寬不會把乾淨的變髒） |
+
+換句話說：**bump 只回答「要不要記版本」，方向才決定「要不要回頭處理舊資料」。** 這也是 Proposal B 從設計到第一次真的有事可做的分界點——在 v3 之前，重評估跑起來必然是 no-op。操作步驟見 [ORCHESTRATION-TW §3.3](./ORCHESTRATION-TW.md)。
 
 ### 觀測與告警
 
@@ -376,7 +390,9 @@ BQ 是**有保留期的鏡射**（sandbox 強制 60 天，見 [CLOUD_LAYER-TW §
 **不可重現的判定不得自動 promote**
 帶有 `clean.NON_REPRODUCIBLE_CODES` 內錯誤碼（目前為 `NON_FINITE_NUMBER`）的記錄一律不 promote：那些規則在標記時把值就地正規化掉了，重評估必然「通過」，但那是**證據消失**而非規則放寬。原始值只逐字留在 Raw——要救它得從 Raw 重產值，按定義是 Proposal C 的領域（見〈Remediation：A + B + C 並用〉的註）。這類記錄只計數回報，讓「有一批卡在 B 與 C 之間」成為可見的數字。
 
-> **適用邊界**：本次 v1→v2 是**變嚴**（標記更多），只往後生效、**不需回溯重評估**。回溯重評估（B 的 promote 路徑）只在**規則放寬**、要把舊 quarantine 撈回來時才觸發；規則變嚴反而可能讓既有 `promoted` 記錄在重評估時落到 `re_quarantined`（狀態機邊緣情況）。
+> **適用邊界**：v1→v2 是**變嚴**（標記更多），只往後生效、**不需回溯重評估**。回溯重評估（B 的 promote 路徑）只在**規則放寬**、要把舊 quarantine 撈回來時才觸發；規則變嚴反而可能讓既有 `promoted` 記錄在重評估時落到 `re_quarantined`（狀態機邊緣情況）。
+>
+> **v2→v3（`age` 上限 120→130）是第一個放寬**，因此也是第一次真的需要跑 B——在那之前重評估跑起來必然是 no-op（見上方〈v2 → v3 的 bump〉）。
 
 ### 狀態機
 

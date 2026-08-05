@@ -262,7 +262,8 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 ```
 1. 灌一批含髒資料          python seed_demo.py --n 200 --dirty-rate 0.12
 2. 跑主 DAG                → 確認該筆落 int_orders_quarantine、fct_orders 看不到它
-3. 放寬一條規則 + bump v3  → clean.py（例如放寬 age 上限），依 bump 判準這是要 bump 的改動
+3. 放寬一條規則 + bump v3  → 【已落地】age 上限 120→130（clean.AGE_MAX），DQ_RULE_VERSION=v3
+                           髒資料注入器會產生 age=125，正好落在新舊上限之間
 4. dry-run 確認影響範圍    dq_reevaluation（commit=off）→ 看 would_write 筆數
 5. 真的寫                  dq_reevaluation（commit=on, expect_rule_version=v3）
                            → 自動觸發主 DAG
@@ -303,7 +304,8 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 - ✅ 映像（兩個隔離 venv）、compose overlay、env_var 版 `profiles.yml`
 - ✅ `tests/test_dags.py`（20 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
 - ⬜ 首次 `docker compose up` 的實機驗證（需要 GCP 金鑰與 BQ 專案）
-- ⬜ v3 規則放寬 + §3.3 demo 劇本走一次
+- ✅ v3 規則放寬（`age` 上限 120→130）——Proposal B 第一次有真的可 promote 的對象
+- ⬜ §3.3 demo 劇本實機走一次（需 GCP 金鑰與 BQ 專案）
 - ⬜ Seeding DAG（見 §4）
 - ⬜ Celery + Redis、OpenTelemetry（藍圖 Phase 5 的其他項）
 

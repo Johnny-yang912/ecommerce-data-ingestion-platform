@@ -15,6 +15,7 @@ import typing
 from clean import (
     format_clean, business_clean, clean_order,
     detect_schema_drift, DriftCode, _expected_kind, _type_compatible,
+    DQCode, NON_REPRODUCIBLE_CODES,
 )
 
 
@@ -328,6 +329,90 @@ class TestBusinessClean:
         assert errors == []
 
 
+# ─── 重評估可重現性（Proposal B 前置）────────────────────────────────────────
+#
+# Proposal B 用【新版規則重跑 business_clean】決定要不要 promote。這只有在「同一筆
+# ODS 值、同一版規則 → 同一個判定」時才成立。有兩類規則會破壞這個前提：
+#   ① 時間相依（判定基準是 wall clock）→ 由 as_of 參數修好，本節前半驗證
+#   ② 標記時把值正規化掉（證據消失）→ 無法修，只能排除，收在 NON_REPRODUCIBLE_CODES
+# 兩者若不處理，後果相同且嚴重：規則一個字都沒放寬，資料卻自己流回 Gold（偽 promote）。
+
+class TestReevaluationReproducibility:
+
+    # ── ①：as_of 讓時間相依規則可重現 ────────────────────────────────────────
+
+    def test_as_of_defaults_to_wall_clock(self):
+        """不傳 as_of → 維持既有行為（回歸保護：攝入路徑一個字都不能變）。"""
+        today = datetime.now(timezone.utc).date()
+        _, errors = business_clean(make_ods(order_date=today + timedelta(days=2)))
+        assert any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in errors)
+
+    def test_as_of_overrides_wall_clock(self):
+        """order_date 相對「今天」是過去、相對 as_of 是未來 → 以 as_of 為準被標記。"""
+        as_of = datetime.now(timezone.utc).date() - timedelta(days=200)
+        ods = make_ods(order_date=as_of + timedelta(days=10))
+        _, errors = business_clean(ods, as_of=as_of)
+        assert any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in errors)
+
+    def test_as_of_accepts_datetime_and_normalizes_to_utc(self):
+        """傳 tz-aware datetime → 先轉 UTC 再取日期。
+
+        本例的 UTC 日期（01-02）與當地日期（01-01）不同：若誤用當地日期，
+        cutoff 會少一天而把 01-03 誤標為未來日期。
+        """
+        as_of = datetime(2026, 1, 1, 23, 0, tzinfo=timezone(timedelta(hours=-8)))  # = 01-02 07:00 UTC
+        _, errors = business_clean(make_ods(order_date=date(2026, 1, 3)), as_of=as_of)
+        assert not any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in errors)
+
+        _, errors = business_clean(make_ods(order_date=date(2026, 1, 4)), as_of=as_of)
+        assert any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in errors)
+
+    def test_future_date_verdict_is_reproducible_with_as_of(self):
+        """核心案例：攝入當下被標記為未來日期的訂單，日後以 received_at 重評估仍成立。
+
+        對照組（不傳 as_of）示範沒有這個參數時會發生什麼——同一筆資料憑空通過。
+        """
+        received_at = datetime.now(timezone.utc) - timedelta(days=200)
+        order_date = (received_at + timedelta(days=10)).date()  # 相對攝入是未來、相對今天是過去
+
+        _, at_ingest = business_clean(make_ods(order_date=order_date), as_of=received_at)
+        assert any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in at_ingest)
+
+        _, wall_clock = business_clean(make_ods(order_date=order_date))
+        assert not any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in wall_clock)  # ← 偽 promote 的來源
+
+        _, replayed = business_clean(make_ods(order_date=order_date), as_of=received_at)
+        assert [e["code"] for e in replayed] == [e["code"] for e in at_ingest]
+
+    # ── ②：值被正規化掉的碼，判定無法重現 ────────────────────────────────────
+
+    def test_non_finite_verdict_is_not_reproducible(self):
+        """NON_FINITE_NUMBER 標記的同時把值設成 None → 重跑時錯誤憑空消失。
+
+        這正是它被列入 NON_REPRODUCIBLE_CODES 的原因：Proposal B 不得據此自動 promote，
+        因為那個「通過」來自證據消失，不是規則放寬。原始值只在 Raw（→ Proposal C）。
+        """
+        ods = make_ods(items=[{"product": {"product_id": "P1"}, "quantity": 1, "unit_price": float("nan")}])
+        cleaned, first = business_clean(ods)
+        assert [e["code"] for e in first] == [DQCode.NON_FINITE_NUMBER]
+
+        _, second = business_clean(cleaned)   # 重評估：輸入已是被正規化後的值
+        assert second == []
+
+    def test_value_preserving_verdict_survives_reevaluation(self):
+        """對照組：不改值的規則重跑仍成立（絕大多數碼屬於這類）。"""
+        ods = make_ods(age=200)
+        cleaned, first = business_clean(ods)
+        _, second = business_clean(cleaned)
+        assert [e["code"] for e in first] == [e["code"] for e in second] == [DQCode.AGE_OUT_OF_RANGE]
+
+    def test_non_reproducible_codes_matches_observed_behaviour(self):
+        """清單內容必須與上面兩支測到的實際行為一致（改規則時這裡要一起改）。"""
+        assert DQCode.NON_FINITE_NUMBER in NON_REPRODUCIBLE_CODES
+        assert DQCode.AGE_OUT_OF_RANGE not in NON_REPRODUCIBLE_CODES
+        assert DQCode.ORDER_DATE_IN_FUTURE not in NON_REPRODUCIBLE_CODES  # 已由 as_of 修成可重現
+
+
 # ─── clean_order ──────────────────────────────────────────────────────────────
 
 class TestCleanOrder:
@@ -361,6 +446,19 @@ class TestCleanOrder:
         result_ods, has_error, _ = clean_order(ods)
         assert result_ods.gender == "male"  # format_clean 有套用
         assert has_error is True            # business_clean 有套用
+
+    def test_as_of_is_passed_through_to_business_clean(self):
+        """as_of 必須原樣透傳——Proposal C 從 Raw 重產值時重用的正是這條路徑，
+        不透傳的話重建結果會與攝入當下不一致（DQ C-2 #3）。"""
+        as_of = datetime.now(timezone.utc) - timedelta(days=200)
+        order_date = (as_of + timedelta(days=10)).date()
+
+        _, has_error, msg = clean_order(make_ods(order_date=order_date), as_of=as_of)
+        assert has_error is True
+        assert any(e["code"] == DQCode.ORDER_DATE_IN_FUTURE for e in msg)
+
+        _, has_error_now, _ = clean_order(make_ods(order_date=order_date))
+        assert has_error_now is False   # 同一筆、不傳 as_of → 判定不同
 
 
 # ─── detect_schema_drift ────────────────────────────────────────────────────────

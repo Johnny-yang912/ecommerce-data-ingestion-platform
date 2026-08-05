@@ -31,6 +31,19 @@ class DQCode:
     NON_FINITE_NUMBER            = "non_finite_number"
 
 
+# 「判定不可重現」的違規碼：這些規則在標記的同時把值就地正規化掉（NaN/Inf → None），
+# 所以重評估時輸入已經是清理後的值，原判定條件【結構性地】無法再觸發——重跑必然「通過」。
+#
+# 這不是 bug，是攝入層的必要行為（PostgreSQL 的 JSONB/TEXT 存不下 NaN，見 business_clean
+# 的 sanitize 註解），但它替 Proposal B 劃了一條邊界：帶有這些碼的記錄【不得】被自動
+# promote——那個「通過」來自證據消失，而不是規則放寬。原始值只逐字留在 Raw，要救它必須
+# 從 Raw 重產值，那按定義是 Proposal C 的領域，不是 B（見 DQ_ARCHITECTURE-TW 的 A/B/C 邊界）。
+#
+# 新增規則時的判準：這條規則會不會【修改 ods 的值】？會 → 加進這裡。
+# 時間相依不算——ORDER_DATE_IN_FUTURE 已由 business_clean 的 as_of 參數修成可重現。
+NON_REPRODUCIBLE_CODES = frozenset({DQCode.NON_FINITE_NUMBER})
+
+
 # 自由文字欄位的「軟性」長度上限：超過則標記 has_clean_error（資料仍落地 ODS），
 # 由下游 quarantine 處理——對應「接受一定程度的意外，但標記出來」。
 # 此閾值刻意低於 models.py 的 DB 欄位硬牆（customer_name 255 / city 128）：
@@ -105,8 +118,25 @@ def format_clean(ods: ODSOrder) -> ODSOrder:
     return ods
 
 
-def business_clean(ods: ODSOrder) -> ODSOrder:
+def business_clean(ods: ODSOrder, as_of: Optional[date] = None) -> tuple[ODSOrder, list]:
+    """業務規則驗證。回傳 (ods, errors)；ods 可能被就地正規化（見 NON_REPRODUCIBLE_CODES）。
+
+    as_of：時間相依規則（目前只有 ORDER_DATE_IN_FUTURE）的判定基準日，預設為執行當下（UTC）。
+
+      攝入路徑不傳 → 行為與過去完全相同。但【重評估】必須傳入該筆的 `received_at`，
+      否則判定基準會隨 wall clock 漂移：一筆攝入當下被標記為未來日期的訂單，數月後
+      重跑時那個日期已成過去 → 憑空通過 → 在規則一個字都沒放寬的情況下被 promote
+      回 Gold（偽 promote）。傳入 as_of 讓這條規則變回可重現的純函數。
+
+      接受 date 或 datetime；datetime 一律先轉 UTC 再取日期（時區契約收在此處，
+      與 DQ_ARCHITECTURE-TW〈設計邊界〉「時區語意屬契約」一致——呼叫端應傳 tz-aware 值）。
+    """
     errors = []
+
+    # datetime 必須先判（它是 date 的子類）；date 物件恆為 truthy，故 `or` 安全。
+    if isinstance(as_of, datetime):
+        as_of = as_of.astimezone(timezone.utc).date()
+    reference_date = as_of or datetime.now(timezone.utc).date()
 
     # items 是 list of dict，逐一檢查。range 檢查皆以 isfinite 守衛：
     # 非有限值（NaN/±Inf）只報一次 non_finite_number，不再意外觸發 range 違規。
@@ -150,8 +180,9 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
                            "value": ods.delivery_date.isoformat(), "order_date": ods.order_date.isoformat()})
 
     # order_date 不能是未來（+容差吸收時區/時鐘偏移）
+    # 基準是 reference_date 而非直接讀時鐘：重評估／重建時傳 received_at 才能重現原判定。
     if ods.order_date is not None:
-        cutoff = datetime.now(timezone.utc).date() + timedelta(days=FUTURE_DATE_TOLERANCE_DAYS)
+        cutoff = reference_date + timedelta(days=FUTURE_DATE_TOLERANCE_DAYS)
         if ods.order_date > cutoff:
             errors.append({"code": DQCode.ORDER_DATE_IN_FUTURE, "field": "order_date",
                            "value": ods.order_date.isoformat()})
@@ -177,9 +208,15 @@ def business_clean(ods: ODSOrder) -> ODSOrder:
     return ods, errors
 
 
-def clean_order(ods: ODSOrder) -> tuple[ODSOrder, bool, Optional[list]]:
+def clean_order(ods: ODSOrder, as_of: Optional[date] = None) -> tuple[ODSOrder, bool, Optional[list]]:
+    """format_clean → business_clean 的整合入口（process.py 的唯一呼叫點）。
+
+    as_of 原樣透傳給 business_clean。攝入路徑不傳（維持 wall clock）；
+    Proposal C 從 Raw 重產值時必須傳入原始 `received_at`——它重用的正是這條純函數路徑
+    （DQ_ARCHITECTURE-TW C-2 #3），不傳的話重建出來的評估結果會與攝入當下不一致。
+    """
     ods = format_clean(ods)
-    ods, business_errors = business_clean(ods)
+    ods, business_errors = business_clean(ods, as_of=as_of)
 
     has_clean_error = len(business_errors) > 0
     clean_error_message = business_errors if business_errors else None

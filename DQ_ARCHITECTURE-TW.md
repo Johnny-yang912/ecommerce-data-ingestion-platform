@@ -143,6 +143,14 @@ bump 判準：**同一筆 raw payload 重跑一次，`has_clean_error` / `clean_
 | 新增欄位對映（`from_nested` 多撈一欄） | ❌ | 不用（走 code review／migration） |
 | 改名重新對映 | ❌ | 不用 |
 | `detect_schema_drift` 偵測邏輯改動 | ❌（屬另一個訊號，不碰 `has_clean_error`） | 不用 |
+| 時間相依規則改為 `as_of` 注入（判定基準從「執行當下」改為「傳入的基準日」） | ❌（攝入路徑預設 `as_of=None`＝維持 `now()`，同一筆 raw 首次評估的結果不變） | 不用 |
+
+**最後一列為什麼存在——它修的是「重跑會不會得到同一個答案」** ⭐
+上表的 bump 判準預設了一件事：**同一筆 raw、同一版規則重跑，會得到同一個結果**。`business_clean` 曾有一條規則違反這個前提——`ORDER_DATE_IN_FUTURE` 以「執行當下」的 wall clock 為基準，於是一筆三個月前被標記為未來日期的訂單，今天重評估時那個日期已成過去，**在規則一個字都沒改的情況下憑空通過**。
+
+這對 Proposal B 是致命的：它的 promote 判準正是「新版規則重跑通過」，而這種通過來自時間流逝、不是規則放寬——結果是**偽 promote**（髒資料自己流回 Gold）。修法是把基準參數化：`business_clean(ods, as_of=...)` / `clean_order(ods, as_of=...)`，重評估與 Proposal C 重建時一律傳入該筆的 `received_at`，讓規則變回可重現的純函數。攝入路徑不傳、行為完全不變，故依上表判準**不 bump**。
+
+> **另一類無法用 `as_of` 修的不可重現**：有些規則在標記的同時把值**就地正規化**掉（`NON_FINITE_NUMBER` 把 NaN/Inf 設為 `None`，因為 PostgreSQL 的 JSONB/TEXT 存不下）。重評估時輸入已是清理後的值，原判定條件結構性地無法再觸發 → 重跑必然「通過」，但那是**證據消失**而非規則放寬。這類碼收在 `clean.NON_REPRODUCIBLE_CODES`，**Proposal B 不得據此自動 promote**；原始值只逐字留在 Raw，要救它必須從 Raw 重產值——按定義是 Proposal C 的領域（見〈Remediation：A + B + C 並用〉）。
 
 **本次 v1 → v2 的 bump**：攝入層強化新增了 `FIELD_TOO_LONG`、`NON_FINITE_NUMBER`、`ORDER_DATE_IN_FUTURE` 三條 `business_clean` 規則，並以 sentinel 正規化影響值評估——同一筆 raw 重跑會得到不同的 `has_clean_error`，故 bump。此次規則是**變嚴**（標記更多），只往後生效即可、**不需回溯重評估**；回溯只在規則放寬要 promote 舊 quarantine 時才做（對應狀態機的 `re_quarantined` 邊緣情況）。
 

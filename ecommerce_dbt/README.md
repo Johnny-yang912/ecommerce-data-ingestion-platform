@@ -474,7 +474,8 @@ Primary code = the first entry of the deduplicated, sorted `error_codes` array. 
 
 | Test | Target | Severity | Notes |
 |---|---|---|---|
-| `error_rate_below` (custom generic test) | `stg_orders` batch `has_clean_error` ratio | error @10% / warn @5% | **Hard Gate** (DQ mechanism 1). Can't use `dbt_utils.expression_is_true` (row-level, put in WHERE; aggregates error out) → custom `macros/error_rate_below.sql` uses `HAVING` for a whole-table aggregate |
+| `hard_gate_latest_batch_error_rate` (`error_rate_below`, `scope: latest_partition`) | `has_clean_error` ratio over `stg_orders`'s **latest `received_at` partition** | error @15% | **Hard Gate** (DQ mechanism 1) — the only test with blocking authority. Per-batch rather than whole-table: a whole-table denominator grows with history and dilutes single-batch anomalies away, and it cannot heal (historical dirty rows stay in the denominator forever). Can't use `dbt_utils.expression_is_true` (row-level, put in WHERE; aggregates error out) → custom `macros/error_rate_below.sql` uses `HAVING` for an aggregate assertion |
+| `monitor_dataset_error_rate` (`error_rate_below`, default `scope: table`) | whole-table `has_clean_error` ratio on `stg_orders` | warn @10% | A **gauge** for dataset-wide health, deliberately given no blocking power. Same reasoning: its denominator is a function of retention/backfill policy, making it sensitive to things other than quality |
 | `unique` + `not_null` | `stg_`'s `raw_id`/`id`/`order_id`; `int_`'s `raw_id`/`order_id` | error | `stg_`'s `unique(raw_id)` is the dedup check |
 | `not_null` | `received_at`/`has_clean_error`/`has_schema_drift` | error | REQUIRED columns |
 | source freshness | `staging.orders`, `staging.quality_events` | warn 26h / error 50h | with `filter` to bypass the fuse |

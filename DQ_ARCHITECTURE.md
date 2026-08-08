@@ -191,26 +191,66 @@ Two mechanisms used together, each covering a different level of failure.
 
 Tests are attached to `dbt stg_*`. A test failure halts the entire dbt run — `int_*/dim_*/fct_*` are not updated and retain their last clean state.
 
+**An error-rate assertion cannot use `dbt_utils.expression_is_true`** ⭐
+That one is a row-level test (it folds the condition into `WHERE NOT(...)`), whereas `countif()/count(*)` is an aggregate — BigQuery rejects it outright with `Aggregate function COUNTIF not allowed in WHERE clause`. A ratio assertion has to be made at the aggregate level, so it lives in the custom generic test `macros/error_rate_below.sql`, expressed via `HAVING` (no `GROUP BY` = a single value over the selected scope); returning one row means the threshold was breached.
+
+**Scope: the gate is per-batch, the gauge is whole-table** ⭐
+
 ```yaml
 # stg_orders.yml
 models:
   - name: stg_orders
     tests:
-      # Critical: key field entirely null → entire batch is meaningless
-      - not_null:
-          column_name: order_id
-          severity: error
+      # Gate: latest received_at partition >= 15% → suspected upstream failure, block downstream
+      - error_rate_below:
+          name: hard_gate_latest_batch_error_rate
+          arguments:
+            threshold: 0.15
+            scope: latest_partition
+          config:
+            severity: error
 
-      # Critical: batch error rate too high → likely a source system issue
-      - expression_is_true:
-          expression: "countif(has_clean_error) / count(*) < 0.1"
-          severity: error     # > 10% → block run
-
-      # Warning: error rate elevated but still acceptable → continue but alert
-      - expression_is_true:
-          expression: "countif(has_clean_error) / count(*) < 0.05"
-          severity: warn      # > 5% → warn
+      # Gauge: dataset-wide health, deliberately given no blocking power
+      - error_rate_below:
+          name: monitor_dataset_error_rate
+          arguments:
+            threshold: 0.1
+          config:
+            severity: warn
+    columns:
+      - name: order_id
+        tests:
+          - not_null      # the one hard-gate column: missing means the batch is meaningless
+          - unique
 ```
+
+| | Scope | Severity | What it guards |
+|---|---|---|---|
+| `hard_gate_latest_batch_error_rate` | Latest `received_at` partition | **error** | Whether this ingestion batch broke (anomaly detection) |
+| `monitor_dataset_error_rate` | Whole table | warn | Dataset-wide health (observation) |
+
+#### A gate has to satisfy three things at once to be worth having
+
+**① It must be sensitive to the signal it detects — a whole-table scope gets diluted by history.**
+What the Hard Gate needs to detect is "today's ingestion broke". But a whole-table ratio has **accumulated history** in its denominator, of which today's data is a small fraction; the higher the daily volume and the longer the history, the less a single bad batch can move the number. In the limit, an upstream system collapses entirely and the metric does not budge in the second decimal place. **A gate that grows duller as the data grows is at its most useless precisely when it is most needed.** A per-batch scope pins the denominator to that batch, so sensitivity does not drift with history.
+
+**② It must be able to heal — a whole-table scope, once red, never comes back.**
+After the upstream is fixed the new data is clean, but **the historical dirty rows stay in the denominator forever**. The whole-table ratio does not fall just because the problem was solved, so the gate keeps blocking. The inevitable human response is to raise the threshold or disable the test — **a gate that can only be cleared by loosening itself has already failed, and failed in the worst way: it trains operators to ignore it.** A per-batch scope heals by construction; the next clean batch turns it green.
+
+> More generally: a whole-table denominator is a function of **retention and backfill policy**. Changing the retention window, replaying a backfill, or rebuilding with `--full-refresh` all move this "quality metric" — and none of those acts have anything to do with data quality. **A metric must not be sensitive to things other than what it claims to measure.**
+
+**③ It must not duplicate another mechanism's job — dirty records were never this gate's to catch.**
+Per-record interception belongs to Mechanism 2, the Row Filter. The Hard Gate asks a question one level up: **"is the source broken as a whole?"** A steady 3% jumping to 40% does not mean the data is dirty, it means the upstream system is on fire, and the pipeline should stop and wait for a human. This is **anomaly detection**, not a cleanliness check. The real mistake in the old design was making a single metric play both roles.
+
+The per-batch scope carries an operational bonus: **a red light comes with its own attribution**. When the gate trips you know which partition, and therefore which upstream time window, to go and look at. A whole-table red light only tells you "the aggregate is bad", with nowhere to start.
+
+> ⚠️ **`latest_partition` is not the same as "this one extract run".**
+> Staging carries no load batch id, so the daily partition is the closest available proxy. Several extracts in one day collapse into a single verdict; when one extract spans two partitions (the `>=` watermark re-pulling the previous day), **only the newest one is asserted on**. At a daily cadence the two are near-equivalent. Getting true batch precision means having extract write a batch column — but that would make `stg_orders`'s `raw_id` dedup tie-break non-deterministic (the copies stop being byte-identical), which is a separate decision.
+
+> ⚠️ **Moving to hourly batches requires changing partition granularity with it.**
+> If the schedule goes hourly while partitioning stays DAY, "latest partition" degrades into "today so far" — the denominator grows through the day and the dilution problem replays itself within a single day. Partition granularity, batch cadence, and gate scope have to move together (see the decision table in [CLOUD_LAYER §2.2](./CLOUD_LAYER.md)).
+
+> ⚠️ **Partition boundaries are UTC.** `received_at` is a `TIMESTAMP`, and `date()` rolls over at UTC midnight.
 
 ### Mechanism 2: Row Filter (record-level)
 
@@ -717,8 +757,16 @@ BQ `dim_*/fct_*` reflects the quality state under the latest evaluation.
 This divergence is an intentional design decision. Traceability is provided by `dq_rule_version` + `quality_events`.
 
 **Hard Gate thresholds are business judgements**  
-Suggested starting values: error rate > 10% blocks the run; > 5% warns.  
-Actual thresholds should be calibrated once real traffic data is available. Initial values are conservative estimates.
+Current values: latest-partition error rate ≥ **15%** blocks the run (error); whole-table ≥ **10%** warns. Both are placeholders and must be recalibrated once real traffic is flowing. Calibration follows three principles:
+
+**A threshold expresses "how far from normal counts as anomalous", not "how dirty is dirty".**  
+It only means anything once there is an estimate of the normal error rate. Detached from that baseline, any round number is a guess — if the upstream norm is 0.5%, 15% is so loose as to be decorative; if the norm is 12%, 15% is tight enough to trip daily.
+
+**Batch size determines how tight a threshold can be.**  
+Sampling noise in a ratio shrinks as the batch grows. At large batch sizes the norm is stable and the threshold can sit close to it; at small batch sizes the ratio jitters on its own and a fixed ratio threshold will be tripped by noise alone. When batch sizes span orders of magnitude (a daily run versus a replay, say), one fixed ratio cannot serve both, and the judgement should move to "ratio + minimum row count" or a statistical test.
+
+**The costs of a false trip and a miss are asymmetric, so lean toward the cheaper side.**  
+A Hard Gate trip stops the whole downstream from updating. The cost of a false trip is "reports that could have refreshed are stuck at yesterday"; the cost of a miss is "bad data reaches Gold and gets consumed" — but the latter has Mechanism 2's Row Filter underneath it, and the former has nothing. **That asymmetry means the Hard Gate should be set loose rather than tight**, leaving fine-grained quality control to per-record isolation so this gate can concentrate on genuine systemic failures.
 
 **Promotion events are produced by `reevaluate_quality.py` (implemented)**  
 The write logic for `promotion` and `re_quarantination` is in place. It is triggered **manually / on a rule-version bump**, not on a daily schedule — with unchanged rules a re-evaluation is necessarily a no-op, so scheduling it daily would just full-scan the entire quarantine backlog for nothing. `rejection` (→ `permanently_rejected`) is deliberately **not** part of the automated task, preserving its "written off by a human" meaning.  

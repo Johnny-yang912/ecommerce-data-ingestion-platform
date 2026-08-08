@@ -189,26 +189,66 @@ bump 判準：**同一筆 raw payload 重跑一次，`has_clean_error` / `clean_
 
 在 `dbt stg_*` 掛載測試。測試失敗 → 整個 dbt run 中止，`int_*/dim_*/fct_*` 不更新，保留上一次的乾淨狀態。
 
+**錯誤率斷言不能用 `dbt_utils.expression_is_true`** ⭐
+後者是逐列測試（把條件塞進 `WHERE NOT(...)`），而 `countif()/count(*)` 是聚合，BQ 會直接報 `Aggregate function COUNTIF not allowed in WHERE clause`。比率斷言必須在聚合層級做，故用自訂 generic test `macros/error_rate_below.sql`，以 `HAVING`（無 `GROUP BY` = 對選定範圍求單一值）表達，回傳一列即代表超標。
+
+**口徑：閘門逐批、儀表全表** ⭐
+
 ```yaml
 # stg_orders.yml
 models:
   - name: stg_orders
     tests:
-      # 嚴重：關鍵欄位全空 → 整批資料無意義，直接擋
-      - not_null:
-          column_name: order_id
-          severity: error
+      # 閘門：最新 received_at 分區錯誤率 >= 15% → 疑似上游系統異常，擋下游
+      - error_rate_below:
+          name: hard_gate_latest_batch_error_rate
+          arguments:
+            threshold: 0.15
+            scope: latest_partition
+          config:
+            severity: error
 
-      # 嚴重：整批錯誤率過高 → 可能是 source 系統異常
-      - expression_is_true:
-          expression: "countif(has_clean_error) / count(*) < 0.1"
-          severity: error     # > 10% 擋住
-
-      # 警告：錯誤率偏高但尚可接受 → 繼續跑但發告警
-      - expression_is_true:
-          expression: "countif(has_clean_error) / count(*) < 0.05"
-          severity: warn      # > 5% 告警
+      # 儀表：資料集整體健康度，刻意不給阻斷權
+      - error_rate_below:
+          name: monitor_dataset_error_rate
+          arguments:
+            threshold: 0.1
+          config:
+            severity: warn
+    columns:
+      - name: order_id
+        tests:
+          - not_null      # 唯一硬閘門欄位：缺失代表整批無意義
+          - unique
 ```
+
+| | 口徑 | severity | 守的是什麼 |
+|---|---|---|---|
+| `hard_gate_latest_batch_error_rate` | 最新 `received_at` 分區 | **error** | 這批攝入是不是壞了（突變偵測）|
+| `monitor_dataset_error_rate` | 全表 | warn | 資料集整體健康度（觀測）|
+
+#### 一道閘門要能用，必須同時滿足三件事
+
+**① 對它要偵測的訊號敏感——全表口徑會被歷史稀釋。**
+Hard Gate 要偵測的是「今天的攝入出事了」。但全表比率的分母是**累積歷史**，本日資料只佔其中一小部分；日流量越大、歷史越長，單批異常能推動全表指標的幅度越小。極端情況是上游整批崩壞，指標卻連小數點後第二位都沒動。**一個隨著資料成長而越來越遲鈍的閘門，最需要它的時候正是它最沒用的時候。** 逐批口徑的分母固定為該批規模，靈敏度不隨歷史漂移。
+
+**② 必須可自癒——全表口徑一旦紅了就回不來。**
+上游修好之後，新資料是乾淨的，但**歷史的髒資料永遠留在分母裡**。全表比率不會因為問題解決而回落，閘門會一直擋著。這時人的反應必然是調高門檻或關掉測試——**一道只能靠放寬自己來解除的閘門，實質上已經失效，而且是以最糟的方式失效：它訓練維運者忽略它。** 逐批口徑天然自癒，下一批乾淨就恢復綠燈。
+
+> 更一般地說：全表口徑的分母是**歷史保留與回填策略**的函數。調整保留期、補跑一次 backfill、`--full-refresh` 重建，都會讓這個「品質指標」變動——而這些動作與資料品質無關。**指標不該對它宣稱要衡量的東西以外的事情敏感。**
+
+**③ 不與其他機制職責重疊——髒資料本來就不靠這道閘門攔。**
+逐筆攔截是機制二 Row Filter 的職責。Hard Gate 問的是另一個層次的問題：**「source 是不是整個壞了」**。常態 3% 突然變 40%，代表的不是資料髒，是上游系統出事，這時整條管線該停下來等人看。這是**突變偵測**，不是清潔度檢查。舊設計真正的錯誤，是讓同一個指標同時扮演這兩個角色。
+
+逐批口徑還有一個維運上的附帶好處：**紅燈自帶歸因**。閘門一擋就知道是哪一個分區、對應哪一個時間窗的上游，可以直接去查。全表紅燈只告訴你「整體不行」，無從下手。
+
+> ⚠️ **`latest_partition` 不等於「這一次 extract」。**
+> staging 沒有 load batch id，日分區是最接近的代理。一天跑多次 extract 會併成一個判斷；一次 extract 因 `>=` watermark 重抓前一天而跨兩個分區時，**只有最新那個會被斷言**。以日批節奏兩者幾乎等價。要精確到批次，得讓 extract 寫入批次欄位——但那會讓 `stg_orders` 的 `raw_id` 去重決勝變成非決定性（副本不再 byte-identical），是另一個獨立決策。
+
+> ⚠️ **升到小時批時，分區粒度必須一起改。**
+> 若排程改為小時級而分區仍是 DAY，「最新分區」會退化成「今天到目前為止」——分母隨當日累積而成長，稀釋問題就在一天之內重演一次。分區粒度、批次節奏、閘門口徑三者必須對齊（見 [CLOUD_LAYER-TW §2.2](./CLOUD_LAYER-TW.md) 的判準表）。
+
+> ⚠️ **分區邊界是 UTC。** `received_at` 為 `TIMESTAMP`，`date()` 在 UTC 換日。
 
 ### 機制二：Row Filter（record-level）
 
@@ -715,8 +755,16 @@ BQ `dim_*/fct_*` 反映目前最新評估下的乾淨狀態。
 這個分歧是有意的設計決策，透過 `dq_rule_version` + `quality_events` 提供追溯能力。
 
 **Hard Gate 閾值為業務判斷**  
-目前建議值：error rate > 10% 擋住，> 5% 告警。  
-實際閾值應在有真實流量資料後調整，初始值為保守估計。
+現行值：最新分區 error rate ≥ **15%** 擋住（error）、全表 ≥ **10%** 告警（warn）。這兩個數字是佔位值，真實流量接上後必須重新校準。校準有三條原則：
+
+**門檻表達的是「偏離常態多遠算異常」，不是「多髒算髒」。**  
+必須先有常態錯誤率的估計，門檻才有意義。脫離了常態，任何整數都只是猜測——上游常態若是 0.5%，15% 寬鬆到形同虛設；常態若是 12%，15% 又緊到天天誤觸。
+
+**批量規模決定門檻能訂得多緊。**  
+比率的抽樣波動隨批量增大而縮小。大批量下常態相當穩定，門檻可以貼近常態；小批量的比率本身就在跳動，固定比率門檻會被雜訊反覆觸發。批量若橫跨數量級（例如日批與補跑），單一固定比率不足以同時服務兩者，屆時應考慮改用「比率 + 最小筆數下限」或統計檢定式的判準。
+
+**誤觸與漏擋的代價不對稱，門檻要往代價小的一邊偏。**  
+Hard Gate 一擋就是整條下游停更。誤觸的代價是「本可更新的報表停在昨天」，漏擋的代價是「壞資料進入 Gold 並被下游消費」——但後者有機制二 Row Filter 兜底，前者沒有。**這個不對稱意味著 Hard Gate 應該訂得寧鬆勿緊**，把細緻的品質控制交給逐筆隔離，讓這道閘門專心只抓真正的系統性異常。
 
 **`quality_events` 的促進事件由 `reevaluate_quality.py` 產生（已實作）**  
 `promotion` 與 `re_quarantination` 的寫入邏輯已落地，觸發方式是**手動／規則升版時**而非日排程——規則沒變時重評估必然是 no-op，排成日批只是對全歷史 quarantine 做一次白工。`rejection`（→ `permanently_rejected`）刻意**不做進自動任務**，維持「人工放棄」的語意。  

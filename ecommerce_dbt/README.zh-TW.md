@@ -474,7 +474,8 @@ DQ 文件原規劃的 `rpt_quality_daily` 混了兩件性質相反的事，實�
 
 | 測試 | 對象 | severity | 說明 |
 |---|---|---|---|
-| `error_rate_below`（自訂 generic test）| `stg_orders` 整批 `has_clean_error` 比率 | error @10% / warn @5% | **Hard Gate**（DQ 機制一）。不能用 `dbt_utils.expression_is_true`（逐列、塞 WHERE，聚合會報錯）→ 自訂 `macros/error_rate_below.sql` 用 `HAVING` 做全表聚合 |
+| `hard_gate_latest_batch_error_rate`（`error_rate_below`，`scope: latest_partition`）| `stg_orders` **最新 `received_at` 分區**的 `has_clean_error` 比率 | error @15% | **Hard Gate**（DQ 機制一）唯一有阻斷權者。逐批而非全表：全表分母隨歷史成長會把單批異常稀釋掉，且不可自癒（歷史髒資料永留分母）。不能用 `dbt_utils.expression_is_true`（逐列、塞 WHERE，聚合會報錯）→ 自訂 `macros/error_rate_below.sql` 用 `HAVING` 做聚合斷言 |
+| `monitor_dataset_error_rate`（`error_rate_below`，預設 `scope: table`）| `stg_orders` 全表 `has_clean_error` 比率 | warn @10% | 資料集整體健康度的**儀表**，刻意不給阻斷權。理由同上：分母是保留／回填策略的函數，對品質以外的事情敏感 |
 | `unique` + `not_null` | `stg_` 的 `raw_id`/`id`/`order_id`；`int_` 的 `raw_id`/`order_id` | error | `stg_` 的 `unique(raw_id)` 即去重驗證 |
 | `not_null` | `received_at`/`has_clean_error`/`has_schema_drift` | error | REQUIRED 欄位 |
 | source freshness | `staging.orders`、`staging.quality_events` | warn 26h / error 50h | 帶 `filter` 繞保險絲 |

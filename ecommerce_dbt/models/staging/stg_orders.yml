@@ -8,16 +8,28 @@ models:
     tests:
       # --- Hard Gate（DQ 機制一，run-level）：失敗 → 整個 dbt run 中止，下游保留上次乾淨狀態 ---
       # 用自訂 generic test error_rate_below（聚合斷言，非逐列）。見 macros/error_rate_below.sql
-      # 嚴重：整批錯誤率 >= 10% → 疑似 source 系統異常，直接擋
+      #
+      # 閘門＝逐批：最新 received_at 分區錯誤率 >= 15% → 疑似上游系統異常，擋下游。
+      # 為何是逐批而非全表：全表分母是累積歷史，日流量越大、歷史越長，單批異常越推不動
+      # 指標——閘門會隨資料成長而失靈。逐批的分母固定為該批規模，靈敏度不隨歷史漂移。
+      # 髒資料【不】靠這道閘門攔——那是 int_ 的 Row Filter 逐筆隔離的職責。
+      # 這裡守的是「source 是不是整個壞了」，是突變偵測，不是資料清潔度。
       - error_rate_below:
+          name: hard_gate_latest_batch_error_rate
           arguments:
-            threshold: 0.1
+            threshold: 0.15
+            scope: latest_partition
           config:
             severity: error
-      # 警告：錯誤率 >= 5% 但尚可接受 → 繼續跑但告警
+      # 儀表＝全表：資料集整體健康度，刻意【不】給阻斷權。
+      # 降為 warn 的理由是【不可自癒】：上游修好後新資料乾淨，但歷史髒資料永遠留在分母裡，
+      # 全表比率不會因為問題解決而回落，閘門會一直擋著——屆時只能靠調高門檻或關掉測試解除，
+      # 而那等於訓練維運者忽略它。另外它的分母還是「保留期／回填策略」的函數（補跑 backfill、
+      # --full-refresh 都會讓它變動），對品質以外的事情敏感。故只留告警。
       - error_rate_below:
+          name: monitor_dataset_error_rate
           arguments:
-            threshold: 0.05
+            threshold: 0.1
           config:
             severity: warn
     columns:

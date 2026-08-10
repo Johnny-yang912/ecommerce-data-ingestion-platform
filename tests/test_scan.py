@@ -2,21 +2,15 @@
 掃描 Recovery 測試（遷移自 test_scan_retry.py）
 
 scan_and_recover : stale processing 重設 / pending 收集 / commit 行為
-lifespan startup : startup 時排程 pending records
-_periodic_scan   : 單次迭代排程 / 例外不中斷迴圈
 
-注意：
-  - 所有 async 測試由 asyncio_mode=auto 自動處理，不需要 @pytest.mark.asyncio
-  - test_startup_requeues_pending 使用 asyncio.sleep(0.1) 等待 to_thread tasks 完成
+排程端（誰在什麼時候觸發掃描、掃到之後怎麼派工）已搬到 Celery Beat，
+對應測試在 test_tasks.py::TestScanAndDispatchTask / TestBeatSchedule。
+本檔只留 scan_and_recover 這個純函式本身的契約。
 """
 
-import asyncio
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 import process
-import main
-from main import lifespan, _periodic_scan, app
 from process import scan_and_recover, STALE_PROCESSING_MINUTES
 from helpers import scalars_result
 
@@ -101,85 +95,3 @@ class TestScanAndRecover:
 
         assert result == []
         assert mock_db.commit.call_count == 0
-
-
-# ─── lifespan startup 測試 ────────────────────────────────────────────────────
-
-class TestLifespanStartup:
-
-    async def test_startup_requeues_all_pending_records(self):
-        """Startup 找到 2 筆 pending → 各派工一次（不在 API 行程內直接處理）。"""
-        with patch("main.scan_and_recover", return_value=[10, 20]), \
-             patch("main._enqueue", return_value=True) as mock_enqueue, \
-             patch("main._periodic_scan", new_callable=AsyncMock):
-
-            async with lifespan(app):
-                pass
-
-        assert sorted(c[0][0] for c in mock_enqueue.call_args_list) == [10, 20]
-
-    async def test_startup_with_no_records_does_not_enqueue(self):
-        """Startup scan 沒有記錄 → 不派工，scan 只呼叫一次。"""
-        with patch("main.scan_and_recover", return_value=[]) as mock_scan, \
-             patch("main._enqueue", return_value=True) as mock_enqueue, \
-             patch("main._periodic_scan", new_callable=AsyncMock):
-
-            async with lifespan(app):
-                pass
-
-        mock_scan.assert_called_once()
-        mock_enqueue.assert_not_called()
-
-
-# ─── _periodic_scan 測試 ─────────────────────────────────────────────────────
-#
-# 用 asyncio.CancelledError 終止迴圈：
-#   mock_sleep 第 1 次立即回傳（進入 scan），第 2 次拋 CancelledError（結束）。
-
-class TestPeriodicScan:
-
-    async def test_periodic_scan_enqueues_found_records(self):
-        """Periodic scan 一輪：找到記錄 → 各派工一次。"""
-        sleep_count = [0]
-        async def mock_sleep(n):
-            sleep_count[0] += 1
-            if sleep_count[0] > 1:
-                raise asyncio.CancelledError()
-
-        with patch("main.scan_and_recover", return_value=[7, 8]), \
-             patch("main._enqueue", return_value=True) as mock_enqueue, \
-             patch("asyncio.sleep", side_effect=mock_sleep):
-            try:
-                await _periodic_scan()
-            except asyncio.CancelledError:
-                pass
-
-        assert sorted(c[0][0] for c in mock_enqueue.call_args_list) == [7, 8]
-
-    async def test_periodic_scan_exception_does_not_break_loop(self):
-        """第 1 輪 scan 拋出例外 → 記 ERROR log，第 2 輪正常繼續。"""
-        scan_count = [0]
-
-        def mock_scan():
-            scan_count[0] += 1
-            if scan_count[0] == 1:
-                raise Exception("db connection error")
-            return []
-
-        sleep_count = [0]
-        async def mock_sleep(n):
-            sleep_count[0] += 1
-            if sleep_count[0] > 2:
-                raise asyncio.CancelledError()
-
-        with patch("main.scan_and_recover", side_effect=mock_scan), \
-             patch("asyncio.sleep", side_effect=mock_sleep), \
-             patch.object(main.logger, "error") as mock_error:
-            try:
-                await _periodic_scan()
-            except asyncio.CancelledError:
-                pass
-
-        # 第 1 輪例外 + 第 2 輪正常 = 2 次 scan
-        assert scan_count[0] == 2
-        assert mock_error.called

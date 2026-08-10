@@ -74,6 +74,7 @@ services:
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
       LOG_FORMAT: json
       CELERY_BROKER_URL: redis://redis:6379/0
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-300}
       # prefork 下每個子行程有自己的 pool，同時又只跑一個任務 → pool 開大沒有意義。
       # 4 個子行程 × (2+10) 遠低於 Postgres 預設 max_connections=100，留餘裕給 api 與 Airflow。
       POOL_SIZE: 2
@@ -91,6 +92,31 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+
+  # Celery Beat：週期恢復掃描的觸發者（取代原本掛在 FastAPI lifespan 的 asyncio 迴圈）。
+  # 它只負責「按時送一則 tasks.scan_and_dispatch 訊息」，真正的掃描在 worker 執行，
+  # 所以極輕——也因此可以放心單實例部署。
+  #
+  # ⚠️ 不可 `--scale beat=N`：多個 beat 會各自按時派掃描，變成重複掃描。後果無害
+  #    （scan_and_recover 冪等、CAS claim 擋住重複處理），但純屬浪費。
+  # ⚠️ 也不要改用 `celery worker -B` 的內嵌 beat：官方明示非生產用法。
+  beat:
+    build: .
+    # schedule 檔寫到 /tmp 而非 /app：容器內的排程狀態是暫時的（間隔排程重啟後
+    # 重新計時即可），沒必要污染程式碼目錄，也免去唯讀根檔案系統時的麻煩。
+    command: celery -A celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    environment:
+      DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
+      LOG_FORMAT: json
+      CELERY_BROKER_URL: redis://redis:6379/0
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-300}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

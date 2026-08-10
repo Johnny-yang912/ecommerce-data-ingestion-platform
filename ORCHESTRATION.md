@@ -14,8 +14,9 @@ ODS (PostgreSQL) ──[E/L]──► BQ staging ──[T: dbt]──► stg_/in
                      └──────── Airflow ───────┘   ← you are here
 ```
 
-**Airflow is not a task queue.** In the roadmap, "Airflow" and "Celery + Redis" are two
-**orthogonal** items; conflating them warps the whole design:
+**Airflow is not a task queue.** "Airflow" and "Celery + Redis" are two
+**orthogonal** items (the latter is implemented — see [QUEUE.md](./QUEUE.md)); conflating
+them warps the whole design:
 
 | | Airflow | Celery + Redis |
 |---|---|---|
@@ -224,8 +225,9 @@ from Raw", and an operational component's history should not live or die with it
 the business DB, you also do not want to roll back Airflow's execution history along with it.
 
 **LocalExecutor**: single host, a handful of tasks. CeleryExecutor would add two containers and a
-broker — and that Redis would collide conceptually with the roadmap's "Celery + Redis replacing
-BackgroundTasks".
+broker — and that Redis would collide conceptually with the ingestion path's "Celery + Redis replacing
+BackgroundTasks" (implemented, see [QUEUE.md](./QUEUE.md); the two deliberately do not share an
+instance, to keep their failure domains apart).
 
 **No triggerer**: only `BashOperator` is in use; there are no deferrable operators.
 
@@ -335,7 +337,6 @@ have convenient buttons.**
 | Item | Why not | Trigger |
 |---|---|---|
 | **Seeding DAG** | Would make a demo-data generator a permanent part of the system, and would **invert** the freshness stance already settled in [CLOUD_LAYER §1.7.7](./CLOUD_LAYER.md) | When BI charts need continuous data. Freshness then becomes a meaningful gate and §1.7.7's rule table must be updated in step |
-| **Celery + Redis** | Orthogonal to Airflow (see *Scope*); it solves `BackgroundTasks` durability | When the API needs horizontal scaling |
 | **OpenTelemetry** | Needs continuous traffic worth observing first | A separate roadmap Phase 5 item |
 | **Cosmos (model-level tasks)** | 13 models; benefit is out of proportion to the dependency cost | When model count makes layer-level tasks too coarse to read |
 | **triggerer / deferrable** | Only `BashOperator` today | When sensors are introduced |
@@ -489,7 +490,8 @@ changes; this is recorded so whoever expands it later knows where the line is.
   5 control records (age -3/150/999) correctly stayed quarantined; a second consecutive run wrote
   0 events (idempotency); ODS was never modified (Bounded Writeback)
 - ⬜ Seeding DAG (see §4)
-- ⬜ Celery + Redis, OpenTelemetry (other roadmap Phase 5 items)
+- ✅ Celery + Redis (implemented, orthogonal to this layer; see [QUEUE.md](./QUEUE.md))
+- ⬜ OpenTelemetry (other roadmap Phase 5 items)
 
 ## 7. Dependencies and Versions
 

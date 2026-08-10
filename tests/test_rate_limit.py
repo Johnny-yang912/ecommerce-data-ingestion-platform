@@ -63,8 +63,7 @@ def client():
     from auth import verify_api_key
     app.dependency_overrides[verify_api_key] = lambda: "test-client"
     try:
-        with patch("main.scan_and_recover", return_value=[]), \
-             patch("main._enqueue", return_value=True), \
+        with patch("main._enqueue", return_value=True), \
              patch("main.SessionLocal", return_value=_make_order_db()):
             with TestClient(app) as c:
                 yield c
@@ -187,8 +186,7 @@ class TestRealAuthDrivesLimiter:
             "key-a2": "client-a",
             "key-b": "client-b",
         })
-        with patch("main.scan_and_recover", return_value=[]), \
-             patch("main._enqueue", return_value=True), \
+        with patch("main._enqueue", return_value=True), \
              patch("main.SessionLocal", return_value=_make_order_db()):
             with TestClient(app) as c:
                 yield c

@@ -13,7 +13,8 @@ ODS (PostgreSQL) ──[E/L]──► BQ staging ──[T：dbt]──► stg_/i
                      └──────── Airflow ───────┘   ← 你在這裡
 ```
 
-**Airflow 不是任務佇列**。開發藍圖裡「Airflow」與「Celery + Redis」是兩個**正交**的項目，
+**Airflow 不是任務佇列**。「Airflow」與「Celery + Redis」是兩個**正交**的項目
+（後者已實作，見 [QUEUE-TW.md](./QUEUE-TW.md)），
 混淆會讓整個設計走歪：
 
 | | Airflow | Celery + Redis |
@@ -204,7 +205,8 @@ quarantine 做一次完整掃描。排成日批＝**364 天的白工換 1 天的
 與它同生共死。要 restore 業務 DB 時，也不會想連 Airflow 的執行歷史一起回滾。
 
 **Executor 用 LocalExecutor**：本機單機、task 數個位數，CeleryExecutor 只多兩個容器與一個
-broker——而那個 Redis 會與藍圖裡「Celery + Redis 取代 BackgroundTasks」在概念上打架。
+broker——而那個 Redis 會與攝入路徑的「Celery + Redis 取代 BackgroundTasks」在概念上打架
+（後者已實作，見 [QUEUE-TW.md](./QUEUE-TW.md)；兩者刻意不共用實例，以免故障域糾纏）。
 
 **不起 triggerer**：目前只用 `BashOperator`，沒有 deferrable operator。
 
@@ -301,7 +303,6 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 | 項目 | 為什麼不做 | 觸發點 |
 |---|---|---|
 | **Seeding DAG** | 會讓「示範資料產生器」變成常駐系統的一部分；且會**翻轉** [CLOUD_LAYER-TW §1.7.7](./CLOUD_LAYER-TW.md) 已寫定的 freshness 立場 | 需要 BI 圖表持續有資料時。屆時 freshness 恢復為有意義的 gate，§1.7.7 的規則表要同步改 |
-| **Celery + Redis** | 與 Airflow 正交（見〈範圍與職責邊界〉），解的是 `BackgroundTasks` 的持久化問題 | 需要 API 水平擴展時 |
 | **OpenTelemetry** | 需要先有值得觀測的持續流量 | 藍圖 Phase 5 的獨立項 |
 | **Cosmos（模型級 task）** | 13 個 model，收益與相依成本不成比例 | model 數量成長到層級 task 看不清依賴時 |
 | **triggerer / deferrable** | 目前只有 `BashOperator` | 引入 sensor 時 |
@@ -437,7 +438,8 @@ dbt build --select path:models/marts         assert_fct_orders_complete_projecti
   → 回流 `fct_orders`，`promotions` 0→15；對照組 5 筆（age -3/150/999）正確留在 quarantine；
   連跑兩次第二次 `written=0`（冪等）；ODS 全程未被修改（Bounded Writeback）
 - ⬜ Seeding DAG（見 §4）
-- ⬜ Celery + Redis、OpenTelemetry（藍圖 Phase 5 的其他項）
+- ✅ Celery + Redis（已實作，與本層正交；見 [QUEUE-TW.md](./QUEUE-TW.md)）
+- ⬜ OpenTelemetry（藍圖 Phase 5 的其他項）
 
 ## 7. 相依與版本
 

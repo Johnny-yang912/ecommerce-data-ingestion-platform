@@ -11,7 +11,7 @@ Celery 應用實例：攝入路徑的任務佇列（取代 FastAPI BackgroundTas
 """
 
 from celery import Celery
-from celery.signals import setup_logging, worker_process_init
+from celery.signals import beat_init, setup_logging, worker_process_init
 
 from config import settings
 from logging_config import configure_logging
@@ -81,9 +81,36 @@ celery_app.conf.update(
     # WARNING，log level 從此失去意義、告警規則也跟著失準。
     worker_redirect_stdouts=False,
 
+    # 週期恢復掃描。原本是 FastAPI lifespan 裡的 asyncio 迴圈（行程內狀態，
+    # 多 uvicorn worker 會各跑一份），搬到 Beat 之後 API 行程才真正無狀態。
+    beat_schedule={
+        "recovery-scan": {
+            "task": "tasks.scan_and_dispatch",
+            "schedule": float(settings.scan_interval_seconds),
+        },
+    },
+
     timezone="UTC",
     enable_utc=True,
 )
+
+
+@beat_init.connect
+def _initial_recovery_scan(**_kwargs) -> None:
+    """
+    Beat 啟動時立刻補一次掃描。
+
+    Beat 的第一次 tick 要等滿一個 schedule 間隔（預設 300s）才發生，中間如果有
+    上一輪留下的 pending / stale processing，就會多躺 5 分鐘沒人管——原本掛在
+    FastAPI lifespan 的 startup recovery 正是為了填這個洞。
+
+    掛 beat_init 而非 API 的 lifespan，是因為「排程器重啟」才是該補掃的時機：
+    API 重啟不代表有東西需要恢復，而 API 若跑多個行程，掛在 lifespan 會變成
+    每個行程各補掃一次。
+    """
+    from tasks import scan_and_dispatch_task
+
+    scan_and_dispatch_task.delay()
 
 
 @setup_logging.connect

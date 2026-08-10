@@ -1,5 +1,4 @@
 import uuid
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -13,13 +12,11 @@ import structlog
 from structlog.contextvars import clear_contextvars, bind_contextvars
 from database import SessionLocal
 from models import Raw
-from process import scan_and_recover
 from tasks import process_raw_event_task
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from logging_config import configure_logging
 from auth import verify_api_key
-from config import settings
 
 configure_logging()
 logger = structlog.get_logger()
@@ -66,8 +63,8 @@ def _enqueue(raw_id: int) -> bool:
     刻意吞掉所有例外：呼叫此函式時 Raw 已經 commit 落地了，broker 掛掉不該讓
     POST /orders 回 500。回 500 會讓上游重送 → 同一個 order_id 灌出一批 Raw →
     全數走到 `duplicate` 終態變成雜訊，但資料其實早就收下了。正確的語意是
-    「已受理（pending），處理會延遲」——scan_and_recover 每 scan_interval_seconds
-    就會把這些沒派成功的 pending 撿回來重派。
+    「已受理（pending），處理會延遲」——Beat 的 tasks.scan_and_dispatch 每
+    scan_interval_seconds 就會把這些沒派成功的 pending 撿回來重派。
 
     與 has_clean_error 非阻斷是同一套原則：**已經成立的事實，不因下游故障而回退**。
 
@@ -83,29 +80,11 @@ def _enqueue(raw_id: int) -> bool:
         return False
 
 
-async def _periodic_scan():
-    while True:
-        await asyncio.sleep(settings.scan_interval_seconds)
-        try:
-            raw_ids = await asyncio.to_thread(scan_and_recover)
-            for raw_id in raw_ids:
-                await asyncio.to_thread(_enqueue, raw_id)
-            logger.info("periodic scan 完成", count=len(raw_ids))
-        except Exception as e:
-            logger.error("periodic scan 失敗", exc_info=True)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    raw_ids = await asyncio.to_thread(scan_and_recover)
-    for raw_id in raw_ids:
-        await asyncio.to_thread(_enqueue, raw_id)
-    logger.info("startup recovery 完成", count=len(raw_ids))
-    asyncio.create_task(_periodic_scan())
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
+# 恢復掃描（stale processing 重設 + pending 補派）已搬到 Celery Beat，見
+# tasks.scan_and_dispatch_task。原本它是掛在 lifespan 上的 asyncio 迴圈——那是
+# **行程內狀態**，API 一旦跑多個 uvicorn worker 就會每個行程各跑一份掃描。
+# 移走之後 API 行程不再持有任何背景狀態，啟動時也不做任何恢復工作。
+app = FastAPI()
 app.add_middleware(RequestContextMiddleware)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

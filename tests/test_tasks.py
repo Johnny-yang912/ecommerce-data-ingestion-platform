@@ -11,7 +11,8 @@ from unittest.mock import MagicMock, patch, AsyncMock
 import main
 from main import create_order, _enqueue
 from celery_app import celery_app
-from tasks import process_raw_event_task
+from config import settings
+from tasks import process_raw_event_task, scan_and_dispatch_task
 
 
 # ─── celery_app 設定契約 ──────────────────────────────────────────────────────
@@ -135,6 +136,80 @@ class TestProcessRawEventTask:
         """
         assert process_raw_event_task.max_retries in (None, 0) or \
             not getattr(process_raw_event_task, "autoretry_for", ())
+
+
+# ─── Beat 排程：週期恢復掃描 ──────────────────────────────────────────────────
+
+class TestBeatSchedule:
+
+    def test_recovery_scan_is_scheduled(self):
+        """
+        恢復掃描必須真的排進 Beat。漏了這條，佇列本身救不回來的那一半
+        （crash 在 claim commit 之後、卡在 processing 的記錄）會永久卡死。
+        """
+        entry = celery_app.conf.beat_schedule["recovery-scan"]
+        assert entry["task"] == "tasks.scan_and_dispatch"
+
+    def test_schedule_interval_follows_settings(self):
+        """掃描間隔是環境設定（scan_interval_seconds），不得寫死在排程裡。"""
+        entry = celery_app.conf.beat_schedule["recovery-scan"]
+        assert entry["schedule"] == float(settings.scan_interval_seconds)
+
+    def test_beat_startup_triggers_immediate_scan(self):
+        """
+        Beat 的第一次 tick 要等滿一個間隔才發生。啟動時若不補一次掃描，
+        上一輪殘留的 pending / stale processing 會多躺一個 scan_interval 沒人管。
+        """
+        from celery_app import _initial_recovery_scan
+
+        with patch("tasks.scan_and_dispatch_task") as mock_task:
+            _initial_recovery_scan()
+
+        mock_task.delay.assert_called_once_with()
+
+
+# ─── 掃描 → 派工 ──────────────────────────────────────────────────────────────
+
+class TestScanAndDispatchTask:
+
+    def test_dispatches_every_scanned_id(self):
+        with patch("tasks.scan_and_recover", return_value=[10, 20, 30]), \
+             patch("tasks.process_raw_event_task") as mock_task:
+            count = scan_and_dispatch_task()
+
+        assert count == 3
+        assert [c[0][0] for c in mock_task.delay.call_args_list] == [10, 20, 30]
+
+    def test_no_records_dispatches_nothing(self):
+        with patch("tasks.scan_and_recover", return_value=[]), \
+             patch("tasks.process_raw_event_task") as mock_task:
+            count = scan_and_dispatch_task()
+
+        assert count == 0
+        mock_task.delay.assert_not_called()
+
+    def test_dispatch_failure_propagates(self):
+        """
+        派工失敗不吞：記錄仍是 pending，下一輪掃描會原封不動再撈一次
+        （scan_and_recover 冪等）。吞掉只會讓失敗變成看不見的靜默。
+        """
+        with patch("tasks.scan_and_recover", return_value=[1]), \
+             patch("tasks.process_raw_event_task") as mock_task:
+            mock_task.delay.side_effect = ConnectionError("redis is down")
+
+            with pytest.raises(ConnectionError):
+                scan_and_dispatch_task()
+
+
+class TestApiProcessHoldsNoBackgroundState:
+
+    def test_app_has_no_lifespan_recovery(self):
+        """
+        API 行程不得再持有背景掃描狀態——那是 lifespan 迴圈時代的東西，
+        多開一個 uvicorn worker 就會多跑一份掃描，擋住水平擴展。
+        """
+        assert not hasattr(main, "_periodic_scan")
+        assert not hasattr(main, "scan_and_recover")
 
 
 # ─── main._enqueue 的失敗語意 ─────────────────────────────────────────────────

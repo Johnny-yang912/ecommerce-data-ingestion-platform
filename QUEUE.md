@@ -348,7 +348,52 @@ While Redis is down slowapi logs `falling back to in-memory storage` and degrade
 per-process counting; on recovery it logs `Rate limit storage recovered` and the limit is back
 to a precise 60/40.
 
-### 5.6 Circuit breaker: before and after
+### 5.6 Dispatch circuit breaking: the situation, the fix, and before/after ⭐
+
+Map the parts onto something concrete first:
+
+| System | Stands for |
+|---|---|
+| The API endpoint | A restaurant's front counter |
+| PostgreSQL's `raw` table | The order book — **once written, the order exists** |
+| Redis | The conveyor that carries tickets to the kitchen |
+| Celery worker | The kitchen |
+| The recovery scan | Someone who periodically leafs through the order book and re-sends whatever never made it |
+
+#### The situation
+
+The trigger is Redis becoming unreachable (crash, restart, OOM, network partition). The
+database is still alive; the only thing broken is the path that *tells the kitchen*.
+
+The counter does not know the conveyor is broken, so for every ticket it still walks over,
+tries to load it, and stands there until the timeout. As customers pile up they queue in the
+walkway — and the degradation is **super-linear**: 1 request waits 3.8s, 8 requests wait 12.8s
+each, and at 48 requests 47 of them get no response within 120 seconds (§2.2 has the full curve
+and the cause).
+
+**The worst part is not the latency — it is "it actually succeeded but the customer cannot
+tell".** The code writes the order book *first* and pushes to the conveyor *second*, so those
+47 requests had already persisted their data while the customer saw only a timeout. A timeout
+is semantically undefined, so the only thing they can do is send it again — the same order
+arrives a second and third time and turns into a pile of `duplicate` downstream. At a scale of
+a hundred million records a day, one ten-minute incident manufactures millions of duplicate
+records that can no longer be told apart after the fact.
+
+#### The fix
+
+The same idea as the breaker in a household fuse box: rather than repeatedly slamming into
+something that is broken, cut the connection first. After three consecutive failed loads, put
+up a note saying "stop trying" — from then on only the order book is written and the conveyor
+is not touched at all. Every 30 seconds **one** request goes to check whether the conveyor is
+back; once it is, the note comes down and normal service resumes.
+
+Skipping the push is safe because **someone leafs through the order book anyway**: tickets are
+never lost, they just reach the kitchen a few minutes later. That fallback was always there —
+the problem was that **entering the fallback cost more than the fallback itself**, and the
+breaker reduces that cost to zero. The design trade-offs (why the state is per-process, why
+half-open must be single-flight) are in §2.2 and `circuit_breaker.py`'s module docstring.
+
+#### Before and after
 
 Redis fully stopped, 4 uvicorn workers, same script:
 
@@ -374,6 +419,14 @@ After the broker recovered, each of the 4 processes logged one `circuit_closed` 
 returned to 10–51ms with no restart. Across the whole incident there were **0** `派工失敗`
 error logs (pre-open failures are recorded as breaker state transitions instead), against one
 traceback per failed request before the change.
+
+#### The side effect: the problem moves to the back door
+
+Once the counter is taking orders at full speed again, the pile of unprocessed tickets in the
+order book also grows at full speed — one ten-minute incident can leave hundreds of thousands.
+If the person leafing through the book tries to carry them all to the kitchen in one go, they
+are the ones who collapse; the problem has merely moved from the front door to the back. So the
+scan must be bounded too: the design is in §4.1, the measurements in the next section, **§5.7**.
 
 ### 5.7 Bounded scanning: measurements
 

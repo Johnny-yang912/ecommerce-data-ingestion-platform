@@ -141,3 +141,64 @@ class TestStaleBasis:
 
         assert try_claim_raw(mock_db, 1) is True
         assert "processing_started_at" in captured[0]
+
+
+# ─── 分頁與寬限期 ⭐ ──────────────────────────────────────────────────────────
+#
+# 原本 scan_and_recover 是「一次撈完所有 pending」。在攝入量大的情境下，一次
+# broker 事故就會累積出數十萬筆，全部載進一個 list 再逐一派工，等於把攝入層的
+# 崩潰原封不動搬到恢復路徑上。
+
+class TestScanPagination:
+
+    @staticmethod
+    def _queries(mock_db):
+        return [str(c[0][0]) for c in mock_db.execute.call_args_list]
+
+    def test_both_queries_are_limited(self):
+        """stale 與 pending 兩段都要有上界——worker 整批死掉時 stale 也可能很大。"""
+        mock_db = make_scan_db([scalars_result([]), scalars_result([])])
+
+        with patch("process.SessionLocal", return_value=mock_db):
+            scan_and_recover()
+
+        for q in self._queries(mock_db):
+            assert "LIMIT" in q.upper()
+
+    def test_pending_query_uses_id_cursor(self):
+        """
+        派工不改變 status，所以單純 LIMIT 每輪都會撈到同一批最前面的記錄，
+        永遠到不了積壓後半段。必須有 id > after_id 這個游標。
+        """
+        mock_db = make_scan_db([scalars_result([]), scalars_result([])])
+
+        with patch("process.SessionLocal", return_value=mock_db):
+            scan_and_recover(after_id=500)
+
+        pending_query = self._queries(mock_db)[-1]
+        assert "raw.id >" in pending_query
+        assert "ORDER BY raw.id" in pending_query
+
+    def test_pending_query_has_grace_period(self):
+        """
+        剛攝入的 pending 不由掃描接手：攝入路徑正常會在毫秒內派出去，掃描此時
+        介入只是為同一筆多送一則訊息。用 received_at（資料躺多久），不是
+        processing_started_at（這次處理跑多久）——兩個問題不同。
+        """
+        mock_db = make_scan_db([scalars_result([]), scalars_result([])])
+
+        with patch("process.SessionLocal", return_value=mock_db):
+            scan_and_recover()
+
+        pending_query = self._queries(mock_db)[-1]
+        assert "received_at <" in pending_query
+        assert "processing_started_at" not in pending_query
+
+    def test_returns_at_most_one_page(self):
+        page = list(range(1, process.SCAN_BATCH_SIZE + 1))
+        mock_db = make_scan_db([scalars_result([]), scalars_result(page)])
+
+        with patch("process.SessionLocal", return_value=mock_db):
+            result = scan_and_recover()
+
+        assert len(result) == process.SCAN_BATCH_SIZE

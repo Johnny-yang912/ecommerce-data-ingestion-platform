@@ -18,6 +18,19 @@ MAX_PROCESS_RETRIES = 3
 MAX_STATUS_RETRIES = 3
 STALE_PROCESSING_MINUTES = 10
 
+# 單輪掃描取回的上限。原本是「一次撈完所有 pending」——在攝入量大的情境下，
+# 一次 broker 事故就會累積出數十萬筆，全部載進一個 Python list 再逐一派工，
+# 等於把攝入層的崩潰原封不動搬到恢復路徑上。
+SCAN_BATCH_SIZE = 5000
+
+# 剛攝入的 pending 不由掃描接手：正常情況下攝入路徑會在毫秒內把它派出去，
+# 掃描此時介入只會為同一筆多送一則訊息（CAS 擋得住，但純屬浪費）。
+# 只有「躺了超過寬限期還是 pending」才代表快路徑真的失手了。
+# ⚠️ 這裡用 received_at 是對的——問的正是「這筆資料躺了多久」；
+#    而 stale 判定問的是「這次處理跑了多久」，故用 processing_started_at。
+#    兩個問題不同，基準不同，別把它們混在一起（見 scan_and_recover 的說明）。
+PENDING_GRACE_SECONDS = 60
+
 
 def try_claim_raw(db, raw_id: int) -> bool:
     # 搶佔成功的同時蓋上 processing_started_at：stale 判定要問的是「這次處理跑了多久」，
@@ -258,12 +271,23 @@ def process_raw_event(raw_id: int) -> None:
         db.close()
 
 
-def scan_and_recover() -> list[int]:
+def scan_and_recover(limit: int = SCAN_BATCH_SIZE, after_id: int = 0) -> list[int]:
     """
-    掃描 stuck records 並回傳需要重新處理的 raw_id list。
+    掃描 stuck records 並回傳**一頁**需要重新處理的 raw_id。
 
     Step 1: stale processing（> STALE_PROCESSING_MINUTES）→ 重設為 pending
-    Step 2: 收集所有 pending（含剛重設的）回傳給 caller 排程
+    Step 2: 收集躺超過 PENDING_GRACE_SECONDS 的 pending（含剛重設的），
+            以 id 為游標往後取一頁回傳給 caller 排程
+
+    ── 為什麼要分頁，以及為什麼游標是 id ─────────────────────────────────────
+
+    派工**不會改變 status**——記錄要等 worker 搶佔成功才離開 pending。所以單純加
+    `LIMIT` 是不夠的：每一輪都會撈到同一批最前面的記錄，永遠到不了後面。必須用
+    `id > after_id` 當游標往前推，caller 才能一頁一頁走完積壓（見
+    tasks.scan_and_dispatch_task 的迴圈）。
+
+    分頁的代價是「同一輪內，若 Step 1 把某筆 id < after_id 的記錄重設為 pending，
+    這一輪會跳過它」——它會在下一輪掃描被撈到，延遲一個掃描間隔，可接受。
 
     ── 為什麼逾時基準是 processing_started_at 而不是 received_at ──────────────
 
@@ -300,9 +324,10 @@ def scan_and_recover() -> list[int]:
         threshold = datetime.now(UTC) - timedelta(minutes=STALE_PROCESSING_MINUTES)
 
         stale_ids = db.execute(
-            select(Raw.id).where(
-                and_(Raw.status == "processing", Raw.processing_started_at < threshold)
-            )
+            select(Raw.id)
+            .where(and_(Raw.status == "processing", Raw.processing_started_at < threshold))
+            .order_by(Raw.id)
+            .limit(limit)
         ).scalars().all()
 
         if stale_ids:
@@ -319,10 +344,19 @@ def scan_and_recover() -> list[int]:
             )
 
         pending_ids = db.execute(
-            select(Raw.id).where(Raw.status == "pending")
+            select(Raw.id)
+            .where(
+                and_(
+                    Raw.status == "pending",
+                    Raw.received_at < datetime.now(UTC) - timedelta(seconds=PENDING_GRACE_SECONDS),
+                    Raw.id > after_id,
+                )
+            )
+            .order_by(Raw.id)
+            .limit(limit)
         ).scalars().all()
 
-        logger.info("找到 pending 記錄待重新處理", count=len(pending_ids))
+        logger.info("找到 pending 記錄待重新處理", count=len(pending_ids), after_id=after_id)
 
         return list(pending_ids)
     finally:

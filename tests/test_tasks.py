@@ -9,10 +9,26 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import main
+import tasks
+from contextlib import contextmanager
 from main import create_order, _enqueue
 from celery_app import celery_app
 from config import settings
 from tasks import process_raw_event_task, scan_and_dispatch_task
+
+
+def _fake_lock(acquired: bool):
+    @contextmanager
+    def _lock():
+        yield acquired
+    return _lock
+
+
+@pytest.fixture
+def held_lock():
+    """取得鎖的情境：把 Redis 那層拿掉，讓測試專注在掃描與派工邏輯。"""
+    with patch("tasks._scan_lock", _fake_lock(True)):
+        yield
 
 
 # ─── celery_app 設定契約 ──────────────────────────────────────────────────────
@@ -172,33 +188,167 @@ class TestBeatSchedule:
 
 class TestScanAndDispatchTask:
 
-    def test_dispatches_every_scanned_id(self):
+    @staticmethod
+    def _dispatched(mock_task):
+        """從 apply_async 的呼叫紀錄取出被派工的 raw_id。"""
+        return [c[0][0][0] for c in mock_task.apply_async.call_args_list]
+
+    def test_dispatches_every_scanned_id(self, held_lock):
         with patch("tasks.scan_and_recover", return_value=[10, 20, 30]), \
              patch("tasks.process_raw_event_task") as mock_task:
             count = scan_and_dispatch_task()
 
         assert count == 3
-        assert [c[0][0] for c in mock_task.delay.call_args_list] == [10, 20, 30]
+        assert self._dispatched(mock_task) == [10, 20, 30]
 
-    def test_no_records_dispatches_nothing(self):
+    def test_shares_one_producer_for_the_whole_batch(self, held_lock):
+        """
+        整輪共用一條連線。`.delay()` 每次都要向 producer pool 取用，數十萬筆積壓
+        就是數十萬次取用——這是恢復路徑在規模下的主要成本之一。
+        """
+        # celery_app.producer_pool 是唯讀 property，整個 app 換掉才 patch 得動
+        with patch("tasks.scan_and_recover", return_value=[1, 2, 3]), \
+             patch("tasks.process_raw_event_task") as mock_task, \
+             patch("tasks.celery_app") as mock_app:
+            scan_and_dispatch_task()
+
+        assert mock_app.producer_pool.acquire.call_count == 1
+        producer = mock_app.producer_pool.acquire.return_value.__enter__.return_value
+        for call in mock_task.apply_async.call_args_list:
+            assert call[1]["producer"] is producer
+
+    def test_paginates_with_id_cursor_until_short_page(self, held_lock):
+        """
+        派工不會改變 status，所以單純 LIMIT 每輪都會撈到同一批。必須用 id 游標
+        往前推，否則永遠到不了積壓的後半段。
+        """
+        pages = [list(range(1, tasks.SCAN_BATCH_SIZE + 1)), [90001, 90002]]
+        seen_after = []
+
+        def fake_scan(after_id=0, **kw):
+            seen_after.append(after_id)
+            return pages[len(seen_after) - 1]
+
+        with patch("tasks.scan_and_recover", side_effect=fake_scan), \
+             patch("tasks.process_raw_event_task"):
+            count = scan_and_dispatch_task()
+
+        assert seen_after == [0, tasks.SCAN_BATCH_SIZE], "第二頁要從第一頁最後一個 id 續傳"
+        assert count == tasks.SCAN_BATCH_SIZE + 2
+
+    def test_stops_at_max_rounds_and_warns(self, held_lock):
+        """
+        單次 task 的工作量必須有上界，否則一次事故的積壓會讓單一 worker 槽位被
+        佔住很久。清不完就留給下一輪 tick——並且要留下「跟不上」的訊號。
+        """
+        full_page = list(range(1, tasks.SCAN_BATCH_SIZE + 1))
+
+        with patch("tasks.scan_and_recover", return_value=full_page), \
+             patch("tasks.process_raw_event_task"), \
+             patch.object(tasks.logger, "warning") as mock_warning:
+            count = scan_and_dispatch_task()
+
+        assert count == tasks.SCAN_BATCH_SIZE * tasks.SCAN_MAX_ROUNDS
+        assert mock_warning.called
+
+    def test_no_records_dispatches_nothing(self, held_lock):
         with patch("tasks.scan_and_recover", return_value=[]), \
              patch("tasks.process_raw_event_task") as mock_task:
             count = scan_and_dispatch_task()
 
         assert count == 0
-        mock_task.delay.assert_not_called()
+        mock_task.apply_async.assert_not_called()
 
-    def test_dispatch_failure_propagates(self):
+    def test_dispatch_failure_propagates(self, held_lock):
         """
         派工失敗不吞：記錄仍是 pending，下一輪掃描會原封不動再撈一次
         （scan_and_recover 冪等）。吞掉只會讓失敗變成看不見的靜默。
         """
         with patch("tasks.scan_and_recover", return_value=[1]), \
              patch("tasks.process_raw_event_task") as mock_task:
-            mock_task.delay.side_effect = ConnectionError("redis is down")
+            mock_task.apply_async.side_effect = ConnectionError("redis is down")
 
             with pytest.raises(ConnectionError):
                 scan_and_dispatch_task()
+
+
+class TestScanOverlapProtection:
+
+    def test_skips_when_another_round_holds_the_lock(self):
+        """
+        Beat 不管上一輪跑完沒有就會再派。積壓深時兩輪重疊會撈到同一批記錄、
+        送出兩份訊息——CAS 保得住正確性，但佇列量平白翻倍。
+        """
+        with patch("tasks._scan_lock", _fake_lock(False)), \
+             patch("tasks.scan_and_recover") as mock_scan:
+            assert scan_and_dispatch_task() == 0
+
+        mock_scan.assert_not_called()
+
+    def test_proceeds_when_lock_backend_errors(self):
+        """
+        鎖是最佳化不是正確性要求。取鎖本身失敗時要照常掃描——跳過的代價是記錄
+        卡著沒人管，比重複派工嚴重得多。
+        """
+        mock_client = MagicMock()
+        mock_client.set.side_effect = ConnectionError("redis is down")
+
+        with patch("tasks.redis.Redis.from_url", return_value=mock_client), \
+             patch("tasks.scan_and_recover", return_value=[7]), \
+             patch("tasks.process_raw_event_task") as mock_task:
+            assert scan_and_dispatch_task() == 1
+
+        assert mock_task.apply_async.called
+
+    def test_releases_only_its_own_lock(self):
+        """
+        先 get 再 delete 不是原子的：中間鎖可能已過期並被別人取得，那樣會誤刪
+        別人的鎖、讓兩輪掃描同時進行。釋放走 Lua 的 compare-and-delete。
+        """
+        mock_client = MagicMock()
+        mock_client.set.return_value = True
+
+        with patch("tasks.redis.Redis.from_url", return_value=mock_client), \
+             patch("tasks.scan_and_recover", return_value=[]), \
+             patch("tasks.process_raw_event_task"):
+            scan_and_dispatch_task()
+
+        mock_client.eval.assert_called_once()
+        args = mock_client.eval.call_args[0]
+        assert "redis.call('del'" in args[0]
+        assert args[2] == tasks._SCAN_LOCK_KEY
+        token = args[3]
+        assert mock_client.set.call_args[0][1] == token, "釋放時比對的必須是自己寫入的 token"
+
+    def test_release_failure_does_not_break_the_scan(self):
+        """
+        釋放失敗不得讓整輪掃描算作失敗——工作已經做完了，鎖交給 TTL 過期即可。
+        往上拋只會讓 Celery 把一輪成功的掃描記成 error。
+        """
+        mock_client = MagicMock()
+        mock_client.set.return_value = True
+        mock_client.eval.side_effect = ConnectionError("redis is down")
+
+        with patch("tasks.redis.Redis.from_url", return_value=mock_client), \
+             patch("tasks.scan_and_recover", return_value=[1]), \
+             patch("tasks.process_raw_event_task"), \
+             patch.object(tasks.logger, "warning") as mock_warning:
+            assert scan_and_dispatch_task() == 1
+
+        assert mock_warning.called
+
+    def test_lock_is_set_with_nx_and_ttl(self):
+        mock_client = MagicMock()
+        mock_client.set.return_value = True
+
+        with patch("tasks.redis.Redis.from_url", return_value=mock_client), \
+             patch("tasks.scan_and_recover", return_value=[]), \
+             patch("tasks.process_raw_event_task"):
+            scan_and_dispatch_task()
+
+        kwargs = mock_client.set.call_args[1]
+        assert kwargs["nx"] is True
+        assert kwargs["ex"] == tasks._SCAN_LOCK_TTL_SECONDS
 
 
 class TestApiProcessHoldsNoBackgroundState:

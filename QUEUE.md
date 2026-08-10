@@ -229,6 +229,41 @@ result is harmless (`scan_and_recover` is idempotent, CAS blocks double processi
 wasteful. Also avoid `celery worker -B`'s embedded beat — the docs explicitly call it
 unsuitable for production.
 
+### 4.1 The scan itself must also be bounded ⭐
+
+The circuit breaker (§2.2) keeps ingestion at full speed through a broker outage — at the cost
+of `pending` accumulating at full speed too. A ten-minute incident can pile up hundreds of
+thousands of records. The scan used to be "select every pending row, dispatch them one by one",
+which simply relocates the collapse ingestion just avoided onto the recovery path.
+
+Three limits, all required:
+
+| Mechanism | What it prevents |
+|---|---|
+| **`LIMIT` + an `id` cursor** (`SCAN_BATCH_SIZE`) | Memory is a function of batch size, not of total backlog |
+| **Cap on pages per run** (`SCAN_MAX_ROUNDS`) | One incident cannot monopolise a worker slot; whatever is left waits for the next tick |
+| **A Redis lock** | Beat dispatches on schedule regardless of whether the previous run finished; overlap sends two messages per record |
+
+**Why the cursor is required and `LIMIT` alone is not**: dispatching does not change `status` —
+a record only leaves `pending` once a worker claims it. So every round would fetch the same
+leading rows and never reach the rest. The query must advance with `id > after_id`.
+
+**The grace period** (`PENDING_GRACE_SECONDS`): freshly ingested `pending` rows are left alone.
+Under normal conditions the ingestion path dispatches them within milliseconds, so the scan
+stepping in merely adds a second message for the same record. `received_at` is the right basis
+here — the question really is "how long has this record been sitting around"; do not confuse it
+with §3.1's staleness check, which asks "how long has this attempt been running".
+
+**The lock is an optimisation, not a correctness requirement**: if acquiring it fails (a Redis
+hiccup) the scan runs anyway; only an explicitly held lock causes a skip — skipping leaves
+records unattended, which is far worse than duplicate dispatch. If the scan task is SIGKILLed
+the lock lingers until its TTL (one scan interval), costing one tick.
+
+**Tuning the cap**: the upper bound is `SCAN_MAX_ROUNDS × SCAN_BATCH_SIZE`, which is effectively
+**the recovery path's dispatch rate limit** (at most this many per scan interval). Tune it
+against worker consumption rate — dispatching faster than workers consume only grows the queue;
+it does not drain the backlog sooner.
+
 ---
 
 ## 5. Live verification (2026-08-10) ⭐
@@ -339,6 +374,36 @@ After the broker recovered, each of the 4 processes logged one `circuit_closed` 
 returned to 10–51ms with no restart. Across the whole incident there were **0** `派工失敗`
 error logs (pre-open failures are recorded as breaker state transitions instead), against one
 traceback per failed request before the change.
+
+### 5.7 Bounded scanning: measurements
+
+Same environment, worker concurrency 4, Beat disabled so each run could be observed.
+
+**Throughput** (60,000-record backlog, cleared in one run): publishing at roughly
+**2,140 msg/s**, workers consuming roughly **305 records/s**. All 60,000 ended `processed`
+with 60,000 ODS rows — reconciled exactly.
+
+**Per-run cap and cursor resumption** (120,000 backlog against a 100,000 cap):
+
+| | Dispatched | Remaining `pending` |
+|---|---|---|
+| Scan #1 | **100,000** (raised the "backlog not cleared" warning) | 20,000 |
+| Scan #2 | **20,000** | 0 |
+
+ODS ended up exactly +120,000 with **zero** `duplicate` rows — proving the cursor neither
+skipped records nor re-dispatched already-processed ones.
+
+**Overlap protection**: two scan messages fired almost simultaneously against the same backlog;
+the second logged `recovery scan 略過：上一輪仍在進行` and dispatched nothing.
+
+**Grace period**: 50 records with `received_at = now()` and 30 from five minutes ago inserted
+together; the scan returned only the 30 — the fresh ones are left to the ingestion path.
+
+**Batch publishing helps far less than expected**: measured, `.delay()` reached 2,332 msg/s and
+a shared producer 2,563 msg/s — a mere **1.1×**. Celery's `.delay()` already reuses the producer
+pool, so acquisition is much cheaper than assumed. The change stays (it costs nothing), but it
+is **not** where this section's benefit comes from — pagination, the per-run cap and overlap
+protection are.
 
 ---
 

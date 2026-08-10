@@ -403,11 +403,31 @@ Redis fully stopped, 4 uvicorn workers, same script:
 | Breaker, 48 concurrent | 48/48 returned 200; batch took 18.4s |
 | Breaker, sustained load of 200 | **p50 = 5ms, p90 = 7ms**; 14 of 200 exceeded 1s |
 
-The first wave is still slow (18.4s) because with 48 requests arriving simultaneously the
-breaker has not opened yet — none of the three failures has *returned*, so the whole wave is
-already past the gate. That is inherent: a breaker protects everything after the first wave,
-bounding the cost at "one concurrency wave per process" rather than per request. Under
-sustained traffic that wave is a few seconds at the start of the incident.
+**A breaker has to hit the wall a few times before it engages.** That is inherent, and it has
+two faces:
+
+*Under high concurrency*: the first wave is still slow (18.4s) because with 48 requests arriving
+simultaneously none of the three failures has *returned* yet, so the whole wave is already past
+the gate. The cost is bounded at "one concurrency wave per process" rather than per request;
+under sustained traffic that wave is just a few seconds at the start of the incident.
+
+*Under low traffic*: each process needs `ENQUEUE_BREAKER_FAILURE_THRESHOLD` (3) consecutive
+failures to open, and requests are spread round-robin across the uvicorn processes. Bringing the
+whole fleet into a protected state therefore takes roughly **processes × threshold** failed
+requests — 12 with 4 processes. Measured: six requests sent sequentially during an outage took
+7–18s each, and the logs show only **2** of the 4 processes ever logged `circuit_opened`; the
+rest never opened at all, so callers paid the full unprotected timeout.
+
+**Not engaging under low traffic is acceptable, because there is nothing to protect at that
+point.** What the breaker guards against is §2.2's super-linear collapse, and collapse is a
+**concurrency phenomenon**: six sequential requests do not queue behind each other, do not
+exhaust the connection pool, and do not time out clients en masse — they are just six slow
+requests. When the disaster being averted does not exist, not intervening is the right call.
+
+**The threshold is deliberately not lowered**: setting it to 1 would let a single transient blip
+open the circuit for 30 seconds, during which every record falls through to the recovery scan
+(up to one scan interval of delay). Demanding evidence that something is genuinely broken is the
+better trade than the reverse.
 
 The remaining 14/200 tail is **not the dispatch** — it is the rate-limit storage re-probe.
 Broken out: after the circuit opens, `POST /orders` shows 4 requests at 0.02s (dispatch now

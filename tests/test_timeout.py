@@ -8,7 +8,7 @@ database.py 設定          : pool_size / max_overflow / pool_timeout / statemen
 
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import HTTPException
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 
 from main import process_raw, create_order, get_raw, MAX_RAW_WRITE_RETRIES
@@ -32,7 +32,7 @@ class TestPoolExhaustion:
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              pytest.raises(HTTPException) as exc_info:
-            await create_order(mock_request, SAMPLE_ORDER, MagicMock(spec=BackgroundTasks), client_id="test-client")
+            await create_order(mock_request, SAMPLE_ORDER, client_id="test-client")
 
         assert exc_info.value.status_code == 503
         # pool 耗盡不應 retry
@@ -45,30 +45,27 @@ class TestPoolExhaustion:
 
 class TestProcessRawEndpoint:
 
-    async def test_force_false_only_queries_existence(self, mock_request, mock_bg):
-        """force=False：只 SELECT 確認記錄存在，不修改 DB，然後排程 background task。"""
+    async def test_force_false_only_queries_existence(self, mock_request, mock_enqueue):
+        """force=False：只 SELECT 確認記錄存在，不修改 DB，然後派工到 Celery。"""
         mock_db = MagicMock()
         mock_db.execute.return_value.scalar_one_or_none.return_value = MagicMock()
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            result = await process_raw(mock_request, raw_id=42, background_tasks=mock_bg, force=False)
+            result = await process_raw(mock_request, raw_id=42, force=False)
 
         # 只有 1 次 SELECT，0 次 commit
         assert mock_db.execute.call_count == 1
         assert mock_db.commit.call_count == 0
         assert mock_db.close.call_count == 1
 
-        # background_tasks.add_task 帶入 process_raw_event 和正確 raw_id
-        mock_bg.add_task.assert_called_once()
-        fn, raw_id_arg = mock_bg.add_task.call_args[0]
-        assert fn.__name__ == "process_raw_event"
-        assert raw_id_arg == 42
+        # 派工到 Celery，帶正確 raw_id
+        mock_enqueue.assert_called_once_with(42)
 
         assert result == {"raw_id": 42, "triggered": True, "force": False}
 
-    async def test_force_true_resets_status_then_schedules(self, mock_request, mock_bg):
-        """force=True：SELECT + UPDATE status（commit）→ 再排程 background task。"""
+    async def test_force_true_resets_status_then_schedules(self, mock_request, mock_enqueue):
+        """force=True：SELECT + UPDATE status（commit）→ 再派工到 Celery。"""
         mock_raw = MagicMock()
         mock_raw.status = "error"   # 明確設定，force=True 只允許 error / duplicate
         mock_db = MagicMock()
@@ -76,46 +73,46 @@ class TestProcessRawEndpoint:
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            result = await process_raw(mock_request, raw_id=99, background_tasks=mock_bg, force=True)
+            result = await process_raw(mock_request, raw_id=99, force=True)
 
         # SELECT + UPDATE = 2 次 execute，1 次 commit
         assert mock_db.execute.call_count == 2
         assert mock_db.commit.call_count == 1
         assert mock_db.close.call_count == 1
-        mock_bg.add_task.assert_called_once()
+        mock_enqueue.assert_called_once_with(99)
         assert result == {"raw_id": 99, "triggered": True, "force": True}
 
-    async def test_process_raw_event_not_called_directly(self, mock_request, mock_bg):
+    async def test_process_raw_event_not_executed_inline(self, mock_request, mock_enqueue):
         """
-        process_raw_event 不應被直接 call，只透過 background_tasks.add_task 排程。
-        這驗證 /process_raw 不再 block event loop。
+        process_raw_event 不應在 request 行程內執行，只透過 Celery 派工。
+        這驗證 /process_raw 不 block event loop。
         """
         mock_db = MagicMock()
         mock_db.execute.return_value.scalar_one_or_none.return_value = MagicMock()
 
-        with patch("main.process_raw_event") as mock_fn, \
+        with patch("process.process_raw_event") as mock_fn, \
              patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            await process_raw(mock_request, raw_id=1, background_tasks=mock_bg, force=False)
+            await process_raw(mock_request, raw_id=1, force=False)
 
         mock_fn.assert_not_called()
-        mock_bg.add_task.assert_called_once()
+        mock_enqueue.assert_called_once_with(1)
 
-    async def test_raw_id_not_found_returns_404(self, mock_request, mock_bg):
-        """raw_id 不存在 → 404，background task 不應被排程。"""
+    async def test_raw_id_not_found_returns_404(self, mock_request, mock_enqueue):
+        """raw_id 不存在 → 404，不應派工。"""
         mock_db = MagicMock()
         mock_db.execute.return_value.scalar_one_or_none.return_value = None  # not found
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"), \
              pytest.raises(HTTPException) as exc_info:
-            await process_raw(mock_request, raw_id=99999, background_tasks=mock_bg, force=False)
+            await process_raw(mock_request, raw_id=99999, force=False)
 
         assert exc_info.value.status_code == 404
-        mock_bg.add_task.assert_not_called()
+        mock_enqueue.assert_not_called()
         assert mock_db.close.call_count == 1
 
-    async def test_force_true_on_processed_status_returns_400(self, mock_request, mock_bg):
+    async def test_force_true_on_processed_status_returns_400(self, mock_request, mock_enqueue):
         """
         force=True 但 raw.status = 'processed'（不允許的狀態）→ 400 Bad Request。
 
@@ -130,10 +127,10 @@ class TestProcessRawEndpoint:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"), \
              pytest.raises(HTTPException) as exc_info:
-            await process_raw(mock_request, raw_id=1, background_tasks=mock_bg, force=True)
+            await process_raw(mock_request, raw_id=1, force=True)
 
         assert exc_info.value.status_code == 400
-        mock_bg.add_task.assert_not_called()
+        mock_enqueue.assert_not_called()
         assert mock_db.close.call_count == 1
 
 

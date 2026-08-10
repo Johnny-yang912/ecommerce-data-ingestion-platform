@@ -6,8 +6,8 @@ pytest 會自動找到並注入這裡定義的 fixture，test 函式直接以參
 """
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock
-from fastapi import BackgroundTasks, Request
+from unittest.mock import MagicMock, AsyncMock, patch
+from fastapi import Request
 
 from helpers import make_sample_order
 
@@ -27,9 +27,15 @@ def mock_request() -> MagicMock:
 
 
 @pytest.fixture
-def mock_bg() -> MagicMock:
-    """Mock FastAPI BackgroundTasks。"""
-    return MagicMock(spec=BackgroundTasks)
+def mock_enqueue():
+    """
+    Patch main._enqueue（派工到 Celery 的單一出口），回傳 True 表示成功入列。
+
+    測試一律 patch 這一層而非 process_raw_event_task：`_enqueue` 是 endpoint 與
+    佇列之間的唯一接縫，patch 它就不必碰 Celery 的 app 狀態，也不需要 broker。
+    """
+    with patch("main._enqueue", return_value=True) as m:
+        yield m
 
 
 @pytest.fixture

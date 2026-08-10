@@ -108,32 +108,27 @@ class TestScanAndRecover:
 class TestLifespanStartup:
 
     async def test_startup_requeues_all_pending_records(self):
-        """Startup 找到 2 筆 pending → process_raw_event 各被呼叫一次。"""
-        process_calls = []
-
+        """Startup 找到 2 筆 pending → 各派工一次（不在 API 行程內直接處理）。"""
         with patch("main.scan_and_recover", return_value=[10, 20]), \
-             patch("main.process_raw_event", side_effect=lambda r: process_calls.append(r)), \
+             patch("main._enqueue", return_value=True) as mock_enqueue, \
              patch("main._periodic_scan", new_callable=AsyncMock):
 
             async with lifespan(app):
-                # 等 asyncio.to_thread tasks 在 thread pool 執行完
-                await asyncio.sleep(0.1)
+                pass
 
-        assert sorted(process_calls) == [10, 20]
+        assert sorted(c[0][0] for c in mock_enqueue.call_args_list) == [10, 20]
 
-    async def test_startup_with_no_records_does_not_call_process(self):
-        """Startup scan 沒有記錄 → process_raw_event 不被呼叫，scan 只呼叫一次。"""
-        process_calls = []
-
+    async def test_startup_with_no_records_does_not_enqueue(self):
+        """Startup scan 沒有記錄 → 不派工，scan 只呼叫一次。"""
         with patch("main.scan_and_recover", return_value=[]) as mock_scan, \
-             patch("main.process_raw_event", side_effect=lambda r: process_calls.append(r)), \
+             patch("main._enqueue", return_value=True) as mock_enqueue, \
              patch("main._periodic_scan", new_callable=AsyncMock):
 
             async with lifespan(app):
-                await asyncio.sleep(0.1)
+                pass
 
         mock_scan.assert_called_once()
-        assert process_calls == []
+        mock_enqueue.assert_not_called()
 
 
 # ─── _periodic_scan 測試 ─────────────────────────────────────────────────────
@@ -143,17 +138,8 @@ class TestLifespanStartup:
 
 class TestPeriodicScan:
 
-    async def test_periodic_scan_schedules_found_records(self):
-        """Periodic scan 一輪：找到記錄 → process_raw_event 被呼叫。"""
-        process_calls = []
-        created_tasks = []
-        orig_create_task = asyncio.create_task
-
-        def capture_task(coro):
-            t = orig_create_task(coro)
-            created_tasks.append(t)
-            return t
-
+    async def test_periodic_scan_enqueues_found_records(self):
+        """Periodic scan 一輪：找到記錄 → 各派工一次。"""
         sleep_count = [0]
         async def mock_sleep(n):
             sleep_count[0] += 1
@@ -161,19 +147,14 @@ class TestPeriodicScan:
                 raise asyncio.CancelledError()
 
         with patch("main.scan_and_recover", return_value=[7, 8]), \
-             patch("main.process_raw_event", side_effect=lambda r: process_calls.append(r)), \
-             patch("asyncio.sleep", side_effect=mock_sleep), \
-             patch("asyncio.create_task", side_effect=capture_task):
+             patch("main._enqueue", return_value=True) as mock_enqueue, \
+             patch("asyncio.sleep", side_effect=mock_sleep):
             try:
                 await _periodic_scan()
             except asyncio.CancelledError:
                 pass
 
-        # asyncio.sleep 已還原，等待 to_thread tasks 完成
-        if created_tasks:
-            await asyncio.gather(*created_tasks, return_exceptions=True)
-
-        assert sorted(process_calls) == [7, 8]
+        assert sorted(c[0][0] for c in mock_enqueue.call_args_list) == [7, 8]
 
     async def test_periodic_scan_exception_does_not_break_loop(self):
         """第 1 輪 scan 拋出例外 → 記 ERROR log，第 2 輪正常繼續。"""

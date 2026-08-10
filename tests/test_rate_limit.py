@@ -64,7 +64,7 @@ def client():
     app.dependency_overrides[verify_api_key] = lambda: "test-client"
     try:
         with patch("main.scan_and_recover", return_value=[]), \
-             patch("main.process_raw_event"), \
+             patch("main._enqueue", return_value=True), \
              patch("main.SessionLocal", return_value=_make_order_db()):
             with TestClient(app) as c:
                 yield c
@@ -188,7 +188,7 @@ class TestRealAuthDrivesLimiter:
             "key-b": "client-b",
         })
         with patch("main.scan_and_recover", return_value=[]), \
-             patch("main.process_raw_event"), \
+             patch("main._enqueue", return_value=True), \
              patch("main.SessionLocal", return_value=_make_order_db()):
             with TestClient(app) as c:
                 yield c

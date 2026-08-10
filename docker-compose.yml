@@ -15,6 +15,22 @@ services:
     ports:
       - "5432:5432"   # 本機除錯用，正式可移除
 
+  # 攝入路徑的 Celery broker。刻意與 Airflow 分開（Airflow 目前是 LocalExecutor、
+  # 根本沒有 broker），兩者的故障域不該糾纏——見 ORCHESTRATION-TW〈範圍與職責邊界〉。
+  #
+  # 不開 appendonly：Redis 預設只有 RDB 快照，crash 可能丟掉最後幾秒的訊息。這裡刻意
+  # 不用 fsync 換那個保證，因為 process.scan_and_recover 已經是資料庫層的兜底——丟訊息
+  # 的後果只是「該筆延遲到下一輪掃描才處理」，而不是遺失。
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "6379:6379"   # 本機除錯用，正式可移除
+
   # 一次性 migration 服務：跑完即退出，api 等它成功才起
   migrate:
     build: .
@@ -32,8 +48,11 @@ services:
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
       API_KEYS: ${API_KEYS}
       LOG_FORMAT: json
+      CELERY_BROKER_URL: redis://redis:6379/0
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -45,6 +64,33 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+  # Celery worker：實際執行 process_raw_event 的地方。與 api 共用同一個映像，
+  # 只換啟動指令——依賴與程式碼完全一致，不會出現「API 有這個 module、worker 沒有」。
+  worker:
+    build: .
+    command: celery -A celery_app worker --loglevel=INFO --concurrency=4
+    environment:
+      DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
+      LOG_FORMAT: json
+      CELERY_BROKER_URL: redis://redis:6379/0
+      # prefork 下每個子行程有自己的 pool，同時又只跑一個任務 → pool 開大沒有意義。
+      # 4 個子行程 × (2+10) 遠低於 Postgres 預設 max_connections=100，留餘裕給 api 與 Airflow。
+      POOL_SIZE: 2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # inspect ping 是廣播＋等回覆，比 HTTP 探針慢得多 → 間隔與 start_period 都放寬。
+      test: ["CMD", "celery", "-A", "celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
 volumes:
   pgdata:

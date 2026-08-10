@@ -51,7 +51,7 @@ def client(added_objects, monkeypatch):
         return db
 
     with patch("main.scan_and_recover", return_value=[]), \
-         patch("main.process_raw_event"), \
+         patch("main._enqueue", return_value=True), \
          patch("main.SessionLocal", side_effect=_make_db):
         with TestClient(app) as c:
             yield c

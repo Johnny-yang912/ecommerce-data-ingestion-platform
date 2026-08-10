@@ -9,3 +9,7 @@ pytz==2025.2
 slowapi==0.1.9
 alembic==1.18.4
 structlog==25.5.0
+celery[redis]==5.6.3
+# redis 明確鎖版：celery[redis] 的 extra 只給範圍（kombu 目前上界 <7），
+# 不鎖的話 build 時間不同會裝到不同版本，違反本檔「一律鎖版」的前提。
+redis==6.4.0

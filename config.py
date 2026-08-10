@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     # --- 背景掃描間隔 ---
     scan_interval_seconds: int = 300
 
+    # --- Phase 5：Celery + Redis 任務佇列（取代 BackgroundTasks）---
+    # 攝入路徑的 broker URL。給預設值而非必填：Celery app 的建構是 lazy 的
+    # （import 時不連線），所以 pytest / CI 不需要真的有一台 Redis。
+    # 刻意與 Airflow 不共用實例，見 celery_app.py 的模組註解。
+    celery_broker_url: str = "redis://localhost:6379/0"
+
     # --- 日誌輸出格式：console（dev）| json（prod）---
     log_format: str = "console"
 

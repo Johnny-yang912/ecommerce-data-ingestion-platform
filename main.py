@@ -1,6 +1,6 @@
 import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -13,7 +13,8 @@ import structlog
 from structlog.contextvars import clear_contextvars, bind_contextvars
 from database import SessionLocal
 from models import Raw
-from process import process_raw_event, scan_and_recover
+from process import scan_and_recover
+from tasks import process_raw_event_task
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from logging_config import configure_logging
@@ -58,13 +59,37 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _enqueue(raw_id: int) -> bool:
+    """
+    把一筆 raw_id 派到 Celery 佇列，回傳是否成功送進 broker。
+
+    刻意吞掉所有例外：呼叫此函式時 Raw 已經 commit 落地了，broker 掛掉不該讓
+    POST /orders 回 500。回 500 會讓上游重送 → 同一個 order_id 灌出一批 Raw →
+    全數走到 `duplicate` 終態變成雜訊，但資料其實早就收下了。正確的語意是
+    「已受理（pending），處理會延遲」——scan_and_recover 每 scan_interval_seconds
+    就會把這些沒派成功的 pending 撿回來重派。
+
+    與 has_clean_error 非阻斷是同一套原則：**已經成立的事實，不因下游故障而回退**。
+
+    ⚠️ 這是同步函式，且 broker 不可用時會走完連線逾時才返回。async 路徑上的呼叫者
+    一律要用 `asyncio.to_thread` 包起來，否則會把整個 event loop 卡住——實測 broker
+    停掉時單次派工阻塞達 19 秒（已由 celery_app 的 socket timeout 收斂，但仍非零）。
+    """
+    try:
+        process_raw_event_task.delay(raw_id)
+        return True
+    except Exception:
+        logger.error("派工失敗，改由 recovery scan 接手", raw_id=raw_id, exc_info=True)
+        return False
+
+
 async def _periodic_scan():
     while True:
         await asyncio.sleep(settings.scan_interval_seconds)
         try:
             raw_ids = await asyncio.to_thread(scan_and_recover)
             for raw_id in raw_ids:
-                asyncio.create_task(asyncio.to_thread(process_raw_event, raw_id))
+                await asyncio.to_thread(_enqueue, raw_id)
             logger.info("periodic scan 完成", count=len(raw_ids))
         except Exception as e:
             logger.error("periodic scan 失敗", exc_info=True)
@@ -74,7 +99,7 @@ async def _periodic_scan():
 async def lifespan(app: FastAPI):
     raw_ids = await asyncio.to_thread(scan_and_recover)
     for raw_id in raw_ids:
-        asyncio.create_task(asyncio.to_thread(process_raw_event, raw_id))
+        await asyncio.to_thread(_enqueue, raw_id)
     logger.info("startup recovery 完成", count=len(raw_ids))
     asyncio.create_task(_periodic_scan())
     yield
@@ -108,7 +133,7 @@ async def health():
 
 @app.post("/orders")
 @limiter.limit("60/minute")
-async def create_order(request: Request, order: OrderIN, background_tasks: BackgroundTasks,
+async def create_order(request: Request, order: OrderIN,
                        client_id: str = Depends(verify_api_key)):
     bind_contextvars(client_id=client_id)
     logger.info("收到訂單請求", order_id=order.order_id)
@@ -146,8 +171,12 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
                     logger.error("raw 寫入失敗，已達最大重試次數", order_id=order.order_id, exc_info=True)
                     raise
 
-        background_tasks.add_task(process_raw_event, raw.id)
-        logger.info("raw 已建立，背景任務已排程", raw_id=raw.id)
+        # 派工必須在 db.commit() 之後：worker 走的是另一條 DB 連線，
+        # 先派工可能讓它讀不到還沒 commit 的 Raw（claim 直接落空）。
+        # to_thread：broker 不可用時 _enqueue 會阻塞，不能卡在 event loop 上。
+        queued = await asyncio.to_thread(_enqueue, raw.id)
+        logger.info("raw 已建立", raw_id=raw.id, queued=queued)
+        # 回應不受派工結果影響：資料已落地，未入列者由 recovery scan 接手（見 _enqueue）。
         return {"raw_id": raw.id, "status": "pending"}
     except SATimeoutError:
         logger.warning("connection pool 耗盡", order_id=order.order_id)
@@ -158,7 +187,7 @@ async def create_order(request: Request, order: OrderIN, background_tasks: Backg
 
 @app.post("/process_raw/{raw_id}")
 @limiter.limit("20/minute")
-async def process_raw(request: Request, raw_id: int, background_tasks: BackgroundTasks, force: bool = False,
+async def process_raw(request: Request, raw_id: int, force: bool = False,
                       client_id: str = Depends(verify_api_key)):
     logger.info("觸發 replay", raw_id=raw_id, force=force)
     db = SessionLocal()
@@ -181,8 +210,11 @@ async def process_raw(request: Request, raw_id: int, background_tasks: Backgroun
     finally:
         db.close()
 
-    background_tasks.add_task(process_raw_event, raw_id)
-    return {"raw_id": raw_id, "triggered": True, "force": force}
+    # 與 /orders 的不對稱是刻意的：replay 是人工維運動作，操作者需要知道「到底派出去了沒」，
+    # 所以 triggered 如實回報派工結果；/orders 面對的是自動化上游，回報派工失敗只會誘發
+    # 無謂的重送（見 _enqueue）。
+    triggered = await asyncio.to_thread(_enqueue, raw_id)
+    return {"raw_id": raw_id, "triggered": triggered, "force": force}
 
 
 @app.get("/raw/{raw_id}", response_model=RawOut)

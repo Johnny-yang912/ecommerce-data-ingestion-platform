@@ -15,7 +15,6 @@ Point 1 Retry 測試：POST /orders Raw 寫入 retry 機制（遷移自 test_ret
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from sqlalchemy.exc import OperationalError
-from fastapi import BackgroundTasks
 from fastapi.exceptions import RequestValidationError
 
 import main
@@ -31,10 +30,10 @@ class TestRawWriteRetry:
         mock_db.refresh.side_effect = lambda obj: setattr(obj, "id", 999)
 
         with patch("main.SessionLocal", return_value=mock_db), \
-             patch("main.process_raw_event"), \
+             patch("main._enqueue", return_value=True), \
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="test-client")
+            result = await create_order(mock_request, sample_order, client_id="test-client")
 
         assert mock_db.commit.call_count == 1
         assert mock_db.rollback.call_count == 0
@@ -50,10 +49,10 @@ class TestRawWriteRetry:
         mock_db.refresh.side_effect = lambda obj: setattr(obj, "id", 999)
 
         with patch("main.SessionLocal", return_value=mock_db), \
-             patch("main.process_raw_event"), \
+             patch("main._enqueue", return_value=True), \
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="test-client")
+            result = await create_order(mock_request, sample_order, client_id="test-client")
 
         assert mock_db.commit.call_count == 2
         assert mock_db.rollback.call_count == 1
@@ -68,11 +67,11 @@ class TestRawWriteRetry:
         mock_db.refresh.side_effect = lambda obj: setattr(obj, "id", 999)
 
         with patch("main.SessionLocal", return_value=mock_db), \
-             patch("main.process_raw_event"), \
+             patch("main._enqueue", return_value=True), \
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              pytest.raises(OperationalError):
-            await create_order(mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="test-client")
+            await create_order(mock_request, sample_order, client_id="test-client")
 
         assert mock_db.commit.call_count == MAX_RAW_WRITE_RETRIES
         assert mock_db.rollback.call_count == MAX_RAW_WRITE_RETRIES
@@ -88,12 +87,12 @@ class TestNulByteHandling:
         mock_db.refresh.side_effect = lambda obj: setattr(obj, "id", 1)
 
         with patch("main.SessionLocal", return_value=mock_db), \
-             patch("main.process_raw_event"), \
+             patch("main._enqueue", return_value=True), \
              patch("main._key_func", return_value="test-ip"), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch.object(main.logger, "warning") as mock_warning:
             result = await create_order(
-                mock_request, sample_order, MagicMock(spec=BackgroundTasks), client_id="c"
+                mock_request, sample_order, client_id="c"
             )
 
         raw_obj = mock_db.add.call_args[0][0]

@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from logging_config import configure_logging
 from auth import verify_api_key
+from config import settings
 
 configure_logging()
 logger = structlog.get_logger()
@@ -38,7 +39,26 @@ _key_func = _client_id_key  # 間接層：測試可替換此變數模擬不同 c
 def _limiter_key(request: Request) -> str:
     return _key_func(request)
 
-limiter = Limiter(key_func=_limiter_key)
+limiter = Limiter(
+    key_func=_limiter_key,
+    # 計數器儲存：空字串 → memory://（單行程 / pytest）；多行程部署指向 Redis。
+    # 沒有共享儲存的話，`60/minute` 在 N 個 uvicorn worker 下會變成 60×N——
+    # 限額的語意（每個上游合計）會隨部署形態靜默改變。
+    storage_uri=settings.rate_limit_storage_uri,
+    # 與 Celery broker 共用 Redis 實例但分開 DB index，再加一層 key 前綴，
+    # 讓限流的 key 在任何情況下都不會與佇列的 key 混淆。
+    key_prefix="ratelimit",
+    # 限流檢查跑在 request 路徑上且是同步的，Redis 不可用時若不設逾時上限，
+    # 會退回 OS 層的 DNS / TCP 逾時——實測單筆請求因此從 3.8s 惡化到 18.3s。
+    # slowapi 在 storage 死掉後仍會以指數退避週期性 _storage.check() 重探，
+    # 那次重探同樣受此上限保護。（與 celery_app 的 broker 逾時是同一個教訓。）
+    # MemoryStorage 會忽略這些多餘參數，故預設路徑不受影響。
+    storage_options={"socket_connect_timeout": 1, "socket_timeout": 1},
+    # Redis 不可用時退回行程內計數，而不是整個放行。
+    # 降級後限額變成「每 worker 60/min」（總量放寬 N 倍），仍遠好過完全不限流；
+    # 與 _enqueue 吞掉 broker 故障是同一套原則：下游故障只降級、不失效。
+    in_memory_fallback_enabled=True,
+)
 
 MAX_RAW_WRITE_RETRIES = 3  # 演算法常數：Raw 寫入重試上限，行為固定不隨環境變動
 

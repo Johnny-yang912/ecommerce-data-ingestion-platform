@@ -243,3 +243,60 @@ class TestRealAuthDrivesLimiter:
 
         assert codes.count(200) == 60  # 兩把 key 合計 60 都通過
         assert over.status_code == 429  # 共用一桶，第 61 次被擋
+
+
+# ─── 多行程下的限流儲存 ⭐ ────────────────────────────────────────────────────
+#
+# 這組守的是「限額語意不隨部署形態漂移」：slowapi 預設把計數器放行程記憶體，
+# API 一開多個 uvicorn worker，60/minute 就會實質變成 60×workers——而且不會有
+# 任何錯誤訊息，只會安靜地放行四倍流量。
+
+class TestLimiterStorageConfig:
+
+    def test_storage_uri_comes_from_settings(self):
+        """儲存位置必須是環境設定，不能寫死——本機/pytest 用記憶體，部署用 Redis。"""
+        from config import settings
+        from main import limiter
+
+        assert limiter._storage_uri == settings.rate_limit_storage_uri
+
+    def test_defaults_to_in_memory_storage(self):
+        """
+        預設（設定為空字串）落回 memory://，讓單行程開發與 pytest 不必有 Redis。
+        這也是 reset_limiter fixture 能直接 _storage.reset() 的前提。
+        """
+        from limits.storage import MemoryStorage
+        from config import settings
+        from main import limiter
+
+        if settings.rate_limit_storage_uri:
+            pytest.skip("環境已指定外部限流儲存，跳過記憶體預設斷言")
+        assert isinstance(limiter._storage, MemoryStorage)
+
+    def test_in_memory_fallback_enabled(self):
+        """
+        Redis 掛掉時退回行程內計數，而不是整個放行。降級後限額變鬆 N 倍，
+        但仍遠好過完全不限流——與 _enqueue 吞掉 broker 故障是同一套原則。
+        """
+        from main import limiter
+
+        assert limiter._in_memory_fallback_enabled is True
+        assert limiter._fallback_limiter is not None
+
+    def test_storage_wait_is_bounded(self):
+        """
+        限流檢查跑在 request 路徑上且同步。不設逾時上限，Redis 掛掉會退到 OS 層
+        的 DNS / TCP 逾時——實測單筆請求從 3.8s 惡化到 18.3s。fallback 保住的是
+        正確性，保不住延遲。
+        """
+        from main import limiter
+
+        opts = limiter._storage_options
+        assert 0 < opts["socket_connect_timeout"] <= 5
+        assert 0 < opts["socket_timeout"] <= 5
+
+    def test_key_prefix_isolates_from_broker_keys(self):
+        """限流 key 與 Celery broker 共用 Redis 實例時不得混淆（另有 DB index 隔離）。"""
+        from main import limiter
+
+        assert limiter._key_prefix == "ratelimit"

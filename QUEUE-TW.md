@@ -66,6 +66,17 @@ SIGKILL 之後 150 筆永久卡在 `pending`，重啟沒有任何機制知道要
 
 **這條 3.81s 是「broker 全掛」的降級延遲，不是常態**。常態下 publish 是次毫秒級。
 
+⚠️ **`_enqueue` 沒有「記住 broker 已死」的狀態**，所以 Redis 全掛期間**每一筆請求**
+都會重付這個逾時。這與限流儲存的行為形成對比——slowapi 有 `_storage_dead` 旗標加
+指數退避，偵測到一次之後就直接走 fallback（實測：首筆 3.77s，之後 2.5ms）。
+兩者疊加後，Redis 全掛時 `POST /orders` 實測落在 7～18s。
+
+語意仍然正確（回 200 `pending`、資料落地、掃描接手），但這個延遲在持續流量下會讓
+上游 client 端逾時、進而重送 → 灌出一批同 `order_id` 的 Raw。若要壓低，可以把
+`socket_connect_timeout` 降到 1s 並把 `task_publish_retry_policy.max_retries` 設為 0
+（換取「瞬斷不再有即時重試，改等下一輪掃描」），或替 `_enqueue` 加一個熔斷旗標。
+**目前刻意不做**——尚未有持續流量會踩到它，見 §6。
+
 ---
 
 ## 3. CAS claim 與重新投遞的交互作用 ⭐
@@ -217,6 +228,23 @@ Redis 復原後，積壓的 2 筆由掃描撿回並處理完成。
 `processing` 的記錄照樣被回收，最終 2900 筆全數 `processed`、ODS 2900 筆、
 自我碰撞 0。
 
+### 5.5 多行程下的限流
+
+`SCAN_INTERVAL_SECONDS` 不變，api 開 4 個 uvicorn worker，對同一把 API key
+連送 100 筆 `POST /orders`（限額 `60/minute`）：
+
+| 計數器儲存 | 200 | 429 |
+|---|---|---|
+| 行程記憶體（`RATE_LIMIT_STORAGE_URI=`） | **91** | 9 |
+| Redis db 1 | **60** | 40 |
+
+記憶體模式放行 91 筆而非 60——每個 worker 各記各的，且 OS 對連線的分派並不平均
+（所以不是整齊的 4 倍）。**沒有任何錯誤訊息**，限額就這樣安靜地失守，這正是它
+危險的地方。改用共享儲存後精準落在 60。
+
+Redis 停機期間 slowapi 記一筆 `falling back to in-memory storage` 並降級為每行程
+計數；復原後記 `Rate limit storage recovered`，限額回到精準的 60/40。
+
 ---
 
 ## 6. 已知邊界與刻意先不做
@@ -228,6 +256,7 @@ Redis 復原後，積壓的 2 筆由掃描撿回並處理完成。
 | **Celery 層 retry / 死信佇列** | 失敗語意已完整落在 `raw.status`（`error` 是終態，帶 `error_message`） | 需要區分「業務失敗」與「基礎設施失敗」並分別重試時 |
 | **Flower 等監控 UI** | 沒有 result backend，Flower 能看的東西有限；`raw.status` 才是真相 | 接 OpenTelemetry 時一併評估（藍圖 Phase 5 獨立項）|
 | **broker 掛掉時回壓上游** | 現在是「收下但延遲」，語意正確且上游不需要改 | 積壓到 DB 寫入本身成為瓶頸時 |
+| **`_enqueue` 的熔斷旗標** | Redis 全掛時每筆請求都重付連線逾時（見 §2.1）。目前沒有持續流量會踩到，加了反而多一份要維護的狀態 | 有持續攝入流量、且一次 Redis 事故會讓上游因逾時而重送時 |
 
 ---
 

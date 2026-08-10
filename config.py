@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # 刻意與 Airflow 不共用實例，見 celery_app.py 的模組註解。
     celery_broker_url: str = "redis://localhost:6379/0"
 
+    # --- Phase 5：限流計數器儲存 ---
+    # slowapi 預設把計數器放在行程記憶體裡。API 一旦跑多個 uvicorn worker，
+    # 每個行程各有一份計數器，`60/minute` 就會實質變成 `60 × workers`。
+    # 指向 Redis 才能讓限額回到「每個上游合計」的原意（見 main.limiter）。
+    # 空字串 = 落回 memory://：本機單行程開發與 pytest 都不需要真的有 Redis。
+    # 與 broker 共用實例但**分開 DB index**（broker=0 / 限流=1）：
+    # `celery purge` 之類的維運動作不該波及限流計數器。
+    rate_limit_storage_uri: str = ""
+
     # --- 日誌輸出格式：console（dev）| json（prod）---
     log_format: str = "console"
 

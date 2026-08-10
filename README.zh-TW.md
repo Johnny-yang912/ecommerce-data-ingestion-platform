@@ -308,9 +308,17 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 | 卡住的 status | 觸發條件 |
 |---|---|
 | `pending` | server crash 在背景任務執行前，或 try_claim_raw 的 DB 例外（transaction rollback） |
-| `processing` | server crash 在 claim commit 之後、狀態更新之前 |
+| `processing` | server crash 在 claim commit 之後、狀態更新之前（Phase 5 後：由 `processing_started_at` 起算逾時，見 [QUEUE-TW §3.1](./QUEUE-TW.md)）|
 
-應對方向：改用 Redis/Celery/Kafka 取代 BackgroundTasks（Recovery 機制已補上，但根本解法仍是持久化 Queue）。
+**⭐ 此結論已於 Phase 5 翻案。** 換上 Celery + Redis 後重跑同型情境（800 筆積壓、處理到 225 筆時 SIGKILL worker）：
+
+| 時點 | `pending` | `processing` | `processed` |
+|---|---|---|---|
+| SIGKILL 當下 | 537 | 2 | 261 |
+| worker 重啟後 30s | 0 | **2** | 798 |
+| stale 逾時後一輪掃描 | 0 | 0 | **800** |
+
+最終 ODS 800 筆、零遺失。值得注意的是中間那列：SIGKILL 當下已 claim 成 `processing` 的 2 筆，**重啟 worker 完全救不回來**——訊息重投遞會 CAS 失敗直接 return，只有 stale 掃描能救。這說明持久化佇列並沒有讓恢復掃描變成冗餘，反而讓它成為「佇列語意的補集」。完整分析見 [QUEUE-TW.md](./QUEUE-TW.md)。
 
 **測試六：同一 order_id 重複提交（ODS idempotency）**
 
@@ -323,7 +331,7 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 ## 持續整合（CI）
 
-每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（333 個測試，受管模組 100% 覆蓋）。
+每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（366 個測試，受管模組 100% 覆蓋）。
 
 另有一條**獨立的 DAG workflow**（`.github/workflows/dags.yml`，20 個測試）：以官方 constraints 安裝 Airflow 並用 DagBag 解析 `orchestration/dags/`。刻意不併進主 job——Airflow 安裝很重且 pin 了大量套件版本，會毀掉主 job「mock DB、數秒跑完」的速度優勢。它不需要 `DB_URL`，因為 DAG 檔刻意不 top-level import 專案模組（見 [ORCHESTRATION-TW §2.2](./ORCHESTRATION-TW.md)）。
 
@@ -445,6 +453,7 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 |---|---|
 | [資料品質控管架構](./DQ_ARCHITECTURE-TW.md) | 完整 DQ 設計：各層品質合約、攔截機制（Hard Gate + Row Filter）、場景補值策略、Quarantine 與 Remediation 策略、版本號與 quality_events 狀態機、歷史指標架構 |
 | [雲端層架構](./CLOUD_LAYER-TW.md) | ODS → BigQuery 抽取與 staging：分區/叢集/保險絲設計、watermark 策略（方案 A 與 `get_watermark()` 接縫）、批次載入與 JSON 落地決策、ODS schema 演進策略（staging 只做加法 + dbt 吸收 + `FIELDS` 一致性測試）|
+| [任務佇列](./QUEUE-TW.md) | 攝入路徑的 Celery + Redis：與 Airflow 的正交邊界、薄包裝與不開 result backend 的理由、`acks_late` 與 CAS claim 的交互作用（佇列救不回來的那一半）、stale 逾時基準為何是 `processing_started_at`、broker 掛掉時的降級語意；含 SIGKILL／限流／降級延遲的實機驗證數據與 runbook |
 | [編排層架構](./ORCHESTRATION-TW.md) | Airflow 的三條 DAG 與決策：Airflow ≠ 任務佇列的邊界、DAG 檔不得 import 專案模組、extract 一表一 task、dbt 分層執行與 `--indirect-selection=buildable`、`catchup=False` 的結構性理由、retry 不對稱、freshness 獨立成 DAG、Proposal B 的手動觸發語意；含 runbook 與 Proposal B 完整 demo 劇本 |
 | [轉換層（dbt）](./ecommerce_dbt/README.zh-TW.md) | dbt 轉換層的操作與實作決策：分層與命名慣例、物化策略（table vs view、incremental + insert_overwrite + `copy_partitions` 繞過 sandbox 禁 DML）、回看窗、去重鍵與不變式、Hard Gate 自訂 generic test、freshness 繞保險絲；`int_` 層的有效品質狀態合成（刻意複製 + 對齊清單）、全量重建的必要性、劃分不變式測試、`int_order_items` 的 `safe_cast` 與嚴格 NULL 傳播。層契約見 DQ_ARCHITECTURE、staging 基建見 CLOUD_LAYER |
 
@@ -490,15 +499,17 @@ pytest
 # 1. 在 .env 設好 API_KEYS（POSTGRES_USER/PASSWORD/DB 可選）
 cp .env.example .env
 
-# 2. build 並啟動：db → migrate（alembic upgrade head）→ api
+# 2. build 並啟動：db + redis → migrate（alembic upgrade head）→ api + worker + beat
 docker compose up --build
 ```
 
-- `db`（postgres:16）先起，`pg_isready` healthcheck 把關後續服務。
+- `db`（postgres:16）與 `redis`（7-alpine）先起，各自的 healthcheck 把關後續服務。
 - 一次性 `migrate` 服務跑完 `alembic upgrade head` 後退出。
-- `api` 要等 DB 健康 **且** migration 成功完成（`service_completed_successfully`）才啟動。
+- `api` / `worker` / `beat` 都要等 DB 與 Redis 健康 **且** migration 成功完成（`service_completed_successfully`）才啟動。
+- `worker`（Celery，4 個 prefork 子行程）消費攝入任務；`beat` 只負責按時派出恢復掃描，**不可 `--scale`**（多個 beat 會重複派工）。三者共用同一個映像，只換啟動指令。
 - `DB_URL` 由 Compose 注入、指向 `db` 服務，會覆蓋 `.env` 內的值（pydantic-settings 中 env var 優先序高於 `.env` 檔），故**不需改任何程式碼**。`.env` **不會**烤進映像，secrets 於執行期注入。
-- API 刻意以 `--workers 1` 啟動：`BackgroundTasks` 與週期恢復掃描是行程內狀態，多 worker 會各跑一份掃描迴圈。水平擴展留待 Phase 5 的佇列（Redis/Celery）。
+- API 預設以 `--workers 4` 啟動（`UVICORN_WORKERS` 可調）。能開多行程的前提是 Phase 5 把兩份行程內狀態都移走了：處理任務交給 Celery worker、恢復掃描交給 Celery Beat，API 行程本身不再持有背景狀態。
+- 連帶必須處理的是**限流計數器**：slowapi 預設放在行程記憶體，多行程下 `60/minute` 會實質變成 `60 × workers`（實測 4 workers 放行 91/100 筆而非 60），且不會有任何錯誤訊息。compose 因此把計數器指向 Redis db 1（broker 用 db 0），限額回到精準的 60。Redis 不可用時退回行程內計數而非整個放行。見 [QUEUE-TW §5.5](./QUEUE-TW.md)。
 
 API 位於 `http://localhost:8000`（文件 `/docs`，健康檢查 `/health`）。
 
@@ -574,7 +585,7 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-client 限流（slowapi，以認證 `client_id` 為 key、IP fallback），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 333 個測試，9 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 20 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] Pytest — 366 個測試，11 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 20 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）除 Airflow 重評估外皆已實作
 
 **Phase 3 — 工程化**
@@ -594,8 +605,10 @@ Looker Studio（直連 BigQuery）
 **Phase 5 — 自動化 + Queue 升級**
 - [v] Airflow（本地，3.0.0 + LocalExecutor）三條 DAG——`orders_analytics_daily`（2 個 extract task → 4 層 `dbt build` → 完整 `dbt test`）、`dq_reevaluation`（Proposal B，手動觸發、預設 dry-run、commit 後自動接主 DAG）、`source_freshness_watch`（獨立觀測，不污染主管線成功率）。dbt 與分析腳本各自獨立 venv；DAG 檔不 import 專案模組故可進 CI；決策見 [ORCHESTRATION-TW.md](./ORCHESTRATION-TW.md)
 - [v] Proposal B 事件產生端（`reevaluate_quality.py`）——候選讀 BQ `int_` 層（與 Row Filter 同一份有效品質狀態定義）、狀態判定讀 PG（冪等不能建立在有保留期的鏡射上）、只在狀態改變時 append；`business_clean` 加 `as_of` 讓時間相依規則可重現，`NON_REPRODUCIBLE_CODES` 擋掉「證據消失式」的偽 promote
-- [ ] Celery + Redis（取代 BackgroundTasks）
-- [ ] Docker 擴展：補上 Redis + Celery Worker
+- [v] Celery + Redis（取代 BackgroundTasks）——`process_raw_event` 以薄包裝進 Celery task（`process.py` 零 Celery 依賴，保留手動補跑的救援路徑）；不開 result backend（任務狀態的真相是 `raw.status`）；`acks_late` + `reject_on_worker_lost`；broker 掛掉時 `POST /orders` 仍回 200 `pending`，由恢復掃描接手。設計與實測見 [QUEUE-TW.md](./QUEUE-TW.md)
+- [v] 恢復掃描搬到 Celery Beat——原本掛在 FastAPI lifespan 的 asyncio 迴圈是行程內狀態，移走後 API 才得以多行程；Beat 啟動時另補一次掃描，填住第一個排程間隔的空窗
+- [v] `raw.processing_started_at`——stale 逾時改由「開始處理」起算而非「攝入」。用 `received_at` 會在積壓時把正在處理的記錄誤判為逾時、收回重派，造成同一 `raw_id` 被兩個 worker 並行處理（實測 2000 筆積壓下重現 2 筆）。見 [QUEUE-TW §3.1](./QUEUE-TW.md)
+- [v] Docker 擴展：補上 Redis + Celery Worker + Beat；api 開 4 個 uvicorn worker，限流計數器改走 Redis
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
   - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）
   - **Metrics**：透過 OTel Metrics API 量化業務指標——訂單寫入量、ODS 處理成功 / 失敗 / duplicate 比率、processing 延遲分佈（P50/P95/P99）、DB pool 壓力、Retry 次數分佈

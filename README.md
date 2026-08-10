@@ -308,9 +308,17 @@ Two stuck-state scenarios:
 | Stuck status | Trigger condition |
 |---|---|
 | `pending` | Crash before background task runs, or `try_claim_raw` DB exception (transaction rollback) |
-| `processing` | Crash after claim commit, before final status update |
+| `processing` | Crash after claim commit, before final status update (post-Phase 5: the timeout runs from `processing_started_at`, see [QUEUE.md §3.1](./QUEUE.md)) |
 
-Mitigation options: replace BackgroundTasks with Redis/Celery/Kafka (recovery scan is now in place, but a persistent queue remains the proper fix).
+**⭐ This conclusion was overturned in Phase 5.** Re-running the same shape of scenario on Celery + Redis (800 records backlogged, worker SIGKILLed after 225 were processed):
+
+| Moment | `pending` | `processing` | `processed` |
+|---|---|---|---|
+| At SIGKILL | 537 | 2 | 261 |
+| 30s after worker restart | 0 | **2** | 798 |
+| One scan after the stale threshold | 0 | 0 | **800** |
+
+Final ODS count 800, nothing lost. Note the middle row: the 2 records already claimed into `processing` at SIGKILL **cannot be saved by restarting the worker** — redelivery fails the CAS check and returns immediately; only the stale scan recovers them. This is why a durable queue does not make the recovery scan redundant; it makes it "the complement of the queue's semantics". Full analysis in [QUEUE.md](./QUEUE.md).
 
 **Test 6 — Duplicate order_id submissions (ODS idempotency)**
 
@@ -323,7 +331,7 @@ Result: ODS always contains exactly one record per `order_id`; all subsequent du
 
 ## Continuous Integration (CI)
 
-Every push to `main` and every Pull Request automatically triggers GitHub Actions (`.github/workflows/ci.yml`), which installs dependencies and runs the full test suite (333 tests, 100% coverage of the gated modules) across a **Python 3.10 and 3.12** matrix.
+Every push to `main` and every Pull Request automatically triggers GitHub Actions (`.github/workflows/ci.yml`), which installs dependencies and runs the full test suite (366 tests, 100% coverage of the gated modules) across a **Python 3.10 and 3.12** matrix.
 
 A **separate DAG workflow** (`.github/workflows/dags.yml`, 20 tests) installs Airflow under the official constraints and parses `orchestration/dags/` with DagBag. It is deliberately not folded into the main job — Airflow's install is heavy and pins many package versions, which would destroy the main job's "mock DB, done in seconds" property. It needs no `DB_URL`, because DAG files deliberately import no project module (see [ORCHESTRATION §2.2](./ORCHESTRATION.md)).
 
@@ -445,6 +453,7 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 |---|---|
 | [Data Quality Control Architecture](./DQ_ARCHITECTURE.md) | Full DQ design: per-layer quality contracts, blocking mechanism (Hard Gate + Row Filter), scenario repair strategy, quarantine and remediation strategy, rule versioning with quality_events state machine, historical metrics architecture |
 | [Cloud Layer Architecture](./CLOUD_LAYER.md) | ODS → BigQuery extraction and staging: partition/clustering/fuse design, watermark strategy (Approach A + the `get_watermark()` seam), batch-load and JSON landing decisions, and the ODS schema evolution strategy (additive staging + dbt absorption + `FIELDS` consistency test) |
+| [Task Queue](./QUEUE.md) | The ingestion path's Celery + Redis: the orthogonality boundary with Airflow, why a thin wrapper and no result backend, how `acks_late` interacts with CAS claim (the half the queue cannot recover), why staleness is judged by `processing_started_at`, and degraded semantics when the broker is down; includes live SIGKILL / rate-limit / degraded-latency measurements and a runbook |
 | [Orchestration Layer Architecture](./ORCHESTRATION.md) | Airflow's three DAGs and their decisions: the Airflow-is-not-a-task-queue boundary, why DAG files must not import project modules, one extract task per table, layered dbt execution with `--indirect-selection=buildable`, the structural reason for `catchup=False`, asymmetric retries, freshness as its own DAG, and the manual-trigger semantics of Proposal B; includes the runbook and the full Proposal B demo script |
 | [Transformation Layer (dbt)](./ecommerce_dbt/README.md) | dbt transformation ops & implementation decisions: layering/naming conventions, materialization (table vs view, incremental + insert_overwrite + `copy_partitions` to bypass the sandbox DML ban), lookback window, dedup key & invariant, Hard Gate custom generic test, freshness fuse bypass; the `int_` layer's effective-quality-state composition (deliberate duplication + alignment checklist), why full rebuilds are required, the partition invariant test, and `int_order_items`'s `safe_cast` + strict NULL propagation. Layer contracts in DQ_ARCHITECTURE, staging infra in CLOUD_LAYER |
 
@@ -490,15 +499,17 @@ The repository ships a `Dockerfile` + `docker-compose.yml` that bring up Postgre
 # 1. Set API_KEYS (and optionally POSTGRES_USER/PASSWORD/DB) in .env
 cp .env.example .env
 
-# 2. Build and start: db → migrate (alembic upgrade head) → api
+# 2. Build and start: db + redis → migrate (alembic upgrade head) → api + worker + beat
 docker compose up --build
 ```
 
-- `db` (postgres:16) starts first; `pg_isready` healthcheck gates the rest.
+- `db` (postgres:16) and `redis` (7-alpine) start first; their healthchecks gate the rest.
 - A one-shot `migrate` service runs `alembic upgrade head` and exits.
-- `api` only starts once the DB is healthy **and** the migration has completed successfully (`service_completed_successfully`).
+- `api` / `worker` / `beat` each start only once the DB and Redis are healthy **and** the migration has completed successfully (`service_completed_successfully`).
+- `worker` (Celery, 4 prefork child processes) consumes ingestion tasks; `beat` only dispatches the recovery scan on schedule and **must not be `--scale`d** (multiple beats would dispatch duplicate scans). All three share one image and differ only in their start command.
 - `DB_URL` is injected by Compose pointing at the `db` service — it overrides the `.env` value (env vars outrank the `.env` file in pydantic-settings), so no code change is needed. `.env` is **not** baked into the image; secrets are injected at runtime.
-- The API runs with `--workers 1` on purpose: `BackgroundTasks` and the periodic recovery scan are in-process state, so multiple workers would each run their own scan loop. Horizontal scaling waits on the Phase 5 queue (Redis/Celery).
+- The API runs 4 uvicorn workers by default (tunable via `UVICORN_WORKERS`). Multiple processes are only viable because Phase 5 moved both pieces of in-process state out: task processing to the Celery worker, the recovery scan to Celery Beat, leaving the API process with no background state of its own.
+- That forced a companion change to the **rate-limit counters**: slowapi keeps them in process memory by default, so across N processes `60/minute` effectively becomes `60 × workers` (measured: 4 workers let 91 of 100 requests through instead of 60) — with no error raised anywhere. Compose therefore points the counters at Redis db 1 (the broker uses db 0), restoring a precise limit of 60. If Redis is unavailable it degrades to per-process counting rather than disabling limiting entirely. See [QUEUE.md §5.5](./QUEUE.md).
 
 API available at `http://localhost:8000` (docs at `/docs`, health at `/health`).
 
@@ -575,7 +586,7 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 - [v] Rate limiting — per-client limits via slowapi (keyed on the authenticated `client_id`, IP fallback): `POST /orders` 60/min, `POST /process_raw` 20/min, `GET /raw` 120/min; no global limit (see Design Decisions)
 
 **Phase 2 — Testability**
-- [v] Pytest — 333 tests, 100% coverage across all 9 gated modules (`pytest --cov`; plus 20 DAG tests in a separate CI job); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
+- [v] Pytest — 366 tests, 100% coverage across all 11 gated modules (`pytest --cov`; plus 20 DAG tests in a separate CI job); unit tests cover all retry paths (Points 1–4), CAS claim, idempotency, crash recovery scan, `format_clean`, `business_clean`, `ODSOrder.from_nested`, quality_events write paths, API Key auth (missing/invalid/valid/rotation/parser fault-tolerance); `asyncio_mode=auto` replaces manual `asyncio.run()`; `reset_limiter` fixture eliminates cross-test rate-limit counter contamination; auth is bypassed via `dependency_overrides` so non-auth tests need not attach a header per request. Currently unit tests and integration tests (HTTP layer) only — no end-to-end tests; E2E tests against a real DB will be added once Phase 3 Docker / docker-compose is in place.
 - [v] Data quality control architecture (ODS layer) — full design document (see [DQ_ARCHITECTURE.md](./DQ_ARCHITECTURE.md)); ODS layer implemented: `DQ_RULE_VERSION` rule version constant, `dq_rule_version` column (ODS), `quality_events` table (append-only quality event log, state machine anchor), structlog `quality_metric` event; BQ Analytics layer (Hard Gate, Row Filter, `int_orders_quarantine`, Airflow re-evaluation, `rpt_quality_*`) all implemented except the Airflow re-evaluation
 
 **Phase 3 — Operability**
@@ -595,8 +606,10 @@ The downstream consumer is BI — dashboards and reports where T+1 or hourly ref
 **Phase 5 — Automation + Queue Upgrade**
 - [v] Airflow (local, 3.0.0 + LocalExecutor), three DAGs — `orders_analytics_daily` (2 extract tasks → 4 layered `dbt build`s → a full `dbt test`), `dq_reevaluation` (Proposal B: manual trigger, dry-run by default, chains into the main DAG on commit), and `source_freshness_watch` (standalone observability that cannot pollute the main pipeline's success rate). dbt and the analytics scripts live in separate venvs; DAG files import no project module and are therefore CI-covered. Decisions in [ORCHESTRATION.md](./ORCHESTRATION.md)
 - [v] Proposal B event producer (`reevaluate_quality.py`) — candidates read from BQ's `int_` layer (the same effective-quality-state definition the Row Filter uses), state decided against PG (idempotency cannot rest on a mirror that expires), and events appended only on an actual state change; `business_clean` gains `as_of` so time-dependent rules are reproducible, and `NON_REPRODUCIBLE_CODES` blocks "evidence disappeared" spurious promotions
-- [ ] Celery + Redis (replace BackgroundTasks)
-- [ ] Docker extension: add Redis + Celery Worker
+- [v] Celery + Redis (replacing BackgroundTasks) — `process_raw_event` is wrapped thinly into a Celery task (`process.py` stays Celery-free, preserving the manual rescue path); no result backend (`raw.status` is the source of truth); `acks_late` + `reject_on_worker_lost`; with the broker down `POST /orders` still returns 200 `pending` and the recovery scan takes over. Design and measurements in [QUEUE.md](./QUEUE.md)
+- [v] Recovery scan moved to Celery Beat — the asyncio loop on FastAPI's lifespan was in-process state; removing it is what allows multiple API processes. Beat also fires one catch-up scan at startup, closing the first scheduling interval's gap
+- [v] `raw.processing_started_at` — staleness now runs from "processing began" rather than "ingested". Using `received_at` misjudges actively-processing records as timed out under backlog, reclaiming and re-dispatching them so one `raw_id` runs on two workers (reproduced: 2 occurrences across a 2000-record backlog). See [QUEUE.md §3.1](./QUEUE.md)
+- [v] Docker extension: Redis + Celery Worker + Beat; the api runs 4 uvicorn workers with rate-limit counters in Redis
 - [ ] OpenTelemetry — extend the existing structlog foundation to cover all three observability pillars:
   - **Logs**: route structlog output through the OTel Log Exporter; `trace_id` / `span_id` are injected into every log entry automatically, enabling cross-service log correlation
   - **Metrics**: quantify business signals via the OTel Metrics API — order ingestion throughput, ODS processed / error / duplicate rates, processing latency distribution (P50/P95/P99), DB pool pressure, retry attempt counts

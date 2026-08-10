@@ -44,11 +44,25 @@ services:
 
   api:
     build: .
+    # Dockerfile 的 CMD 是 exec form，${VAR} 不會展開 → worker 數在此覆寫。
+    # 多行程之所以可行，是因為恢復掃描已搬到 Beat、API 行程不再持有背景狀態。
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 8000
+      --workers ${UVICORN_WORKERS:-4}
     environment:
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
       API_KEYS: ${API_KEYS}
       LOG_FORMAT: json
       CELERY_BROKER_URL: redis://redis:6379/0
+      # 限流計數器走 Redis db 1（broker 是 db 0）。沒有這行，4 個 worker
+      # 各記各的，60/minute 會變成 240/minute。
+      RATE_LIMIT_STORAGE_URI: ${RATE_LIMIT_STORAGE_URI-redis://redis:6379/1}
+      # 連線預算：多行程之後 pool 是「每行程一份」。4 × (3+5) = 32，
+      # 加上 worker 的 4 × (2+2) = 16，共 48，安全低於 Postgres 預設 max_connections=100。
+      # 不改 config.py 的預設值（5/10）——那是單行程本機開發的合理值，
+      # 這裡是部署形態帶來的差異，屬於環境設定。
+      POOL_SIZE: 3
+      MAX_OVERFLOW: 5
     depends_on:
       db:
         condition: service_healthy
@@ -76,8 +90,9 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-300}
       # prefork 下每個子行程有自己的 pool，同時又只跑一個任務 → pool 開大沒有意義。
-      # 4 個子行程 × (2+10) 遠低於 Postgres 預設 max_connections=100，留餘裕給 api 與 Airflow。
+      # 4 × (2+2) = 16，與 api 的 32 相加為 48，留足餘裕給 Airflow 與人工連線。
       POOL_SIZE: 2
+      MAX_OVERFLOW: 2
     depends_on:
       db:
         condition: service_healthy

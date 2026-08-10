@@ -75,6 +75,19 @@ Verified: with the broker fully down, `POST /orders` still returns 200 (3.81s) w
 **That 3.81s is the degraded-mode latency for a fully dead broker**, not the normal path.
 Normally publishing is sub-millisecond.
 
+⚠️ **`_enqueue` keeps no "the broker is dead" state**, so while Redis is fully down **every
+request** pays that timeout again. Contrast the rate-limit storage: slowapi has a
+`_storage_dead` flag plus exponential backoff, so after detecting failure once it goes
+straight to the fallback (measured: 3.77s on the first request, 2.5ms thereafter). Stacked
+together, `POST /orders` measured 7–18s with Redis fully down.
+
+The semantics stay correct (200 `pending`, data landed, the scan picks it up), but under
+sustained traffic that latency will time out upstream clients and trigger resends — flooding
+in Raws sharing one `order_id`. To reduce it, drop `socket_connect_timeout` to 1s and set
+`task_publish_retry_policy.max_retries` to 0 (trading away the immediate retry for a blip, so
+it waits for the next scan instead), or give `_enqueue` a circuit-breaker flag. **Deliberately
+not done yet** — no sustained traffic hits it today; see §6.
+
 ---
 
 ## 3. How CAS claim interacts with redelivery ⭐
@@ -248,6 +261,25 @@ The §5.1 SIGKILL scenario was then re-run to confirm **the recovery mechanism i
 broken**: the 2 records stuck in `processing` were reclaimed as before, ending with all 2900
 records `processed`, 2900 ODS rows, and 0 self-collisions.
 
+### 5.5 Rate limiting across multiple processes
+
+With the api running 4 uvicorn workers, 100 `POST /orders` sent against the same API key
+(limit `60/minute`):
+
+| Counter storage | 200 | 429 |
+|---|---|---|
+| Process memory (`RATE_LIMIT_STORAGE_URI=`) | **91** | 9 |
+| Redis db 1 | **60** | 40 |
+
+Memory mode let 91 through instead of 60 — each worker keeps its own counter, and the OS does
+not distribute connections evenly (hence not a tidy 4×). **No error is raised anywhere**; the
+limit simply fails silently, which is exactly what makes it dangerous. With shared storage it
+lands exactly on 60.
+
+While Redis is down slowapi logs `falling back to in-memory storage` and degrades to
+per-process counting; on recovery it logs `Rate limit storage recovered` and the limit is back
+to a precise 60/40.
+
 ---
 
 ## 6. Known boundaries and deliberate non-goals
@@ -259,6 +291,7 @@ records `processed`, 2900 ODS rows, and 0 self-collisions.
 | **Celery-level retry / dead-letter queue** | Failure semantics already land in `raw.status` (`error` is terminal and carries `error_message`) | When "business failure" and "infrastructure failure" need separate retry policies |
 | **Flower or similar UI** | With no result backend there is little for Flower to show; `raw.status` is the truth | Evaluate alongside OpenTelemetry (a separate Phase 5 roadmap item) |
 | **Back-pressure to upstream when the broker is down** | Current semantics ("accepted, delayed") are correct and require no upstream change | When the DB write itself becomes the bottleneck under backlog |
+| **A circuit-breaker flag for `_enqueue`** | With Redis fully down every request re-pays the connection timeout (see §2.1). Nothing today generates the sustained traffic that would hit it, and it would add another piece of state to maintain | Once ingestion traffic is continuous and a single Redis incident would make upstreams time out and resend |
 
 ---
 

@@ -26,6 +26,20 @@ def mock_request() -> MagicMock:
     return r
 
 
+@pytest.fixture(autouse=True)
+def reset_enqueue_breaker():
+    """
+    每個測試前重置派工熔斷器。
+
+    它是模組層級物件，失敗計數會跨測試累積——一個「模擬 broker 掛掉」的測試
+    連跑三次就會讓後面無關的測試進入開路狀態。與 reset_limiter 是同型問題。
+    """
+    from main import _enqueue_breaker
+
+    _enqueue_breaker.reset()
+    yield
+
+
 @pytest.fixture
 def mock_enqueue():
     """

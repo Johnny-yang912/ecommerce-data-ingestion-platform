@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from logging_config import configure_logging
 from auth import verify_api_key
+from circuit_breaker import CircuitBreaker, CircuitOpen
 from config import settings
 
 configure_logging()
@@ -62,6 +63,20 @@ limiter = Limiter(
 
 MAX_RAW_WRITE_RETRIES = 3  # 演算法常數：Raw 寫入重試上限，行為固定不隨環境變動
 
+# 派工熔斷器的參數。與 MAX_*_RETRIES 同類——是程式行為而非環境設定，
+# 故留在模組頂端、改動走 code review（見 config.py 對這條分界的說明）。
+# 門檻 3：broker 掛掉時是全失敗，連續三次已足以區分「瞬斷」與「真的掛了」。
+# 冷卻 30s：探測成本為每行程每 30 秒一筆慢請求（約 3.8s），可忽略；
+#           同時讓 broker 復原後 30 秒內就能回到快路徑。
+ENQUEUE_BREAKER_FAILURE_THRESHOLD = 3
+ENQUEUE_BREAKER_RESET_SECONDS = 30
+
+_enqueue_breaker = CircuitBreaker(
+    failure_threshold=ENQUEUE_BREAKER_FAILURE_THRESHOLD,
+    reset_timeout=ENQUEUE_BREAKER_RESET_SECONDS,
+    name="celery_enqueue",
+)
+
 # Schema 由 Alembic 管理（alembic upgrade head），啟動時不再 create_all。
 
 
@@ -91,10 +106,19 @@ def _enqueue(raw_id: int) -> bool:
     ⚠️ 這是同步函式，且 broker 不可用時會走完連線逾時才返回。async 路徑上的呼叫者
     一律要用 `asyncio.to_thread` 包起來，否則會把整個 event loop 卡住——實測 broker
     停掉時單次派工阻塞達 19 秒（已由 celery_app 的 socket timeout 收斂，但仍非零）。
+
+    熔斷器讓上面那個「非零」在持續故障下歸零：連續失敗三次後開路，之後直接回 False
+    而不碰 Redis。少了它，實測 48 併發下有 47 筆在 120 秒內拿不到回應（見
+    circuit_breaker.py 的模組註解）——而那些請求的 Raw **其實都已經寫進去了**，
+    客戶端卻只看到逾時，於是重送、灌出一批同 order_id 的重複資料。
     """
     try:
-        process_raw_event_task.delay(raw_id)
+        _enqueue_breaker.call(process_raw_event_task.delay, raw_id)
         return True
+    except CircuitOpen:
+        # 開路是預期中的降級狀態，不逐筆記 log：開路那一刻已經記過一次，
+        # 事故期間每筆都記只會把真正的訊號淹掉（實測規模下每秒上千條）。
+        return False
     except Exception:
         logger.error("派工失敗，改由 recovery scan 接手", raw_id=raw_id, exc_info=True)
         return False
@@ -170,13 +194,20 @@ async def create_order(request: Request, order: OrderIN,
                     logger.error("raw 寫入失敗，已達最大重試次數", order_id=order.order_id, exc_info=True)
                     raise
 
+        # db.refresh() 會開啟一個新交易取回 id，而它要到 db.close() 才結束。
+        # 若讓它跨越下面的派工，broker 故障時整段阻塞期間連線都掛在
+        # `idle in transaction`（實測 60 併發下 32 個 pool 槽位有 23 個是這狀態），
+        # 同時壓住 Postgres 的 vacuum horizon。先取出 id 再明確收掉交易。
+        raw_id = raw.id
+        db.close()
+
         # 派工必須在 db.commit() 之後：worker 走的是另一條 DB 連線，
         # 先派工可能讓它讀不到還沒 commit 的 Raw（claim 直接落空）。
         # to_thread：broker 不可用時 _enqueue 會阻塞，不能卡在 event loop 上。
-        queued = await asyncio.to_thread(_enqueue, raw.id)
-        logger.info("raw 已建立", raw_id=raw.id, queued=queued)
+        queued = await asyncio.to_thread(_enqueue, raw_id)
+        logger.info("raw 已建立", raw_id=raw_id, queued=queued)
         # 回應不受派工結果影響：資料已落地，未入列者由 recovery scan 接手（見 _enqueue）。
-        return {"raw_id": raw.id, "status": "pending"}
+        return {"raw_id": raw_id, "status": "pending"}
     except SATimeoutError:
         logger.warning("connection pool 耗盡", order_id=order.order_id)
         raise HTTPException(status_code=503, detail="Server busy, please retry later")

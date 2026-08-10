@@ -233,6 +233,56 @@ class TestEnqueue:
         assert mock_error.called
 
 
+class TestEnqueueCircuitBreaker:
+
+    def test_breaker_opens_and_stops_touching_the_broker(self):
+        """
+        連續失敗達門檻後不得再呼叫 delay()。開路的價值全在這裡——碰了就要付逾時，
+        實測 48 併發下那個逾時會讓 47 筆請求在 120 秒內拿不到回應。
+        """
+        threshold = main.ENQUEUE_BREAKER_FAILURE_THRESHOLD
+
+        with patch("main.process_raw_event_task") as mock_task:
+            mock_task.delay.side_effect = ConnectionError("redis is down")
+            for _ in range(threshold + 20):
+                assert _enqueue(1) is False
+
+        assert mock_task.delay.call_count == threshold
+        assert main._enqueue_breaker.state == "open"
+
+    def test_open_circuit_does_not_log_per_request(self):
+        """
+        開路後逐筆記 error 等於把事故期間的日誌淹成雜訊（實測規模下每秒上千條）。
+        開路那一刻已由熔斷器記過一次，之後應該安靜。
+        """
+        threshold = main.ENQUEUE_BREAKER_FAILURE_THRESHOLD
+
+        with patch("main.process_raw_event_task") as mock_task:
+            mock_task.delay.side_effect = ConnectionError("redis is down")
+            for _ in range(threshold):
+                _enqueue(1)
+
+            with patch.object(main.logger, "error") as mock_error:
+                for _ in range(50):
+                    assert _enqueue(1) is False
+
+        mock_error.assert_not_called()
+
+    def test_recovers_after_cooldown(self):
+        """broker 復原後要能自己回到快路徑，不需要重啟行程。"""
+        with patch("main.process_raw_event_task") as mock_task:
+            mock_task.delay.side_effect = ConnectionError("redis is down")
+            for _ in range(main.ENQUEUE_BREAKER_FAILURE_THRESHOLD):
+                _enqueue(1)
+            assert main._enqueue_breaker.state == "open"
+
+            main._enqueue_breaker.reset_timeout = 0.0   # 視為冷卻期已滿
+            mock_task.delay.side_effect = None
+            assert _enqueue(1) is True
+
+        assert main._enqueue_breaker.state == "closed"
+
+
 class TestCreateOrderEnqueueContract:
 
     async def test_still_returns_pending_when_broker_is_down(self, mock_request, sample_order):
@@ -273,3 +323,24 @@ class TestCreateOrderEnqueueContract:
             await create_order(mock_request, sample_order, client_id="test-client")
 
         assert call_order == ["commit", "enqueue"]
+
+    async def test_session_closed_before_enqueue(self, mock_request, sample_order):
+        """
+        DB session 必須在派工**之前**收掉。db.refresh() 會開一個新交易，若讓它跨越
+        派工阻塞，broker 故障期間連線會整段掛在 `idle in transaction`（實測 60 併發
+        下 32 個 pool 槽位有 23 個是這狀態），同時壓住 Postgres 的 vacuum horizon。
+        """
+        call_order = []
+        mock_db = MagicMock()
+        mock_db.commit.side_effect = lambda: call_order.append("commit")
+        mock_db.refresh.side_effect = lambda obj: setattr(obj, "id", 1)
+        mock_db.close.side_effect = lambda: call_order.append("close")
+
+        with patch("main.SessionLocal", return_value=mock_db), \
+             patch("main.process_raw_event_task") as mock_task, \
+             patch("main._key_func", return_value="test-ip"), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            mock_task.delay.side_effect = lambda _: call_order.append("enqueue")
+            await create_order(mock_request, sample_order, client_id="test-client")
+
+        assert call_order.index("close") < call_order.index("enqueue")

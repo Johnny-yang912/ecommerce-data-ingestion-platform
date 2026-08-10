@@ -331,7 +331,7 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 ## 持續整合（CI）
 
-每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（366 個測試，受管模組 100% 覆蓋）。
+每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（381 個測試，受管模組 100% 覆蓋）。
 
 另有一條**獨立的 DAG workflow**（`.github/workflows/dags.yml`，20 個測試）：以官方 constraints 安裝 Airflow 並用 DagBag 解析 `orchestration/dags/`。刻意不併進主 job——Airflow 安裝很重且 pin 了大量套件版本，會毀掉主 job「mock DB、數秒跑完」的速度優勢。它不需要 `DB_URL`，因為 DAG 檔刻意不 top-level import 專案模組（見 [ORCHESTRATION-TW §2.2](./ORCHESTRATION-TW.md)）。
 
@@ -585,7 +585,7 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-client 限流（slowapi，以認證 `client_id` 為 key、IP fallback），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 366 個測試，11 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 20 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] Pytest — 381 個測試，12 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 20 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）除 Airflow 重評估外皆已實作
 
 **Phase 3 — 工程化**
@@ -608,6 +608,7 @@ Looker Studio（直連 BigQuery）
 - [v] Celery + Redis（取代 BackgroundTasks）——`process_raw_event` 以薄包裝進 Celery task（`process.py` 零 Celery 依賴，保留手動補跑的救援路徑）；不開 result backend（任務狀態的真相是 `raw.status`）；`acks_late` + `reject_on_worker_lost`；broker 掛掉時 `POST /orders` 仍回 200 `pending`，由恢復掃描接手。設計與實測見 [QUEUE-TW.md](./QUEUE-TW.md)
 - [v] 恢復掃描搬到 Celery Beat——原本掛在 FastAPI lifespan 的 asyncio 迴圈是行程內狀態，移走後 API 才得以多行程；Beat 啟動時另補一次掃描，填住第一個排程間隔的空窗
 - [v] `raw.processing_started_at`——stale 逾時改由「開始處理」起算而非「攝入」。用 `received_at` 會在積壓時把正在處理的記錄誤判為逾時、收回重派，造成同一 `raw_id` 被兩個 worker 並行處理（實測 2000 筆積壓下重現 2 筆）。見 [QUEUE-TW §3.1](./QUEUE-TW.md)
+- [v] 派工熔斷器（`circuit_breaker.py`）——broker 不可用時的退化是**超線性**的（kombu producer pool 每行程上限 10），實測 48 併發下 47 筆在 120 秒內拿不到回應，而它們的 Raw **其實都已寫入**，客戶端只看到逾時、於是重送。連續失敗三次即開路，之後不再碰 Redis：p50 從「逾時」降到 **5ms**。連帶修掉 `db.refresh()` 開啟的交易跨越派工的問題（實測 60 併發時 32 個 pool 槽位有 23 個卡在 `idle in transaction`）
 - [v] Docker 擴展：補上 Redis + Celery Worker + Beat；api 開 4 個 uvicorn worker，限流計數器改走 Redis
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
   - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）

@@ -75,18 +75,51 @@ Verified: with the broker fully down, `POST /orders` still returns 200 (3.81s) w
 **That 3.81s is the degraded-mode latency for a fully dead broker**, not the normal path.
 Normally publishing is sub-millisecond.
 
-⚠️ **`_enqueue` keeps no "the broker is dead" state**, so while Redis is fully down **every
-request** pays that timeout again. Contrast the rate-limit storage: slowapi has a
-`_storage_dead` flag plus exponential backoff, so after detecting failure once it goes
-straight to the fallback (measured: 3.77s on the first request, 2.5ms thereafter). Stacked
-together, `POST /orders` measured 7–18s with Redis fully down.
+### 2.2 Dispatch must be circuit-broken ⭐
 
-The semantics stay correct (200 `pending`, data landed, the scan picks it up), but under
-sustained traffic that latency will time out upstream clients and trigger resends — flooding
-in Raws sharing one `order_id`. To reduce it, drop `socket_connect_timeout` to 1s and set
-`task_publish_retry_policy.max_retries` to 0 (trading away the immediate retry for a blip, so
-it waits for the next scan instead), or give `_enqueue` a circuit-breaker flag. **Deliberately
-not done yet** — no sustained traffic hits it today; see §6.
+That 3.81s is the **single-request** figure. Concurrency reveals the real shape:
+
+| Concurrency | Without a breaker |
+|---|---|
+| 1 | 3.8s |
+| 8 | 12.8s each |
+| 48 | **47 of 48 requests did not complete within 120s** |
+
+The degradation is **super-linear**: kombu's producer pool is capped at 10 per process, and
+with the broker unavailable every acquisition re-pays the connection timeout, so higher
+concurrency means longer queueing behind each other.
+
+**The danger is not the latency — it is silent success.** The Raw commit happens before the
+dispatch, so all 47 timed-out requests had in fact already persisted their data — while the
+client saw only a timeout. A timeout is semantically *undefined*, so the upstream can only
+resend, producing a second and third Raw for the same `order_id` that end up `duplicate` at
+the ODS layer. The signal itself is accurate (the upstream really did resend), but we caused it.
+
+The failure mode is **unbounded latency rather than fast rejection**: no 429, no 503, no
+`Retry-After` — the upstream receives nothing it can act on.
+
+`circuit_breaker.CircuitBreaker` closes this off: after a threshold of consecutive failures the
+circuit opens and `_enqueue` returns False immediately without touching Redis. It changes no
+external contract (still 200 `pending`, still picked up by the scan); it changes only the
+**cost**, making "entering the fallback" cheaper than the fallback itself. The design
+trade-offs (why the state is per-process, why half-open must be single-flight, why the lock
+never spans the call) are documented in that module.
+
+Measured results in §5.6.
+
+### 2.3 No DB transaction may span the dispatch ⭐
+
+In `create_order`, the `db.refresh(raw)` following `db.commit()` **opens a new transaction** to
+fetch the id, and that transaction only ends at `db.close()`. The dispatch sat in between — so
+during a broker outage every waiting request pinned a connection in `idle in transaction`
+(measured: 23 of 32 pool slots at 60 concurrent).
+
+Two costs: once the pool is saturated new requests can only wait out `pool_timeout`; and those
+long transactions hold back PostgreSQL's vacuum horizon, accelerating bloat on a
+high-write-volume table.
+
+The fix is to read `raw.id` out and then close the session explicitly, ending the transaction
+before the dispatch.
 
 ---
 
@@ -280,6 +313,33 @@ While Redis is down slowapi logs `falling back to in-memory storage` and degrade
 per-process counting; on recovery it logs `Rate limit storage recovered` and the limit is back
 to a precise 60/40.
 
+### 5.6 Circuit breaker: before and after
+
+Redis fully stopped, 4 uvicorn workers, same script:
+
+| | Result |
+|---|---|
+| No breaker, 48 concurrent | **47 of 48 did not complete within 120s** |
+| Breaker, 48 concurrent | 48/48 returned 200; batch took 18.4s |
+| Breaker, sustained load of 200 | **p50 = 5ms, p90 = 7ms**; 14 of 200 exceeded 1s |
+
+The first wave is still slow (18.4s) because with 48 requests arriving simultaneously the
+breaker has not opened yet — none of the three failures has *returned*, so the whole wave is
+already past the gate. That is inherent: a breaker protects everything after the first wave,
+bounding the cost at "one concurrency wave per process" rather than per request. Under
+sustained traffic that wave is a few seconds at the start of the incident.
+
+The remaining 14/200 tail is **not the dispatch** — it is the rate-limit storage re-probe.
+Broken out: after the circuit opens, `POST /orders` shows 4 requests at 0.02s (dispatch now
+free) and 4 at 3.63s, while `GET /raw/1` (rate limiting only) shows all 8 at 3.75s. slowapi's
+`_storage.check()` has no single-flight guard, so concurrent requests in one process all pile
+into the same probe.
+
+After the broker recovered, each of the 4 processes logged one `circuit_closed` and requests
+returned to 10–51ms with no restart. Across the whole incident there were **0** `派工失敗`
+error logs (pre-open failures are recorded as breaker state transitions instead), against one
+traceback per failed request before the change.
+
 ---
 
 ## 6. Known boundaries and deliberate non-goals
@@ -291,7 +351,7 @@ to a precise 60/40.
 | **Celery-level retry / dead-letter queue** | Failure semantics already land in `raw.status` (`error` is terminal and carries `error_message`) | When "business failure" and "infrastructure failure" need separate retry policies |
 | **Flower or similar UI** | With no result backend there is little for Flower to show; `raw.status` is the truth | Evaluate alongside OpenTelemetry (a separate Phase 5 roadmap item) |
 | **Back-pressure to upstream when the broker is down** | Current semantics ("accepted, delayed") are correct and require no upstream change | When the DB write itself becomes the bottleneck under backlog |
-| **A circuit-breaker flag for `_enqueue`** | With Redis fully down every request re-pays the connection timeout (see §2.1). Nothing today generates the sustained traffic that would hit it, and it would add another piece of state to maintain | Once ingestion traffic is continuous and a single Redis incident would make upstreams time out and resend |
+| **Single-flight for the rate-limit storage probe** | slowapi's `_storage.check()` has no single-flight guard, so while Redis is down concurrent requests in one process all pile into the same probe (measured 3.75s). This is the sole cause of §5.6's latency tail | Once the degraded-mode tail becomes a practical problem; the cheapest first step is lowering the rate-limit storage's `socket_connect_timeout` below 1s |
 
 ---
 

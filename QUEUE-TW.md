@@ -410,7 +410,49 @@ broker 復原後 4 個行程各記一次 `circuit_closed`，請求回到 10–51
 | **Celery 層 retry / 死信佇列** | 失敗語意已完整落在 `raw.status`（`error` 是終態，帶 `error_message`） | 需要區分「業務失敗」與「基礎設施失敗」並分別重試時 |
 | **Flower 等監控 UI** | 沒有 result backend，Flower 能看的東西有限；`raw.status` 才是真相 | 接 OpenTelemetry 時一併評估（藍圖 Phase 5 獨立項）|
 | **broker 掛掉時回壓上游** | 現在是「收下但延遲」，語意正確且上游不需要改 | 積壓到 DB 寫入本身成為瓶頸時 |
+| **`raw.status` 的索引** | 索引的形狀取決於活躍集比例、`status` 變動速率與真實查詢計畫；沒有真實流量就只能拿自己造的分佈自問自答（見 §6.1） | 接上真實流量、能用 `pg_stat_statements` 量到這條查詢的實際成本時 |
 | **限流儲存重探的 single-flight** | slowapi 的 `_storage.check()` 沒有單飛保護，Redis 停機期間同一行程的併發請求會一起撞那次探測（實測 3.75s）。這是 §5.6 那條長尾的唯一成因 | 降級延遲的長尾成為實際問題時；最省力的第一步是把限流儲存的 `socket_connect_timeout` 從 1s 再調小 |
+
+
+### 6.1 `raw.status` 沒有索引 ⚠️
+
+`raw` 目前只有三個索引：主鍵 `pk_raw (id)`、`ix_raw_order_id`、
+`ix_raw_source_client_id`。`status`、`received_at`、`processing_started_at` 都沒有。
+而恢復掃描的查詢形狀是：
+
+```sql
+WHERE status = 'pending' AND received_at < ... AND id > ... ORDER BY id LIMIT ...
+```
+
+穩態下絕大多數列都停在 `processed` / `duplicate` 這類終態，真正需要被掃到的活躍集
+（`pending` / `processing`）只佔極小比例。沒有支援索引時，這個查詢得從大量終態列裡
+撈出那一小撮——而且 §4.1 的分頁讓單輪最多跑 20 次，**同一次事故裡這條查詢會被重複
+執行 20 次**。分頁收斂的是記憶體與派工量，**不是查詢成本**。
+
+方向大致是部分索引（只索引活躍集，索引本身就很小）：
+
+```sql
+CREATE INDEX ... ON raw (status, id) WHERE status IN ('pending', 'processing');
+```
+
+**但現在不做，因為現在做等於自問自答。** 索引的價值與形狀取決於幾件只有真實流量
+才知道的事：
+
+- **活躍集佔全表的比例**——部分索引的整個價值就建立在這個比例上
+- **`status` 的變動速率**——每次狀態轉移都要維護索引，寫入放大是有代價的
+- **真正的執行計畫**——Postgres 用不用得上這個索引取決於統計資訊
+- **欄位組合**——要不要含 `received_at`（寬限期過濾），還是 `(status, id)` 就夠
+
+拿自己造的資料去 `EXPLAIN`，得到的只會是「對這批假資料最佳」的索引；而那批假資料
+的分佈是我自己決定的，等於先射箭再畫靶，結論無法外推到真實負載。多餘的索引也不是
+沒有代價：它會拖慢每一次寫入，而且一旦上線就很少有人敢拆。
+
+**應該用什麼決定**：接上真實流量後，以 `pg_stat_statements` 量這條查詢佔整體的比重、
+以 `pg_stat_user_tables` 看活躍集相對全表的大小，再用 `EXPLAIN (ANALYZE, BUFFERS)`
+對照加與不加索引的實際差異。欄位順序與是否 partial 由那組數據決定。
+
+目前的部署規模（demo 資料十萬筆量級）量不出差異，所以這不是當下的風險，而是
+**上真實流量前必須先處理掉的事**。
 
 ---
 

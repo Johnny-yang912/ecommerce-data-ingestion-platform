@@ -609,7 +609,7 @@ Looker Studio（直連 BigQuery）
 - [v] 恢復掃描搬到 Celery Beat——原本掛在 FastAPI lifespan 的 asyncio 迴圈是行程內狀態，移走後 API 才得以多行程；Beat 啟動時另補一次掃描，填住第一個排程間隔的空窗
 - [v] `raw.processing_started_at`——stale 逾時改由「開始處理」起算而非「攝入」。用 `received_at` 會在積壓時把正在處理的記錄誤判為逾時、收回重派，造成同一 `raw_id` 被兩個 worker 並行處理（實測 2000 筆積壓下重現 2 筆）。見 [QUEUE-TW §3.1](./QUEUE-TW.md)
 - [v] 派工熔斷器（`circuit_breaker.py`）——broker 不可用時的退化是**超線性**的（kombu producer pool 每行程上限 10），實測 48 併發下 47 筆在 120 秒內拿不到回應，而它們的 Raw **其實都已寫入**，客戶端只看到逾時、於是重送。連續失敗三次即開路，之後不再碰 Redis：p50 從「逾時」降到 **5ms**。連帶修掉 `db.refresh()` 開啟的交易跨越派工的問題（實測 60 併發時 32 個 pool 槽位有 23 個卡在 `idle in transaction`）
-- [v] 有界的恢復掃描——熔斷器讓事故期間攝入維持全速，代價是 `pending` 也全速累積，原本「一次撈完所有 pending 逐一派工」等於把剛避開的崩潰搬到恢復路徑。改為 `LIMIT` + `id` 游標分頁（派工不改 status，光有 LIMIT 每輪會撈到同一批）、單輪頁數上限、Redis 鎖擋重疊，並加寬限期讓剛攝入的 pending 留給攝入路徑。實測 120,000 積壓：掃描 #1 送出 100,000（上限）、#2 送出 20,000，ODS 恰好 +120,000、重複 0 筆
+- [v] 有界的恢復掃描——熔斷器讓事故期間攝入維持全速，代價是 `pending` 也全速累積，原本「一次撈完所有 pending 逐一派工」等於把剛避開的崩潰搬到恢復路徑。改為 `LIMIT` + `id` 游標分頁（派工不改 status，光有 LIMIT 每輪會撈到同一批）、單輪頁數上限、Redis 鎖擋重疊，並加寬限期讓剛攝入的 pending 留給攝入路徑。實測 120,000 積壓：掃描 #1 送出 100,000（上限）、#2 送出 20,000，ODS 恰好 +120,000、重複 0 筆。⚠️ **前提未完備**：`raw.status` 目前沒有索引，分頁收斂的是記憶體與派工量而非查詢成本；索引形狀需由真實流量決定，不能用自造資料的 `EXPLAIN` 下結論（見 [QUEUE-TW §6.1](./QUEUE-TW.md)）
 - [v] Docker 擴展：補上 Redis + Celery Worker + Beat；api 開 4 個 uvicorn worker，限流計數器改走 Redis
 - [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
   - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）

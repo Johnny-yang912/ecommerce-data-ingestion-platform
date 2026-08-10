@@ -469,7 +469,55 @@ protection are.
 | **Celery-level retry / dead-letter queue** | Failure semantics already land in `raw.status` (`error` is terminal and carries `error_message`) | When "business failure" and "infrastructure failure" need separate retry policies |
 | **Flower or similar UI** | With no result backend there is little for Flower to show; `raw.status` is the truth | Evaluate alongside OpenTelemetry (a separate Phase 5 roadmap item) |
 | **Back-pressure to upstream when the broker is down** | Current semantics ("accepted, delayed") are correct and require no upstream change | When the DB write itself becomes the bottleneck under backlog |
+| **An index on `raw.status`** | The right index shape depends on the active-set ratio, how fast `status` churns, and the real query plan; without real traffic all you can do is interrogate a distribution you invented yourself (see §6.1) | Once real traffic is flowing and `pg_stat_statements` can measure what this query actually costs |
 | **Single-flight for the rate-limit storage probe** | slowapi's `_storage.check()` has no single-flight guard, so while Redis is down concurrent requests in one process all pile into the same probe (measured 3.75s). This is the sole cause of §5.6's latency tail | Once the degraded-mode tail becomes a practical problem; the cheapest first step is lowering the rate-limit storage's `socket_connect_timeout` below 1s |
+
+
+### 6.1 `raw.status` has no index ⚠️
+
+`raw` currently carries three indexes: the primary key `pk_raw (id)`, `ix_raw_order_id`, and
+`ix_raw_source_client_id`. There is none on `status`, `received_at`, or
+`processing_started_at`. The recovery scan's query, meanwhile, looks like:
+
+```sql
+WHERE status = 'pending' AND received_at < ... AND id > ... ORDER BY id LIMIT ...
+```
+
+In steady state the overwhelming majority of rows sit in terminal states (`processed` /
+`duplicate`), and the active set that actually needs scanning (`pending` / `processing`) is a
+tiny fraction. With no supporting index the query has to dig that handful out from among all
+the terminal rows — and §4.1's pagination runs up to 20 rounds, so **this query is executed 20
+times over during a single incident**. Pagination bounds memory and dispatch volume; it does
+**not** bound query cost.
+
+The likely direction is a partial index covering only the active set, which keeps the index
+itself small:
+
+```sql
+CREATE INDEX ... ON raw (status, id) WHERE status IN ('pending', 'processing');
+```
+
+**It is deliberately not being added yet, because adding it now would be circular reasoning.**
+An index's value and shape depend on things only real traffic reveals:
+
+- **What fraction of the table the active set is** — a partial index's entire value rests on it
+- **How fast `status` churns** — every state transition maintains the index; write amplification is a real cost
+- **The actual execution plan** — whether Postgres even chooses the index depends on its statistics
+- **The column combination** — whether `received_at` (the grace-period filter) belongs in it, or `(status, id)` suffices
+
+Running `EXPLAIN` against data I generated myself only yields the index that is optimal *for
+that fabricated distribution* — and I chose that distribution, so the conclusion cannot be
+extrapolated to a real workload. A superfluous index is not free either: it slows every write,
+and once it is in production almost nobody dares remove it.
+
+**What should decide it**: with real traffic flowing, measure this query's share with
+`pg_stat_statements`, size the active set against the whole table with `pg_stat_user_tables`,
+then compare with and without the index using `EXPLAIN (ANALYZE, BUFFERS)`. Column order and
+whether it should be partial follow from those numbers.
+
+At the current deployment size (demo data in the hundred-thousand range) the difference is not
+measurable, so this is not a present-day risk — it is **something that must be settled before
+real traffic arrives**.
 
 ---
 

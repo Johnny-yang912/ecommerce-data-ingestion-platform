@@ -93,6 +93,50 @@ SIGKILL 之後 150 筆永久卡在 `pending`，重啟沒有任何機制知道要
 > ⚠️ 未來看到「都已經有持久化佇列了」就想拿掉週期掃描的人，請先讀完這張表。
 > 拿掉之後，第二列那些記錄會**永久**卡在 `processing`。
 
+### 3.1 逾時基準必須是 `processing_started_at`，不是 `received_at` ⭐
+
+上表第二列的恢復靠 stale 掃描，而 stale 掃描要問的是
+**「這次處理跑了多久」**。`received_at` 回答的卻是**「這筆資料躺了多久」**——
+平時兩者幾乎相等（進來就處理），**積壓時相差極大，而積壓正是這個判定最常被觸發的
+時候**。
+
+用 `received_at` 當基準會炸出下面這條時間軸（已實測重現，數據見 §5.4）：
+
+```
+T-30min  訂單攝入，received_at = T-30min，因 broker 停機留在 pending
+T+0      broker 復原，掃描派工；worker A 搶佔成功 → status = processing
+T+0.01   worker A 正在清洗、組 ODS（尚未 commit）
+T+0.02   下一輪掃描：status='processing' ✓ 且 received_at < now()-10min ✓
+         → 判定 stale → 改回 pending → 再派一則新訊息
+T+0.03   worker B 搶佔：狀態現在是 pending，CAS 成功 ← 擋不住
+         同一個 raw_id 有兩個 worker 在跑
+T+0.05   A 先 commit：ods.raw_id 落地，raw.status = 'processed'
+T+0.06   B 撞到「自己」寫的 ODS，被判為 duplicate，蓋掉 processed
+```
+
+三件事值得特別指出：
+
+1. **CAS 沒有失效**。它防的是「同一個狀態下的競爭」，防不了「狀態被第三方倒退回
+   `pending`」。號碼牌在處理中途被收回重發，第二次搶奪就成了合法動作。
+2. **第二個 worker 不是 Celery 重投遞來的**，是掃描自己 `.delay()` 出來的一則全新
+   訊息。單純的重投遞反而是安全的——CAS 會讓它 `rowcount==0` 直接 return。
+3. **資料不會壞，壞的是訊號**。ODS 的 `UNIQUE(raw_id)` / `UNIQUE(order_id)` 擋住了
+   重複寫入，但那筆其實處理成功的訂單最終頂著 `duplicate`——污染了「上游重送」這個
+   刻意保留的監控語意（見 CLAUDE.md 架構約束）。加上白做的一份工，發生在系統
+   正在追進度的時候。
+
+改用 `processing_started_at`（由 `try_claim_raw` 在搶佔成功時蓋上）之後，計時從
+「開始處理」起算，與資料躺多久無關，`T+0.02` 那一步不再成立。
+
+**自我碰撞因此不可達**：全專案只有 `try_claim_raw` 會把狀態寫成 `processing`，
+也只有 stale 掃描會把它退回 `pending`（`/process_raw?force=true` 只接受 `error` /
+`duplicate`）。堵住這唯一的倒退路徑，症狀就沒有來源了——所以**不需要**再為
+「自我碰撞」另外加一個訊號，那會是一個永遠為 0 的指標。
+
+> **不變式**：`status='processing'` ⇒ `processing_started_at` 非空。
+> 由 `try_claim_raw` 保證，並由 migration `e5f6a7b8c9d0` 對既有資料 backfill 建立。
+> 若這個不變式被破壞（例如手動寫 DB），該筆會永遠不符合 stale 條件而卡死。
+
 ---
 
 ## 4. 恢復掃描為什麼在 Beat 而不在 API
@@ -129,13 +173,13 @@ API 一旦跑多個 uvicorn worker，每個行程都會各跑一份掃描。搬�
 |---|---|---|---|
 | SIGKILL 當下 | 537 | 2 | 261 |
 | worker 重啟後 30s | 0 | **2** | 798 |
-| `received_at` 回推 11 分鐘、等一輪掃描 | 0 | 0 | **800** |
+| `processing_started_at` 回推 11 分鐘、等一輪掃描 | 0 | 0 | **800** |
 
 最終 ODS 800 筆，**零遺失**。
 
 這張表就是 §3 恢復矩陣的實體：537 筆在佇列裡的靠重新投遞自行排空，而 SIGKILL 當下
 正在處理的那 **2 筆卡在 `processing`，重啟 worker 完全救不了它們**——只有 stale 掃描
-能。（第三列用回推 `received_at` 模擬滿 10 分鐘，避免實測乾等。）
+能。（第三列用回推 `processing_started_at` 模擬滿 10 分鐘，避免實測乾等。）
 
 對照 README 壓力測試「測試五」的舊結論——「150 筆永久卡在 pending，重啟後無自動
 recovery」——這一項到此翻案。
@@ -150,6 +194,29 @@ Beat 於 `05:58:38` 啟動，`beat_init` 派出的掃描在 `05:58:39` 被 worke
 見 §2.1。`POST /orders` → HTTP 200 + `pending`（3.81s），資料落地；`/health` 1.7ms。
 Redis 復原後，積壓的 2 筆由掃描撿回並處理完成。
 
+### 5.4 逾時基準：修正前後對照
+
+同一組腳本、同一份資料，只差 §3.1 的基準欄位。灌入 2000 筆
+`received_at = now() - 30 分鐘` 的 pending（模擬 broker 長時間停機後的積壓），
+`SCAN_INTERVAL_SECONDS=5` 加密掃描頻率：
+
+| | `processed` | `duplicate` | 自我碰撞 |
+|---|---|---|---|
+| 修正前（基準 `received_at`） | 1998 | **2** | **2** |
+| 修正後（基準 `processing_started_at`） | **2000** | 0 | **0** |
+
+自我碰撞以 `raw.status='duplicate'` ⋈ `ods.raw_id = raw.id` 判定。修正前那 2 筆的
+`error_message` 直接寫著「已由 raw_id=1998 寫入 ODS」——而 1998 就是它自己；
+且該 `order_id` 在 `raw` 表只出現一次，排除上游重送的可能。
+
+**量級說明**：每輪掃描命中的筆數 ≈ 當下併發處理中的筆數 ≈ worker concurrency，
+與積壓總量無關（單筆處理約 40ms，掃描間隔遠大於它）。所以是「罕見但真實」，
+不是大規模污染——但它專挑系統正在追進度的時候發生。
+
+接著重跑 §5.1 的 SIGKILL 情境確認**沒有修壞恢復機制本身**：2 筆卡在
+`processing` 的記錄照樣被回收，最終 2900 筆全數 `processed`、ODS 2900 筆、
+自我碰撞 0。
+
 ---
 
 ## 6. 已知邊界與刻意先不做
@@ -161,23 +228,6 @@ Redis 復原後，積壓的 2 筆由掃描撿回並處理完成。
 | **Celery 層 retry / 死信佇列** | 失敗語意已完整落在 `raw.status`（`error` 是終態，帶 `error_message`） | 需要區分「業務失敗」與「基礎設施失敗」並分別重試時 |
 | **Flower 等監控 UI** | 沒有 result backend，Flower 能看的東西有限；`raw.status` 才是真相 | 接 OpenTelemetry 時一併評估（藍圖 Phase 5 獨立項）|
 | **broker 掛掉時回壓上游** | 現在是「收下但延遲」，語意正確且上游不需要改 | 積壓到 DB 寫入本身成為瓶頸時 |
-
-### 6.1 已知缺陷：stale 判定用的是 `received_at` ⚠️
-
-`scan_and_recover` 判定 stale 的條件是
-`status = 'processing' AND received_at < now() - STALE_PROCESSING_MINUTES`，
-而 `received_at` 是**攝入時間**，不是**開始處理的時間**。
-
-在長積壓的情境下這會誤判：broker 停機 15 分鐘累積的記錄，復原後被 worker claim 成
-`processing`，下一輪掃描立刻認定它們「已 stale」並重設為 `pending` ——即使 worker
-正在處理。結果是同一筆被並行處理兩次，落敗方吃 `IntegrityError` 後把 `raw.status`
-覆寫成 `duplicate`，讓一筆其實處理成功的訂單帶著誤導性的狀態。
-
-資料不會壞（ODS 的 UNIQUE 約束擋住重複寫入），壞的是**監控訊號**——而 `duplicate`
-在本專案是刻意保留的監控語意（見 CLAUDE.md 架構約束）。
-
-這個缺陷在 `BackgroundTasks` 時代很難踩到（任務會直接消失而非積壓），持久化佇列
-讓它變得可達。**修法需要 schema 變更，尚未實作**，選項見 README 的 Phase 5 待辦。
 
 ---
 
@@ -206,5 +256,6 @@ SCAN_INTERVAL_SECONDS=20 docker compose up -d
 ```
 
 **卡在 `processing` 的記錄怎麼辦**：不要手動改 status。等 stale 掃描（10 分鐘）自動
-處理即可——這正是它存在的理由。若確定要立刻恢復，把該筆 `received_at` 回推超過
-`STALE_PROCESSING_MINUTES` 再等一輪掃描，語意上等同於「宣告它已經逾時」。
+處理即可——這正是它存在的理由。若確定要立刻恢復，把該筆 `processing_started_at`
+回推超過 `STALE_PROCESSING_MINUTES` 再等一輪掃描，語意上等同於「宣告這次處理已經
+逾時」。**不要改 `received_at`**：它是攝入時刻、屬於資料血緣，與逾時判定無關（原因見 §3.1）。

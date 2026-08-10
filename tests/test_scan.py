@@ -11,8 +11,8 @@ scan_and_recover : stale processing 重設 / pending 收集 / commit 行為
 from unittest.mock import MagicMock, patch
 
 import process
-from process import scan_and_recover, STALE_PROCESSING_MINUTES
-from helpers import scalars_result
+from process import scan_and_recover, try_claim_raw, STALE_PROCESSING_MINUTES
+from helpers import scalars_result, claim_result
 
 
 # ─── scan_and_recover Helper ──────────────────────────────────────────────────
@@ -32,7 +32,7 @@ def make_scan_db(exec_results: list) -> MagicMock:
 # ─── scan_and_recover 單元測試 ────────────────────────────────────────────────
 #
 # execute 呼叫順序：
-#   1. SELECT stale processing（received_at < threshold）
+#   1. SELECT stale processing（processing_started_at < threshold）
 #   2. [if stale] UPDATE stale → pending
 #   3. SELECT all pending
 
@@ -82,7 +82,7 @@ class TestScanAndRecover:
 
     def test_recent_processing_not_in_stale_result(self):
         """
-        recent processing（< 門檻）→ DB 的 WHERE received_at < threshold 條件
+        recent processing（< 門檻）→ DB 的 WHERE processing_started_at < threshold 條件
         已在查詢層過濾，stale query 回傳空，不被重設。
         """
         mock_db = make_scan_db([
@@ -95,3 +95,49 @@ class TestScanAndRecover:
 
         assert result == []
         assert mock_db.commit.call_count == 0
+
+
+# ─── 逾時基準：processing_started_at ⭐ ───────────────────────────────────────
+#
+# 這組守的是一個實測過的迴歸（見 QUEUE-TW.md §3.1／§5.4）：逾時基準若用 received_at，
+# 積壓中的記錄會在「剛被搶佔、正在處理」時就符合逾時條件，被掃描收回改回 pending
+# 並重新派工 → 同一個 raw_id 兩個 worker 並行 → 落敗方被誤標為 duplicate。
+# CAS 擋不住這件事，因為狀態是被第三方倒退回 pending 的。
+
+class TestStaleBasis:
+
+    def test_stale_query_filters_on_processing_started_at(self):
+        """
+        逾時判定必須看「這次處理跑了多久」（processing_started_at），
+        不能看「這筆資料躺了多久」（received_at）——積壓時兩者天差地遠。
+        """
+        captured = []
+
+        mock_db = MagicMock()
+        def _execute(stmt):
+            captured.append(str(stmt))
+            return scalars_result([])
+        mock_db.execute.side_effect = _execute
+
+        with patch("process.SessionLocal", return_value=mock_db):
+            scan_and_recover()
+
+        stale_query = captured[0]
+        assert "processing_started_at" in stale_query
+        assert "received_at" not in stale_query
+
+    def test_claim_stamps_processing_started_at(self):
+        """
+        搶佔成功時必須蓋上 processing_started_at，否則上面那條查詢永遠比不到東西，
+        stale 記錄會從「10 分鐘後恢復」變成「永久卡死」。
+        """
+        captured = []
+
+        mock_db = MagicMock()
+        def _execute(stmt):
+            captured.append(str(stmt))
+            return claim_result(1)
+        mock_db.execute.side_effect = _execute
+
+        assert try_claim_raw(mock_db, 1) is True
+        assert "processing_started_at" in captured[0]

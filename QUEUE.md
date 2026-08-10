@@ -105,6 +105,58 @@ Two consequences, both important:
 > ⚠️ If you are about to remove the periodic scan because "we have a durable queue now",
 > read that table first. Without it, the second row stays stuck in `processing` **forever**.
 
+### 3.1 Staleness must be judged by `processing_started_at`, not `received_at` ⭐
+
+Recovering the second row above depends on the stale scan, and what that scan needs to ask is
+**"how long has this attempt been running?"** `received_at` answers a different question —
+**"how long has this record been sitting around?"** The two are nearly identical in normal
+operation (ingest, then process immediately) and **wildly different under backlog — which is
+exactly when this check matters most**.
+
+Using `received_at` produces the following timeline (reproduced live; numbers in §5.4):
+
+```
+T-30min  Order ingested; received_at = T-30min; stays pending because the broker is down
+T+0      Broker recovers, the scan dispatches; worker A claims it → status = processing
+T+0.01   Worker A is cleaning and building the ODS row (not committed yet)
+T+0.02   Next scan tick: status='processing' ✓ AND received_at < now()-10min ✓
+         → declared stale → reset to pending → a fresh message is dispatched
+T+0.03   Worker B claims it: the status is pending again, so CAS succeeds ← nothing blocks it
+         Two workers are now running the same raw_id
+T+0.05   A commits first: ods.raw_id lands, raw.status = 'processed'
+T+0.06   B collides with the ODS row *it wrote itself*, is judged a duplicate,
+         and overwrites 'processed'
+```
+
+Three points deserve emphasis:
+
+1. **CAS did not fail.** It guards against contention *within one state*; it cannot guard
+   against a third party rolling the state back to `pending`. Once the ticket is revoked
+   mid-processing and reissued, a second claim is a perfectly legal move.
+2. **The second worker did not come from Celery redelivery** — it came from a brand-new
+   message the scan itself dispatched. Plain redelivery is in fact safe: CAS makes it
+   `rowcount == 0` and the task returns immediately.
+3. **The data stays correct; the signal does not.** ODS's `UNIQUE(raw_id)` /
+   `UNIQUE(order_id)` block the double write, but an order that genuinely succeeded ends up
+   labelled `duplicate` — contaminating the deliberately preserved "upstream resent it"
+   monitoring semantic (see CLAUDE.md's architecture constraints). Plus one batch of wasted
+   work, performed precisely while the system is trying to catch up.
+
+Switching to `processing_started_at` (stamped by `try_claim_raw` on a successful claim) makes
+the clock start at "processing began", independent of how long the record sat around, so step
+`T+0.02` no longer holds.
+
+**Self-collision therefore becomes unreachable**: `try_claim_raw` is the only thing in the
+codebase that writes the `processing` state, and the stale scan is the only thing that rolls
+it back to `pending` (`/process_raw?force=true` accepts only `error` / `duplicate`). Plug that
+single reversal path and the symptom has no source left — which is why **no separate
+"self-collision" signal is needed**; it would be a metric permanently pinned at zero.
+
+> **Invariant**: `status='processing'` ⇒ `processing_started_at` is not null. Enforced by
+> `try_claim_raw`, and established for pre-existing rows by migration `e5f6a7b8c9d0`'s
+> backfill. If the invariant is broken (e.g. by hand-editing the DB), that row will never
+> satisfy the stale condition and will hang forever.
+
 ---
 
 ## 4. Why the recovery scan lives in Beat, not the API
@@ -148,15 +200,15 @@ shorten the observation window.
 |---|---|---|---|
 | At SIGKILL | 537 | 2 | 261 |
 | 30s after worker restart | 0 | **2** | 798 |
-| `received_at` backdated 11 min, one scan later | 0 | 0 | **800** |
+| `processing_started_at` backdated 11 min, one scan later | 0 | 0 | **800** |
 
 Final ODS count: 800. **Nothing lost.**
 
 That table is §3's recovery matrix made concrete: the 537 still in the queue drained
 themselves via redelivery, while the **2 that were mid-processing at SIGKILL stayed stuck in
 `processing` — restarting the worker could not save them.** Only the stale scan could. (The
-third row backdates `received_at` to simulate the 10-minute threshold rather than idling
-through it.)
+third row backdates `processing_started_at` to simulate the 10-minute threshold rather than
+idling through it.)
 
 Against the old conclusion in README stress test #5 — "150 records stuck in pending forever,
 no automatic recovery on restart" — this item is now overturned.
@@ -172,6 +224,30 @@ the first interval's gap.
 See §2.1. `POST /orders` → HTTP 200 + `pending` (3.81s), data landed; `/health` 1.7ms. After
 Redis came back, the 2 stranded records were picked up by the scan and completed.
 
+### 5.4 Staleness basis: before and after
+
+The same script over the same data; only §3.1's basis column differs. 2000 records inserted as
+`pending` with `received_at = now() - 30 minutes` (simulating the backlog left by a long broker
+outage), with `SCAN_INTERVAL_SECONDS=5` to tighten the scan cadence:
+
+| | `processed` | `duplicate` | Self-collisions |
+|---|---|---|---|
+| Before (basis `received_at`) | 1998 | **2** | **2** |
+| After (basis `processing_started_at`) | **2000** | 0 | **0** |
+
+Self-collisions are identified by `raw.status='duplicate'` ⋈ `ods.raw_id = raw.id`. The two
+offenders' `error_message` literally read "already written by raw_id=1998" — where 1998 *is*
+their own id — and that `order_id` appears exactly once in `raw`, ruling out an upstream resend.
+
+**On magnitude**: the number of records hit per scan tick ≈ the number concurrently in
+`processing` ≈ worker concurrency, independent of total backlog size (a single record takes
+~40ms, far below the scan interval). So this is "rare but real", not wholesale contamination —
+but it specifically strikes while the system is catching up.
+
+The §5.1 SIGKILL scenario was then re-run to confirm **the recovery mechanism itself was not
+broken**: the 2 records stuck in `processing` were reclaimed as before, ending with all 2900
+records `processed`, 2900 ODS rows, and 0 self-collisions.
+
 ---
 
 ## 6. Known boundaries and deliberate non-goals
@@ -183,26 +259,6 @@ Redis came back, the 2 stranded records were picked up by the scan and completed
 | **Celery-level retry / dead-letter queue** | Failure semantics already land in `raw.status` (`error` is terminal and carries `error_message`) | When "business failure" and "infrastructure failure" need separate retry policies |
 | **Flower or similar UI** | With no result backend there is little for Flower to show; `raw.status` is the truth | Evaluate alongside OpenTelemetry (a separate Phase 5 roadmap item) |
 | **Back-pressure to upstream when the broker is down** | Current semantics ("accepted, delayed") are correct and require no upstream change | When the DB write itself becomes the bottleneck under backlog |
-
-### 6.1 Known defect: staleness is judged by `received_at` ⚠️
-
-`scan_and_recover` decides staleness with
-`status = 'processing' AND received_at < now() - STALE_PROCESSING_MINUTES`, where
-`received_at` is the **ingestion** time, not the time processing **started**.
-
-Under a long backlog this misfires: records accumulated during a 15-minute broker outage get
-claimed into `processing` after recovery, and the very next scan declares them stale and
-resets them to `pending` — while a worker is actively processing them. The same record then
-runs twice concurrently; the loser hits `IntegrityError` and overwrites `raw.status` with
-`duplicate`, leaving an order that actually succeeded carrying a misleading status.
-
-The data stays correct (ODS's UNIQUE constraints block the double write); what breaks is the
-**monitoring signal** — and `duplicate` is a deliberately preserved monitoring semantic in
-this project (see CLAUDE.md's architecture constraints).
-
-This defect was hard to hit in the `BackgroundTasks` era (tasks vanished rather than backing
-up); a durable queue makes it reachable. **Fixing it requires a schema change and is not yet
-implemented** — see the Phase 5 to-do list in the README.
 
 ---
 
@@ -232,5 +288,7 @@ SCAN_INTERVAL_SECONDS=20 docker compose up -d
 
 **What to do about records stuck in `processing`**: do not edit `status` by hand. Let the
 stale scan handle it after 10 minutes — that is exactly what it is for. If immediate recovery
-is genuinely needed, backdate that record's `received_at` beyond
-`STALE_PROCESSING_MINUTES` and wait one scan; semantically that is "declaring it timed out".
+is genuinely needed, backdate that record's `processing_started_at` beyond
+`STALE_PROCESSING_MINUTES` and wait one scan; semantically that is "declaring this attempt
+timed out". **Do not touch `received_at`** — it is the ingestion timestamp, part of the data's
+lineage, and has nothing to do with the timeout decision (see §3.1).

@@ -13,6 +13,13 @@ class Raw(Base):
     error_message = Column(Text, nullable=True)
     processed_at = Column(DateTime, nullable=True)
 
+    # 進入 processing 的時刻，由 try_claim_raw 在 CAS 搶佔成功時蓋上。
+    # 存在的理由是 stale 判定需要「這次處理跑了多久」，而 received_at 回答的是
+    # 「這筆資料躺了多久」——積壓時兩者會差很遠，用錯會把正在處理的記錄誤判為逾時
+    # 並收回重派（見 process.scan_and_recover 的時間軸說明與 QUEUE-TW.md §3.1）。
+    # nullable：從未被搶佔過的記錄沒有這個時刻；status='processing' 時必為非空。
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)
+
     # 系統攤平欄位
     order_id = Column(String(50), nullable=True, index=True)
 

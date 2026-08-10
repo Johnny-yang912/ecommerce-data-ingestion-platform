@@ -20,7 +20,13 @@ STALE_PROCESSING_MINUTES = 10
 
 
 def try_claim_raw(db, raw_id: int) -> bool:
-    claim = (update(Raw).where(and_(Raw.id == raw_id, Raw.status == "pending")).values(status="processing"))
+    # 搶佔成功的同時蓋上 processing_started_at：stale 判定要問的是「這次處理跑了多久」，
+    # 這裡是唯一能回答它的時點（也是唯一進入 processing 的路徑）。見 scan_and_recover。
+    claim = (
+        update(Raw)
+        .where(and_(Raw.id == raw_id, Raw.status == "pending"))
+        .values(status="processing", processing_started_at=datetime.now(UTC))
+    )
     result = db.execute(claim)
     return result.rowcount == 1
 
@@ -257,8 +263,37 @@ def scan_and_recover() -> list[int]:
     掃描 stuck records 並回傳需要重新處理的 raw_id list。
 
     Step 1: stale processing（> STALE_PROCESSING_MINUTES）→ 重設為 pending
-            ⚠️ 若 ODS 已寫入，重跑時 idempotency 保護會攔截重複寫入，標為 duplicate
     Step 2: 收集所有 pending（含剛重設的）回傳給 caller 排程
+
+    ── 為什麼逾時基準是 processing_started_at 而不是 received_at ──────────────
+
+    這裡要判定的是「**這次處理**跑太久了，worker 大概已經死了」。received_at 回答
+    的卻是「這筆資料**躺了**多久」——兩者在平時幾乎相等（進來就處理），在積壓時
+    相差極大，而積壓正是這個判定最常被觸發的時候。
+
+    用 received_at 會炸的時間軸（實測可重現，見 QUEUE-TW.md §3.1／§5.4）：
+
+        T-30min  訂單攝入，received_at = T-30min，因 broker 停機留在 pending
+        T+0      broker 復原，掃描派工；worker A 搶佔成功 → status = processing
+        T+0.01   worker A 正在清洗、組 ODS（尚未 commit）
+        T+0.02   下一輪掃描：status='processing' ✓ 且 received_at < now()-10min ✓
+                 → 判定 stale → 改回 pending → 再派一則新訊息
+        T+0.03   worker B 搶佔：狀態現在是 pending，CAS 成功 ← 擋不住
+                 同一個 raw_id 有兩個 worker 在跑
+        T+0.05   A 先 commit：ods.raw_id 落地，raw.status = 'processed'
+        T+0.06   B 撞到「自己」寫的 ODS，被判為 duplicate，蓋掉 processed
+
+    注意 CAS 沒有失效——它防的是同一個狀態下的競爭，防不了狀態被第三方倒退回
+    pending。結果是一筆其實處理成功的訂單頂著 duplicate，污染了「上游重送」這個
+    刻意保留的監控語意（見 CLAUDE.md 架構約束）。資料本身不會壞（ODS 的 UNIQUE
+    擋住重複寫入），壞的是訊號與白做的工。
+
+    改用 processing_started_at 之後，計時從「搶佔成功」起算，與資料躺多久無關，
+    上面 T+0.02 那步就不再成立——自我碰撞因此**不可達**（全專案只有 try_claim_raw
+    會寫入 processing，也只有這裡會把它退回 pending）。
+
+    不變式：status='processing' ⇒ processing_started_at 非空。由 try_claim_raw
+    保證，並由 migration e5f6a7b8c9d0 對既有資料做 backfill 建立。
     """
     db = SessionLocal()
     try:
@@ -266,7 +301,7 @@ def scan_and_recover() -> list[int]:
 
         stale_ids = db.execute(
             select(Raw.id).where(
-                and_(Raw.status == "processing", Raw.received_at < threshold)
+                and_(Raw.status == "processing", Raw.processing_started_at < threshold)
             )
         ).scalars().all()
 

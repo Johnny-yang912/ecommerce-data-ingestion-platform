@@ -12,6 +12,7 @@ pin 打架。見 .github/workflows/dags.yml。
 """
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -124,6 +125,204 @@ class TestFreshnessIsolation:
         dag = dagbag.dags["source_freshness_watch"]
         assert len(dag.tasks) == 1
         assert dag.tasks[0].retries == 0     # stale 是 deterministic，重跑答案一樣
+
+
+class TestSeedDemoDaily:
+    """seeding 已經不是輔助腳本，而是這個系統唯一的資料來源，故比照管線 DAG 測。"""
+
+    @pytest.fixture
+    def dag(self, dagbag):
+        return dagbag.dags["seed_demo_daily"]
+
+    def test_no_retries(self, dag):
+        """⭐ 與 extract 的 retries=2 方向相反，而且這個不對稱是重點。
+
+        extract 重試安全（`>=` watermark 寧可重抓，重複由 stg_ 去重）；
+        seeding 重試是【真的多灌一批】——order_id 帶 wall-clock 批次標記，不撞冪等，
+        當天資料翻倍、髒率被稀釋、Hard Gate 的門檻線失真。
+        重試的前提是操作冪等，不是「失敗了就再試一次」這個直覺。"""
+        for task in dag.tasks:
+            assert task.retries == 0
+
+    def test_all_slots_land_in_one_utc_partition(self, dag):
+        """⭐ 正確性約束：所有時段必須在台北 08:00 之後。
+
+        Hard Gate 的口徑是【最新的一個 UTC 日分區】，而 received_at 的 date()
+        在 UTC 換日。台北 00:00–08:00 屬前一個 UTC 日 → 當天資料被拆成兩個分區，
+        gate 判的那批就不是設定的那批，當日髒率也不再是設定值。
+        這條紅了代表有人改了排程時段而沒意識到分區邊界。"""
+        hours = [int(h) for h in str(dag.schedule).split()[1].split(",")]
+        assert hours, "沒解析到排程時段"
+        for h in hours:
+            assert 8 <= h <= 23, f"台北 {h}:00 會落到前一個 UTC 分區（見 DAG 檔頭 ③）"
+
+    def test_schedule_is_taipei_time(self, dag):
+        """排程時間是業務決策（誰、何時看報表），不是技術參數——必須顯式宣告時區，
+        而不是寫成 UTC 再靠註解解釋。"""
+        assert "Taipei" in str(dag.timezone)
+
+    def test_runs_before_the_analytics_dag(self, dagbag, dag):
+        """seeding 與主 DAG 的時序契約【只存在於時間差裡】（刻意不用 Trigger 相接，
+        見 seed_demo_daily 檔頭 ①）。既然如此，這個時間差就必須被測試釘住——
+        否則有人調整任一邊的排程時，那個隱性契約會無聲斷掉。"""
+        last_seed = max(int(h) for h in str(dag.schedule).split()[1].split(","))
+        analytics = dagbag.dags["orders_analytics_daily"]
+        analytics_hour = int(str(analytics.schedule).split()[1])
+        assert last_seed < analytics_hour, (
+            f"最後一個 seeding 時段（{last_seed}:00）必須早於抽取（{analytics_hour}:00）")
+
+    def test_landed_gate_is_enforced(self, dag):
+        """⭐ 唯一擋得住靜默失敗的東西。
+
+        POST 回 202 只代表 Raw 落地；_enqueue 刻意吞掉 broker 故障，所以 worker
+        或 redis 掛掉時腳本會印滿版 ok、exit 0、DAG 全綠而 ODS 一筆都沒有。"""
+        cmd = dag.get_task("seed_orders").bash_command
+        assert "--require-landed-pct" in cmd
+
+    def test_payload_seed_differs_per_slot(self, dag):
+        """⭐ payload 種子必須逐時段不同，否則四個時段會灌出**一模一樣的訂單**
+        （同 seed = 同亂數序列），只有 order_id 因 wall-clock 批次標記而不同——
+        customer / product 分佈被複製四份，dim_ 表嚴重失真。
+
+        與 test_all_slots_of_a_taipei_day_share_one_dirty_rate_seed 是一對：
+        髒率要全天相同、payload 要逐時段不同，兩者的種子因此刻意不同源。"""
+        from datetime import datetime, timedelta, timezone
+
+        env = dag.get_template_env()
+        tpl = env.from_string(dag.get_task("seed_orders").bash_command)
+        seeds = set()
+        tpe = timezone(timedelta(hours=8))
+        for taipei_hour in (9, 13, 17, 21):
+            run_after = datetime(2026, 8, 12, taipei_hour, tzinfo=tpe)
+            out = tpl.render(dag_run=SimpleNamespace(run_after=run_after))
+            seeds.add(out.split("--seed ")[1].split()[0])
+        assert len(seeds) == 4, f"四個時段的 payload 種子必須互異，實得：{seeds}"
+
+    def test_time_base_is_run_after_not_data_interval(self, dag):
+        """⭐ cron 的 data_interval_start 是【上一個】觸發點；logical_date 在
+        Airflow 3 的手動 run 裡可能不存在。兩者都不能當這條 DAG 的時間基準。
+        這支測試釘住「用 run_after」這個決定本身，因為它的錯誤形式是無聲的。"""
+        cmd = dag.get_task("seed_orders").bash_command
+        assert "dag_run.run_after" in cmd
+        assert "data_interval_start" not in cmd
+        assert "ds_nodash" not in cmd
+
+    def test_catchup_disabled(self, dag):
+        """received_at 由伺服器在攝入當下產生，回填在物理上不可能——
+        補跑舊日期只會在今天再灌一批。"""
+        assert dag.catchup is False
+
+    def test_single_active_run(self, dag):
+        """兩個 run 並行會互撞 60/min 限流，雙方一起退避，實際更慢。"""
+        assert dag.max_active_runs == 1
+
+    def test_has_execution_timeout(self, dag):
+        """429 退避可能無限拖著一個 task；沒有上限的話它會一直掛著不失敗。"""
+        assert dag.get_task("seed_orders").execution_timeout is not None
+
+    @pytest.mark.parametrize("utc_hour,taipei_hour,expected_n", [
+        (1,  9,  150),   # 台北 09:00
+        (5,  13, 200),   # 台北 13:00
+        (9,  17, 200),   # 台北 17:00
+        (13, 21, 250),   # 台北 21:00
+        (4,  12, 200),   # 非排程時段（手動觸發）→ 落到 DEFAULT_SLOT_SIZE
+    ])
+    def test_bash_command_actually_renders(self, dag, utc_hour, taipei_hour, expected_n):
+        """⭐ 真的把模板渲染一次，而不只是對字串做子字串比對。
+
+        **為什麼需要這支測試**：Jinja 模板是 task 執行時才渲染的，錯誤在 DagBag
+        解析階段【完全看不出來】——`dags list` 乾淨、import errors 為空、所有結構
+        測試都綠，然後排程當天 task 在 0.16 秒內失敗。實作時連續踩到三種：
+          ① `{{ f({{ x }}) }}` 巢狀 {{ }} 是語法錯誤
+          ② f-string 裡的 `}}` 會被跳脫成單一個 `}`，把 Jinja 結束標記吃掉一半
+          ③ 手動觸發時 data_interval_start 在 Airflow 3 裡根本不存在
+        三種都只有真的渲染一次才抓得到。
+        """
+        # ⚠️ 刻意用 stdlib datetime 而非 pendulum：Airflow 傳給模板的
+        #    dag_run.run_after 就是 stdlib datetime。這裡曾經用 pendulum 假物件，
+        #    於是測試綠、runtime 卻炸 "'datetime.datetime' has no attribute
+        #    'in_timezone'"——**假物件的型別錯了，測試就只是在測假物件**。
+        from datetime import datetime, timezone
+
+        env = dag.get_template_env()
+        run_after = datetime(2026, 8, 12, utc_hour, tzinfo=timezone.utc)
+        rendered = env.from_string(dag.get_task("seed_orders").bash_command).render(
+            dag_run=SimpleNamespace(run_after=run_after))
+
+        assert f"--n {expected_n}" in rendered, rendered
+        # payload 種子＝日期＋台北時段（逐 slot 不同）
+        assert f"--seed 20260812{taipei_hour}" in rendered, rendered
+        # 髒率種子＝純日期（全天一致）
+        assert "--dirty-rate-seed 20260812 " in rendered, rendered
+        assert "{{" not in rendered and "}}" not in rendered, f"仍有未渲染的模板：{rendered}"
+
+    def test_all_slots_of_a_taipei_day_share_one_dirty_rate_seed(self, dag):
+        """⭐ cron 的 data_interval_start 是【上一個】觸發點，用它會讓每天 09:00 那批
+        取到**前一天**的日期種子——當天四批的髒率就不再一致，而 Hard Gate 的整套
+        推論（它判的是全天加權平均）正是建立在那個一致性上。
+
+        這個錯誤不會有任何症狀：資料照樣灌得出來，只是當日髒率變成一個沒人算得
+        出來的混合值。故必須由測試釘住。
+        """
+        from datetime import datetime, timedelta, timezone
+
+        env = dag.get_template_env()
+        tpl = env.from_string(dag.get_task("seed_orders").bash_command)
+        seeds = set()
+        tpe = timezone(timedelta(hours=8))
+        for taipei_hour in (9, 13, 17, 21):
+            run_after = datetime(2026, 8, 12, taipei_hour, tzinfo=tpe)
+            out = tpl.render(dag_run=SimpleNamespace(run_after=run_after))
+            seeds.add(out.split("--dirty-rate-seed ")[1].split()[0])
+        assert seeds == {"20260812"}, f"同一個台北日的四個時段種子不一致：{seeds}"
+
+    def test_slot_size_lookup_tolerates_manual_trigger(self, dag):
+        """⭐ 手動觸發時 data_interval_start 是「現在」，其台北小時幾乎不會落在
+        SLOT_SIZES 的鍵上。用 `[hour]` 下標會讓手動觸發必定以 Jinja KeyError 收場
+        ——而手動觸發正是最需要它能動的時候（補灌、驗證改動、demo）。"""
+        cmd = dag.get_task("seed_orders").bash_command
+        assert "SLOT_SIZES.get(" in cmd, "必須用 .get(hour, 預設) 而非 [hour] 下標"
+        assert "SLOT_SIZES[" not in cmd
+
+
+class TestSeedDemoGateDemo:
+
+    @pytest.fixture
+    def dag(self, dagbag):
+        return dagbag.dags["seed_demo_gate_demo"]
+
+    def test_never_scheduled(self, dag):
+        """⭐ 這是設計的核心，不是「還沒設好」。
+
+        讓日常 seeding 偶爾超標會摧毀主 DAG 的成功率訊號——「主 DAG 紅」會同時
+        代表「管線壞了」與「閘門正常運作」，而兩者需要完全相反的處置。
+        這與 source_freshness_watch 被拆出去是同一個論證。"""
+        assert dag.schedule is None
+
+    def test_default_rate_clears_the_gate_decisively(self, dag):
+        """Hard Gate 是 15%。預設值必須明顯超過而非剛好壓線——壓線會讓抽樣變異
+        決定成敗，重跑一次紅一次綠，比沒有示範更糟。"""
+        assert dag.params["dirty_rate"] >= 0.20
+
+    def test_ingestion_itself_must_still_succeed(self, dag):
+        """該髒的是【資料內容】，不是攝入路徑。攝入若失敗就什麼都沒展示到。"""
+        assert "--require-landed-pct" in dag.get_task("seed_dirty_batch").bash_command
+
+
+class TestSeedingIsIsolatedFromTheAnalyticsPipeline:
+
+    def test_analytics_dag_does_not_seed(self, dagbag):
+        """⭐ 資料產生器壞掉與分析管線壞掉需要不同處置，混在一條 DAG 裡會讓
+        「主 DAG 紅」失去單一意義。與 freshness 被拆出去是同一條原則。"""
+        for task in dagbag.dags["orders_analytics_daily"].tasks:
+            assert "seed_demo.py" not in getattr(task, "bash_command", "")
+
+    def test_only_seeding_dags_post_orders(self, dagbag):
+        owners = {
+            dag_id for dag_id, dag in dagbag.dags.items()
+            for t in dag.tasks if "seed_demo.py" in getattr(t, "bash_command", "")
+        }
+        assert owners == {"seed_demo_daily", "seed_demo_gate_demo"}
 
 
 class TestDqReevaluation:

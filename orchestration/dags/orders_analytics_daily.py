@@ -56,13 +56,26 @@
    CLOUD_LAYER §1.7.7 立了硬規則：不得當前置檢查。但「旁路 task」還不夠——一個
    預期會紅的 task 會讓主 DAG 恆為 failed，真正的失敗被噪音淹沒。故獨立成
    source_freshness_watch DAG（PR5）。
+
+   ⚠️ 2026-08-11 起攝入已連續化（seed_demo_daily），freshness 因此**由恆紅轉為
+   常綠**，§1.7.7 那句「若日後改成持續攝入，本立場即失效」的條件成立了。
+   但它**仍然不該併回來當前置 gate**，理由換成了一個更強的：
+   **seeding 是唯一的資料來源，所以 seeding 掛掉的那天就是「沒有新資料」——
+   分析管線在舊資料上跑一次是無害且正確的，擋住它一點好處都沒有。**
+
+⑨ seeding 不在這條 DAG 裡，理由同 ⑧ 那一類 ⭐
+   資料產生器壞掉與分析管線壞掉需要完全不同的處置，混在一條 DAG 裡會讓
+   「主 DAG 紅」失去單一意義。量測佐證：本管線全程約 2.5 分鐘，而單一 seeding
+   時段就要 3~5 分鐘且大半在等 API 限流——那不是這條 DAG 該負責的等待。
+   見 seed_demo_daily.py 檔頭 ①。
 ────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
+import pendulum
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 
@@ -91,8 +104,13 @@ def _dbt(command: str) -> str:
 with DAG(
     dag_id="orders_analytics_daily",
     description="ODS → BigQuery staging → dbt stg_/int_/dim_/fct_/rpt_",
-    schedule="@daily",
-    start_date=datetime(2026, 8, 1),
+    # 台北 23:00：假想的營運團隊早上 9 點看前一天的報表，報表必須在那之前備妥。
+    # 用 Asia/Taipei 宣告而不是寫 UTC 15:00，是為了把這個推理留在程式碼裡——
+    # 排程時間是【業務決策】（誰、什麼時候要看報表），不是技術參數。
+    # ⚠️ 這也讓它排在 seed_demo_daily 最後一個時段（台北 21:00）之後，
+    #    當天四批 seeding 都已落地才抽取。兩者的時序契約只存在於這個時間差裡。
+    schedule="0 23 * * *",
+    start_date=pendulum.datetime(2026, 8, 1, tz=pendulum.timezone("Asia/Taipei")),
     catchup=False,          # 見檔頭 ②
     max_active_runs=1,      # 見檔頭 ③
     default_args=default_args,

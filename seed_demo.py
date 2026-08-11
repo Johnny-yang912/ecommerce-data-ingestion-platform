@@ -479,28 +479,76 @@ async def run(args) -> None:
     print("   請等背景處理完再抽取；用 --verify 可直接查 DB 確認。")
     if args.verify:
         await asyncio.sleep(args.verify_wait)
-        verify(batch)
+        landed = verify(batch, expected=results["ok"])
+        enforce_landed(landed, results["ok"], args.require_landed_pct)
 
 
-def verify(batch: str) -> None:
-    """查 DB 確認這批資料的落地狀況。失敗不影響已灌的資料，只是看不到報告。"""
+def enforce_landed(landed: int | None, expected: int, threshold: float | None) -> None:
+    """落地率閘門。低於門檻就非零 exit——這是排程化之後唯一擋得住「靜默不落地」的東西。
+
+    為什麼需要它 ⭐
+    ──────────────
+    `POST /orders` 回 202 只代表 Raw 落地；ODS 由 Celery worker 非同步寫入，而
+    `main._enqueue` **刻意吞掉 broker 故障**（照樣回 200 pending）。所以 worker 或
+    Redis 掛掉時，這支腳本會印出滿版的 ok、exit code 0、DAG 一片綠，而 ODS 一筆都沒有。
+    補派的 scan_and_dispatch 在 Celery Beat 裡，一起沒了的話也不會自癒。
+
+    無人值守的日排程正是最不可能有人察覺這件事的場景——它會一路綠到有人問
+    「為什麼報表沒更新」為止。
+
+    預設 None＝不啟用，手動跑的行為完全不變（那時有人盯著輸出）。
+    """
+    if threshold is None:
+        return
+    if landed is None:
+        raise SystemExit(
+            "落地閘門：查不到落地筆數（verify 失敗或連錯資料庫），無法判定 → 視為失敗。\n"
+            "  查不到與真的沒落地在後果上相同，都代表『我不知道這批資料在哪』。"
+        )
+    pct = landed / expected if expected else 0.0
+    if pct < threshold:
+        raise SystemExit(
+            f"落地閘門未通過：送出 {expected} 筆，ODS 只有 {landed} 筆（{pct:.1%} < {threshold:.0%}）。\n"
+            f"  最常見原因是 Celery worker 或 Redis 沒起——Raw 落地了但沒人處理。\n"
+            f"  檢查：docker compose ps worker redis / docker compose logs worker"
+        )
+    print(f"\n落地閘門通過：{landed}/{expected}（{pct:.1%} >= {threshold:.0%}）")
+
+
+def verify(batch: str, expected: int | None = None) -> int | None:
+    """查 DB 確認這批資料的落地狀況，回傳進到 ODS 的筆數（查不到回 None）。
+
+    失敗不影響已灌的資料，只是看不到報告——但**回傳 None 是有意義的訊號**，
+    由 enforce_landed 決定要不要當成失敗。
+    """
     try:
         from dotenv import load_dotenv
         from sqlalchemy import create_engine, text
     except ImportError:
         print("（跳過 verify：缺 sqlalchemy / python-dotenv）")
-        return
+        return None
 
+    # ⚠️ override=False（預設）：**環境裡既有的 DB_URL 會蓋過 .env**。
+    #    這不是 bug 而是 dotenv 的設計（環境優先於檔案），但它讓「我改了 .env
+    #    卻連到舊資料庫」變成一個完全無聲的故障——實測踩過兩次，兩次都只看到
+    #    一片空白的報告而沒有任何錯誤。故下方一定要印出實際連到哪裡。
     load_dotenv(".env")
     db_url = os.getenv("DB_URL")
     if not db_url:
-        print("（跳過 verify：.env 沒有 DB_URL）")
-        return
+        print("（跳過 verify：找不到 DB_URL）")
+        return None
 
     prefix = f"SEED-{batch}-%"
     try:
         with create_engine(db_url).connect() as c:
+            # ⭐ 印出實際連到的資料庫。一行字，但它是「灌 A 庫、查 B 庫」這類
+            #    問題唯一會自己現形的地方——沒有它，錯連只會表現為空白報告。
+            who = c.execute(text(
+                "select current_user || '@' || inet_server_addr() || ':' "
+                "|| inet_server_port() || '/' || current_database()"
+            )).scalar()
             print(f"\n── 落地確認（order_id LIKE '{prefix}'）──")
+            print(f"連線：{who}")
             print("raw.status：")
             for status, n in c.execute(text(
                 "select status, count(*) from raw where order_id like :p group by status order by 1"
@@ -514,8 +562,15 @@ def verify(batch: str) -> None:
             ), {"p": prefix}).one()
             total, dirty, lo, hi = row
             if total:
-                print(f"ods：{total} 筆，其中髒 {dirty} 筆（{dirty/total:.1%}）"
-                      f"，raw_id {lo}..{hi}")
+                line = (f"ods：{total} 筆，其中髒 {dirty} 筆（{dirty/total:.1%}）"
+                        f"，raw_id {lo}..{hi}")
+                if expected:
+                    line += f"｜落地率 {total/expected:.1%}"
+                print(line)
+            else:
+                # 明說「零筆」而不是靜靜跳過。舊版在這裡什麼都不印，於是「連錯庫」
+                # 與「資料還沒處理完」看起來一模一樣——都是一片空白。
+                print(f"ods：0 筆 ⚠️ 這批資料在上面那個連線裡【找不到】")
 
             # 選填欄位缺漏的落地確認。用 jsonb_typeof(...) = 'null' 而不是
             # `it->'cost_price' IS NULL`：前者是「欄位存在、值是 JSON null」
@@ -546,8 +601,10 @@ def verify(batch: str) -> None:
                 "group by code order by 2 desc"
             ), {"p": prefix}):
                 print(f"  {code:32s} {n}")
+            return total
     except Exception as e:
         print(f"（verify 失敗，不影響已灌資料）{type(e).__name__}: {e}")
+        return None
 
 
 def main() -> None:
@@ -578,13 +635,53 @@ def main() -> None:
                     help="灌完查 DB report 落地狀況（預設開啟）")
     ap.add_argument("--verify-wait", type=float, default=10.0,
                     help="verify 前等待背景任務的秒數（預設 10）")
+    ap.add_argument("--require-landed-pct", type=float, default=None,
+                    help="落地率閘門：ODS 筆數／送出筆數低於此值就非零 exit（例 0.9）。"
+                         "預設不啟用——手動跑時有人盯著輸出，排程跑則必設。"
+                         "見 enforce_landed() 的說明。")
+    ap.add_argument("--dirty-rate-choices", default=None,
+                    help="逗號分隔的候選髒率（例 0.03,0.05,0.08,0.10,0.12）。給定時"
+                         "覆蓋 --dirty-rate，並以 --dirty-rate-seed 決定性地選一個。")
+    ap.add_argument("--dirty-rate-seed", default=None,
+                    help="挑選 --dirty-rate-choices 用的種子，通常餵 Airflow 的 "
+                         "{{ ds_nodash }}。同一天必得同一個值。")
     args = ap.parse_args()
 
     if args.rps > 1.0:
         print(f"⚠️ --rps {args.rps} 超過 API 限流 60/min，將大量觸發 429 退避，"
               f"實際只會更慢。建議 ≤ 1.0。\n")
 
+    args.dirty_rate = resolve_dirty_rate(
+        args.dirty_rate, args.dirty_rate_choices, args.dirty_rate_seed)
+
     asyncio.run(run(args))
+
+
+def resolve_dirty_rate(fixed: float, choices: str | None, seed: str | None) -> float:
+    """從候選清單裡【決定性地】挑一個髒率。沒給候選就原樣回傳 fixed。
+
+    為什麼是「由日期決定的隨機」而不是固定循環，也不是真隨機 ⭐
+    ──────────────────────────────────────────────────────────
+    · 固定循環（例如 5 天一輪）會在品質趨勢圖上畫出規律的鋸齒——比隨機更像假資料。
+    · 真 random.choice() 則讓補跑同一天得到不同的髒率，那天的資料就再也解釋不了；
+      而「同一個 logical date 產生同一批資料」是整個排程能被推理的前提。
+    以日期為種子同時滿足兩邊：圖上看不出週期，重跑卻完全可重現。
+
+    ⚠️ 一天多個 slot 必須共用同一個 seed（都餵 ds_nodash）。Hard Gate 的口徑是
+       【最新的一個 UTC 日分區】而非單一批次（見 macros/error_rate_below.sql），
+       所以它判的是全天加權平均——各 slot 髒率不同的話，你選的那個值根本不是
+       gate 看到的值。payload 的種子則必須逐 slot 不同，否則會灌出四批一模一樣
+       的訂單（見 seed_demo_daily.py）。
+    """
+    if not choices:
+        return fixed
+    values = [float(x) for x in choices.split(",") if x.strip()]
+    if not values:
+        raise SystemExit("--dirty-rate-choices 解析後是空的")
+    picked = random.Random(seed).choice(values)
+    print(f"髒率由 --dirty-rate-choices 決定：seed={seed!r} → {picked:.0%}"
+          f"（候選 {', '.join(f'{v:.0%}' for v in values)}）")
+    return picked
 
 
 if __name__ == "__main__":

@@ -22,9 +22,28 @@ Staging is populated by the extraction script via a batch load job. BigQuery's s
 
 The rule for choosing a partition column is "pick the column that the table's most frequent, most expensive queries filter on." Staging's access pattern is **pipeline incremental** (both the extraction watermark and dbt incremental filter on `received_at`), so it partitions by `received_at`, letting each run scan only the new partition (partition pruning).
 
-> **`received_at` vs `order_date`**: staging serves the pipeline, so it partitions by ingestion time `received_at`; downstream Gold (`dim_/fct_`) serves analysts whose monthly/weekly aggregates filter by the business time `order_date`, so that layer partitions by `order_date` instead. The partition column is chosen per table, according to its own access pattern. **The full Gold-side decision is §1.2.1 below** — it is not this section copied over: each of the four decisions has its own reasoning, and two of them come out the opposite way.
+> **`received_at` vs `order_date`**: staging serves the pipeline, so it partitions by the ODS landing time `received_at` (⚠️ this column is *not* the order-receipt time — see §1.2.2); downstream Gold (`dim_/fct_`) serves analysts whose monthly/weekly aggregates filter by the business time `order_date`, so that layer partitions by `order_date` instead. The partition column is chosen per table, according to its own access pattern. **The full Gold-side decision is §1.2.1 below** — it is not this section copied over: each of the four decisions has its own reasoning, and two of them come out the opposite way.
 
 DAY granularity over HOUR: batches are T+1 / hourly; and with a 4000-partition-per-table cap, DAY lasts ~11 years while HOUR lasts only 166 days.
+
+### 1.2.2 ⚠️ `received_at` Means Two Different Instants in Raw and ODS ⭐
+
+The column name means different things on the two tables, and three downstream mechanisms are built on it, so this has to be stated explicitly:
+
+| Column | Stamped when | Meaning |
+|---|---|---|
+| `raw.received_at` | The API writes Raw synchronously in the request path (`models.py`, `server_default=func.now()`) | **Order-receipt time** |
+| `ods.received_at` | The worker writes ODS (also `server_default`; `process.py` does not carry the Raw value over) | **ODS landing time** |
+
+**The semantics are correct, not a compromise.** staging mirrors `extract_ods_to_bq.py`, and what extract moves *is* ODS — using ODS's own clock as the partition column and `loaded_at_field` answers exactly the question "did extract move ODS forward?". Switching to `raw.received_at` would fold "latency of the Raw→ODS hop" into the extract check, making one signal stand for two pipeline segments.
+
+**But it carries a scope boundary you must know**: when a backlog is flushed by the recovery scan, those rows get an `ods.received_at` of the *catch-up write*, so the ingestion gap does not exist on the ODS timeline at all. Anything built on `ods.received_at` (partitioning, freshness, the day boundary in `rpt_quality_events_daily`) therefore only sees outages **still in progress at sampling time** — never ones that have already recovered.
+
+The health of the Raw→ODS hop is answered elsewhere: the oldest age of `raw.status='pending'` (owned by the `raw_pending_watch` DAG added in a follow-up change), and later the continuity of `raw.received_at` via OTel. **Three timelines, one hop each — none of them moonlights.**
+
+**Why not change it to carry `raw.received_at` over**: the first reason is the one above — the semantics are already right, and changing them is what would make them wrong. The cost is only the secondary reason: changing the partition column's meaning requires rebuilding and backfilling the table, and shifts the Hard Gate's "latest UTC day partition" scope along with it.
+
+⚠️ **The name reads like receipt time.** We are not renaming it (that is a migration, and it would ripple into the ODS→BQ `FIELDS` declaration and every dbt reference), but whoever reads `ods.received_at` next should take this section as authoritative rather than inferring from the name.
 
 ### 1.2.1 Partitioning Decisions for Gold (`dim_/fct_`) ⭐
 
@@ -264,7 +283,7 @@ means exactly one thing:
 | DAG | Red means |
 |---|---|
 | `orders_analytics_daily` | The pipeline is broken |
-| `source_freshness_watch` | The source is stale (under manual ingestion = the expected state) |
+| `source_freshness_watch` | staging is stale = extract did not move ODS across (as of 2026-08-11 this flipped from "expected to be red" to "expected to be green" — see the update in the §1.7.7 table above) |
 
 `tests/test_dags.py::TestFreshnessIsolation` pins this isolation down: if any DAG that produces
 real output ever picks up `dbt source freshness`, the test goes red.

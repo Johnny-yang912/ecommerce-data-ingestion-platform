@@ -22,9 +22,28 @@ staging 由抽取腳本以 batch load job 灌入。BQ 的 streaming insert 按�
 
 分區欄位選法的原則是「選那張表最常、最貴的查詢拿來過濾的欄位」。staging 的 access pattern 是**管線增量**（抽取 watermark、dbt incremental 都過濾 `received_at`），所以分區用 `received_at`，讓每次跑批只掃新增的分區（partition pruning）。
 
-> **`received_at` vs `order_date`**：staging 服務管線，故用攝入時間 `received_at` 分區；下游 Gold（`dim_/fct_`）服務分析師，月/週平均按業務時間 `order_date` 過濾，那一層才改用 `order_date` 分區。分區欄位是「每張表依自己的 access pattern 各自選」。**Gold 側的完整決策見下方 §1.2.1**——那不是把本節照抄一遍，四個決定各有各的理由，且其中兩個與 staging 相反。
+> **`received_at` vs `order_date`**：staging 服務管線，故用 ODS 的落地時間 `received_at` 分區（⚠️ 這個欄位不是收單時刻，見 §1.2.2）；下游 Gold（`dim_/fct_`）服務分析師，月/週平均按業務時間 `order_date` 過濾，那一層才改用 `order_date` 分區。分區欄位是「每張表依自己的 access pattern 各自選」。**Gold 側的完整決策見下方 §1.2.1**——那不是把本節照抄一遍，四個決定各有各的理由，且其中兩個與 staging 相反。
 
 粒度選 DAY 不選 HOUR：批次是 T+1／小時級；且單表上限 4000 分區，DAY 可撐約 11 年、HOUR 僅 166 天。
+
+### 1.2.2 ⚠️ `received_at` 在 Raw 與 ODS 是兩個不同的時刻 ⭐
+
+這個欄位名在兩張表上意思不同，而下游有三個機制建立在它上面，所以必須寫清楚：
+
+| 欄位 | 何時蓋章 | 語意 |
+|---|---|---|
+| `raw.received_at` | API 在請求路徑中同步寫 Raw 時（`models.py` `server_default=func.now()`） | **收單時刻** |
+| `ods.received_at` | worker 寫 ODS 時（同樣吃 `server_default`；`process.py` 建 ODS 未帶入 Raw 的值） | **ODS 落地時刻** |
+
+**語意是對的，不是妥協。** staging 是 `extract_ods_to_bq.py` 的鏡射，而 extract 搬的就是 ODS——用 ODS 自己的時鐘當分區欄位與 `loaded_at_field`，回答的正是「extract 有沒有把 ODS 往前搬」這個問題。若改用 `raw.received_at`，反而會把「Raw→ODS 那一段的延遲」混進 extract 的檢查裡，一個訊號同時代表兩段管線。
+
+**但它有一個必須知道的範圍邊界**：積壓被恢復掃描沖出去時，那批列的 `ods.received_at` 是**回補當下**的寫入時刻，於是攝入中斷的斷層在 ODS 的時間軸上**不存在**。因此任何建立在 `ods.received_at` 上的觀測（分區、freshness、`rpt_quality_events_daily` 的日界）都只看得見「取樣當下仍在進行中」的中斷，看不見已經恢復的。
+
+Raw→ODS 那一段的健康由別的東西回答：`raw.status='pending'` 的最舊年齡（由後續新增的 `raw_pending_watch` DAG 負責），以及未來 OTel 的 `raw.received_at` 連續性。**三個時間軸各管一段，不要讓其中一個兼差。**
+
+**為什麼不改成帶入 `raw.received_at`**：第一理由是上面那句——語意本來就是對的，改了才會錯。次要理由才是代價：分區欄位語意一變就要重建表與回填，且 Hard Gate 的「最新 UTC 日分區」口徑會跟著改。
+
+⚠️ **欄位名容易被照字面讀成收單時刻。** 不改名（那是一次 migration，且會波及 ODS→BQ 的 `FIELDS` 宣告與 dbt 的所有引用），但下一個讀到 `ods.received_at` 的人請以本節為準，不要從欄位名推論。
 
 ### 1.2.1 Gold（`dim_/fct_`）的分區決策 ⭐
 
@@ -255,7 +274,7 @@ freshness 因此從「一個因為前提不成立而不該有權限的訊號」�
 | DAG | 紅代表 |
 |---|---|
 | `orders_analytics_daily` | 管線壞了 |
-| `source_freshness_watch` | 資料源不新鮮（目前的手動攝入下＝預期狀態）|
+| `source_freshness_watch` | staging 不新鮮＝extract 沒把 ODS 搬過去（2026-08-11 起由「預期恆紅」轉為「預期常綠」，見上方 §1.7.7 表格的更新）|
 
 `tests/test_dags.py::TestFreshnessIsolation` 把這條隔離釘住：任何有實際產出的 DAG
 混進 `dbt source freshness`，測試就紅。

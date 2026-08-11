@@ -216,10 +216,15 @@ models:
           cost_price 在攝入層完全沒有規則（缺值合法、不產生 quality_event、不會被隔離），
           本 counter 是它唯一會現形的地方——2026-08 實測 dev 有 207/631 個品項屬此類，
           而當時的 items_missing_amount 對它們的偵測率是 0%。
+          資料來源可重現：seed_demo.py 的 --missing-cost-rate（per item 抽樣，
+          故產得出「同一張訂單部分品項缺成本」這種讓 SUM 靜默少算的切片）。
       - name: items_missing_shipping
         description: >
           ⭐ ✅ 可加。該切片有幾個品項的 shipping_fee 為 NULL。
           shipping_fee 不是衍生值、不在任何一條鏈的下游，故必須自己一隻金絲雀。
+          ⚠️ 本欄與 items_missing_cost 會【不相等】——seed_demo 兩個欄位各自獨立抽樣，
+          正是為了讓這件事在資料上成立。若哪天觀察到兩者恆等，先懷疑資料產生方式
+          （早期手動灌的 demo 資料就是兩者永遠同時缺），而不是以為它們是同一個訊號。
     tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

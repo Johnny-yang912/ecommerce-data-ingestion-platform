@@ -426,10 +426,13 @@ Pydantic handles input validation and schema flattening. SQLAlchemy handles pers
 │   ├── test_auth.py       # API Key auth, rotation, source_client_id persistence
 │   ├── test_extract_cli.py        # Extraction script --table dispatch and gate
 │   ├── test_reevaluate_quality.py # Proposal B: transition matrix, deserialization fidelity, CLI gates
-│   └── test_dags.py       # DAG structure (needs Airflow; separate CI job, auto-skipped locally)
+│   ├── test_dags.py       # DAG structure (needs Airflow; separate CI job, auto-skipped locally)
+│   └── test_seed_demo.py  # Generator cross-module invariant (missing optional fields must not become dirty data)
 ├── extract_ods_to_bq.py   # E/L: ODS → BQ staging (--table orders|quality_events|all)
 ├── reevaluate_quality.py  # Proposal B event producer (candidates from BQ int_, state from PG, dry-run by default)
 ├── seed_demo.py           # Generates BI demo data through the real ingestion path
+│                          #   (--dirty-rate emits violations, --missing-cost-rate emits
+│                          #    incomplete upstream data; the two axes are orthogonal)
 ├── orchestration/         # Airflow: Dockerfile, dags/, env_var-driven dbt profiles
 ├── docker-compose.airflow.yml     # Airflow overlay (layered onto docker-compose.yml)
 ├── requirements-analytics.txt     # Analytics runtime deps (what the Airflow image installs)

@@ -129,6 +129,15 @@ select
     --    本層特別容易踩：整格 sum 為 NULL 時 Looker Studio 只顯示一個空白，
     --    而【部分】缺失更危險——sum 會回一個看起來完全正常的數字，只是少算幾筆，
     --    連空白都不會有。這三個 counter 是分辨兩者的唯一依據。
+    --
+    -- ⭐ 這三個 counter 的資料來源是【可重現的】：seed_demo.py 的 --missing-cost-rate
+    --    以 item 為粒度、cost_price 與 shipping_fee 各自獨立抽。這兩件事都是刻意的：
+    --      · 獨立抽 → items_missing_cost 與 items_missing_shipping 會真的分岔。
+    --        早期手動灌的 demo 資料兩者永遠同時缺，於是這兩欄恆等，看起來像同一個
+    --        訊號的複本，分開設計的意義完全看不出來。
+    --      · item 粒度 → 產得出「同一張訂單裡有些品項有成本、有些沒有」，也就是
+    --        上面那個【部分缺失】的危險狀態。舊資料是整張訂單全缺，只會讓整格
+    --        變 NULL（BI 上是空白），演不到真正該防的那一種。
     countif(net_amount is null)   as items_missing_amount,
     countif(cost_amount is null)  as items_missing_cost,
     countif(shipping_fee is null) as items_missing_shipping

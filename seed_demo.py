@@ -12,6 +12,18 @@
 共用會讓「調壓測參數」與「調 demo 資料形狀」互相干擾。
 payload 的【結構】真相仍然只有一份，在 schema.py（OrderIN），不因此重複。
 
+兩個【正交】的資料形狀旋鈕 ⭐
+────────────────────────────
+    --dirty-rate           上游給了【違規的值】 → 觸發 DQCode、產生 quality_events
+    --missing-cost-rate    上游給的資料【本來就不完整】 → 一個 code 都不產生
+
+刻意分成兩個參數而不是一個「髒資料比例」，因為它們在 DQ 架構裡是不同層級的東西：
+前者是品質規則攔下來的違規，後者是選填欄位沒給值（schema.py 的 cost_price /
+shipping_fee 是 Optional，business_clean 對 None 完全不檢查）。把兩者混成一個
+旋鈕，就沒辦法造出「乾淨但不完整」與「髒但完整」這兩種資料——而它們在下游
+是完全不同的問題：前者讓 rpt_sales 的加總靜默少算，後者讓訂單落進 quarantine。
+細節見下方〈選填欄位缺漏〉一節。
+
 為什麼走 POST /orders 而不是直接 INSERT 進 ODS
 ─────────────────────────────────────────────
 資料必須走完整條真實路徑才有展示價值：
@@ -295,6 +307,55 @@ def inject_dirty(payload: dict, rng: random.Random) -> list[str]:
     return codes
 
 
+# ── 選填欄位缺漏（上游不完整，【不是】DQ 違規）───────────────────────────────
+#
+# ⚠️ 這一節刻意【不】放進 DIRTY_WEIGHTS，理由不是風格而是正確性：
+#
+#   1. 它沒有對應的 DQCode。schema.py 的 cost_price / shipping_fee 是
+#      `Optional[float] = None`，business_clean 對 None 完全不標記（數值檢查都在
+#      `_is_number()` 守衛之後）。它描述的是【上游給的資料本來就不完整】，
+#      而不是【上游給了違規的值】——兩者在 DQ 架構裡是不同層級的東西。
+#   2. DIRTY_WEIGHTS 的每一項都回傳一個 code 名稱，run() 用它累計 expected_codes
+#      去和 business_clean 的實判對帳。混進一個「不會產生任何 code」的注入器，
+#      那份對帳表就永遠差一項，而且差的原因無法從輸出看出來。
+#
+# 為什麼要造這種資料：rpt_sales_daily_by_category 有三個 counter——
+# items_missing_amount / items_missing_cost / items_missing_shipping。它們存在的
+# 理由寫在該檔檔頭：整格 sum 為 NULL 時 BI 只顯示一個空白，而【部分】缺失更危險，
+# sum 會回一個看起來完全正常的數字，只是少算幾筆。沒有這種資料，那三個 counter
+# 恆為 0，等於一個防呆設計沒有任何證據能證明它有用。
+#
+# ⭐ 兩個欄位【各自獨立】抽，而不是一起拿掉。這是刻意要修正舊 demo 資料的形狀：
+#    2026-07-08 手動灌的那 250 筆是 cost 與 shipping 永遠同時缺，於是
+#    items_missing_cost 與 items_missing_shipping 在報表上【恆等】——兩個 counter
+#    看起來像同一個訊號的兩份複本，分開設計的意義完全看不出來。獨立抽才會讓它們
+#    真的分岔。
+#
+# ⭐ 粒度是 item 而非 order，同理：舊資料是「整張訂單全缺」（order 粒度 251 筆
+#    全缺、0 筆部分缺），產不出「同一張訂單裡有些品項有成本、有些沒有」這種
+#    最貼近真實上游、也最容易讓下游加總靜默少算的形狀。
+OPTIONAL_COST_FIELDS = ("cost_price", "shipping_fee")
+
+
+def strip_optional_costs(payload: dict, rng: random.Random,
+                         rate: float) -> Counter:
+    """以 item 為粒度、逐欄位獨立地把選填成本欄位拿掉。回傳各欄位的缺漏筆數。
+
+    就地修改 payload。與 inject_dirty 正交——DIRTY_WEIGHTS 裡沒有任何注入器會碰
+    cost_price / shipping_fee（_dirty_non_finite_number 只打 unit_price /
+    quantity / discount_pct），所以兩者誰先誰後都不影響結果。
+    """
+    stripped: Counter = Counter()
+    if rate <= 0:
+        return stripped
+    for item in payload["items"]:
+        for field in OPTIONAL_COST_FIELDS:
+            if rng.random() < rate:
+                item[field] = None
+                stripped[field] += 1
+    return stripped
+
+
 # ── 送出 ─────────────────────────────────────────────────────────────────────
 
 def resolve_api_key(explicit: str | None) -> str:
@@ -351,7 +412,9 @@ async def run(args) -> None:
     if args.dry_run:
         p = make_order(rng, f"SEED-{batch}-0001", args.order_date_days)
         codes = inject_dirty(p, rng) if args.dirty_rate > 0 else []
+        stripped = strip_optional_costs(p, rng, args.missing_cost_rate)
         print(f"[dry-run] 預期觸發 code: {codes or '(clean)'}")
+        print(f"[dry-run] 留空的選填成本欄位: {dict(stripped) or '(無)'}")
         print(json.dumps(p, indent=2, ensure_ascii=False))
         return
 
@@ -360,10 +423,12 @@ async def run(args) -> None:
     print(f"目標 {args.n} 筆 → {args.url}")
     print(f"髒資料比例 {args.dirty_rate:.0%}｜速率 {args.rps}/s（{args.rps*60:.0f}/min，上限 60/min）"
           f"｜預估 {eta_min:.1f} 分鐘")
+    print(f"選填成本欄位缺漏率 {args.missing_cost_rate:.0%}（per item、逐欄位獨立）")
     print(f"批次標記 SEED-{batch}-*｜order_date 回看 {args.order_date_days} 天\n")
 
-    results, expected_codes = Counter(), Counter()
+    results, expected_codes, missing_fields = Counter(), Counter(), Counter()
     raw_ids: list[int] = []
+    total_items = 0
     started = time.monotonic()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -372,6 +437,9 @@ async def run(args) -> None:
             if rng.random() < args.dirty_rate:
                 for c in inject_dirty(payload, rng):
                     expected_codes[c] += 1
+            # 與 dirty 注入正交：髒訂單一樣可能缺成本欄位，真實上游本來就這樣。
+            missing_fields.update(strip_optional_costs(payload, rng, args.missing_cost_rate))
+            total_items += len(payload["items"])
 
             tag, raw_id = await post_one(client, args.url, headers, payload)
             results[tag] += 1
@@ -398,6 +466,14 @@ async def run(args) -> None:
         print("\n預期觸發的錯誤碼（腳本端統計，非權威——以 business_clean 實判為準）：")
         for code, n in expected_codes.most_common():
             print(f"  {code:32s} {n}")
+
+    if missing_fields:
+        # 與上面那份統計分開列，因為它們是不同性質的東西：上面是【違規】、
+        # 會產生 quality_events；這裡是【上游不完整】，一個 code 都不會產生，
+        # 只會在 rpt_sales_daily_by_category 的 items_missing_* 上現形。
+        print(f"\n留空的選填成本欄位（不產生任何 DQCode；共 {total_items} 個 item）：")
+        for field, n in missing_fields.most_common():
+            print(f"  {field:32s} {n}  ({n/total_items:.1%})")
 
     print("\n⚠️ POST 回傳 pending 只代表 Raw 已落地，ODS 由背景任務非同步寫入。")
     print("   請等背景處理完再抽取；用 --verify 可直接查 DB 確認。")
@@ -441,6 +517,24 @@ def verify(batch: str) -> None:
                 print(f"ods：{total} 筆，其中髒 {dirty} 筆（{dirty/total:.1%}）"
                       f"，raw_id {lo}..{hi}")
 
+            # 選填欄位缺漏的落地確認。用 jsonb_typeof(...) = 'null' 而不是
+            # `it->'cost_price' IS NULL`：前者是「欄位存在、值是 JSON null」
+            # （我們寫進去的形狀），後者是「欄位根本不存在」。兩者在 ODS 都可能
+            # 出現，而下游 int_order_items 的 json_value() 對兩者都回 SQL NULL，
+            # 所以這裡兩種都要算進去，否則對帳數字會比報表少。
+            row = c.execute(text(
+                "select count(*), "
+                "  count(*) filter (where coalesce(jsonb_typeof(it->'cost_price'), 'null') = 'null'), "
+                "  count(*) filter (where coalesce(jsonb_typeof(it->'shipping_fee'), 'null') = 'null') "
+                "from ods, lateral jsonb_array_elements(items) it "
+                "where order_id like :p"
+            ), {"p": prefix}).one()
+            items_n, miss_cost, miss_ship = row
+            if items_n:
+                print(f"選填成本欄位缺漏（item 粒度，共 {items_n} 個）："
+                      f"cost_price {miss_cost}（{miss_cost/items_n:.1%}）、"
+                      f"shipping_fee {miss_ship}（{miss_ship/items_n:.1%}）")
+
             print("實際觸發的錯誤碼：")
             # jsonb_typeof 守衛不可省：乾淨列的 clean_error_message 存的是 JSON null
             # （scalar，不是 SQL NULL 也不是空陣列），jsonb_array_elements 對 scalar
@@ -464,6 +558,15 @@ def main() -> None:
     ap.add_argument("--dirty-rate", type=float, default=0.12,
                     help="髒資料比例（預設 0.12——刻意壓在 Hard Gate 的 "
                          "warn@5%%/error@10%% 附近，讓門檻線在 BI 上真的有意義）")
+    # 預設 0.06 的取法：報表的 grain 是 (order_date, category, is_returned)，
+    # 太高會讓整格都缺（sum 變 NULL，BI 上是空白，反而不危險也不真實）；
+    # 太低則多數格子一筆都不缺，測不到「sum 靜默少算」那個真正危險的狀態。
+    # 6% 讓典型格子落在「0~2 個品項缺」的區間，正是要展示的形狀。
+    ap.add_argument("--missing-cost-rate", type=float, default=0.06,
+                    help="選填成本欄位（cost_price / shipping_fee）的缺漏率，"
+                         "per item 且兩欄位獨立抽（預設 0.06）。這【不是】髒資料——"
+                         "它不觸發任何 DQCode，只餵 rpt_sales_daily_by_category 的 "
+                         "items_missing_* counter。設 0 可完全關閉。")
     ap.add_argument("--rps", type=float, default=0.8,
                     help="每秒送出筆數（預設 0.8＝48/min；API 限流上限 60/min）")
     ap.add_argument("--order-date-days", type=int, default=45,

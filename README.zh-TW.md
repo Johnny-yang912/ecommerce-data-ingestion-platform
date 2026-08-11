@@ -426,10 +426,12 @@ Pydantic 負責驗證和攤平，SQLAlchemy 負責存資料，兩層刻意解耦
 │   ├── test_auth.py       # API Key 驗證、輪替、source_client_id 落地
 │   ├── test_extract_cli.py        # 抽取腳本的 --table 分派與 gate
 │   ├── test_reevaluate_quality.py # Proposal B：狀態轉移矩陣、反序列化保真、CLI 閘門
-│   └── test_dags.py       # DAG 結構（需 Airflow，跑在獨立 CI job；本機自動 skip）
+│   ├── test_dags.py       # DAG 結構（需 Airflow，跑在獨立 CI job；本機自動 skip）
+│   └── test_seed_demo.py  # 造資料器的跨模組不變式（缺漏選填欄位不得變成髒資料）
 ├── extract_ods_to_bq.py   # E/L：ODS → BQ staging（--table orders|quality_events|all）
 ├── reevaluate_quality.py  # Proposal B 事件產生端（候選讀 BQ int_、狀態讀 PG、預設 dry-run）
-├── seed_demo.py           # 走真實攝入路徑產生 BI 展示資料
+├── seed_demo.py           # 走真實攝入路徑產生 BI 展示資料（--dirty-rate 造違規、
+│                          #   --missing-cost-rate 造上游不完整，兩者正交）
 ├── orchestration/         # Airflow：Dockerfile、dags/、env_var 版 dbt profiles
 ├── docker-compose.airflow.yml     # Airflow overlay（與 docker-compose.yml 疊加）
 ├── requirements-analytics.txt     # 分析管線執行期依賴（Airflow 容器裝這個）

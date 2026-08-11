@@ -30,6 +30,45 @@ queue runs into DAG parse intervals (second-scale latency) and task startup over
 the real-time semantics of `POST /orders`. The only thing the two share is the word "Redis" —
 and they should **not** share an instance (entangled failure domains).
 
+### ⚠️ This is a portfolio project; the data source is simulated
+
+There is no real upstream here and there never will be. `seed_demo_daily` posts four batches a
+day to `POST /orders`. **It simulates "there is data every day", not "realistic ingestion
+behaviour".**
+
+The gap is not in the data itself (that travels the real ingestion path through the real quality
+rules) but in its **distribution over time**: a real system takes orders continuously around the
+clock with peaks and troughs; this project fires at four discrete instants, each at a constant rate.
+
+That gap has concrete consequences — this is not a disclaimer:
+
+| Design that "happens to hold" because of the simulation | What real traffic would do to it |
+|---|---|
+| All seeding slots land in one UTC day partition | Round-the-clock ingestion cannot dodge the UTC day boundary; Taipei 00:00–08:00 falls into the previous day (see §2.11) |
+| The Hard Gate uses "latest UTC day partition" as a proxy for "latest batch" | Under continuous ingestion it degrades into "today so far", replaying the dilution problem within a single day |
+| Freshness needs no blocking authority (no data = nobody seeded = harmless) | An upstream outage is an incident; freshness should be restored as a gate |
+| The 26h/50h freshness thresholds | Far too much slack at four batches a day — it cannot detect "the peak stopped for three hours" |
+
+**But verification maturity differs sharply between the two paths, and the distinction matters:**
+
+- **Ingestion path** (API → Redis → worker → ODS): **burst behaviour has been measured**, and it
+  is the best-evidenced part of this project. See [QUEUE §5](./QUEUE.md) — multi-process rate
+  limiting, degradation and circuit breaking under a broker outage (200 concurrent), and bounded
+  recovery scans (60,000 backlogged rows cleared in one pass; 120,000 continued across two passes
+  via cursor with 0 `duplicate`). **None of this is verified by seeding.**
+- **Analytics path** (extract → BQ → dbt): **has never run on anything but small volumes.** The
+  real cost of the `stg_` lookback window and `insert_overwrite`, how Hard Gate sensitivity shifts
+  as data grows, and BigQuery storage/query cost are all unobserved.
+
+Two things neither path covers: **sustained load** (load tests are a one-off burst, not weeks of
+daily traffic — cumulative effects are unknown) and **peak shape** (an instantaneous concurrency
+spike is not the same pressure as hours at a high plateau).
+
+**Why write this down**: every one of these designs is correct under present conditions, but their
+correctness rests on a premise that appears nowhere in the code. Without this note, the next person
+to pick this up (including future me) will assume the pipeline has already faced continuous
+traffic — **and every test in the repo will support that misreading.**
+
 ---
 
 ## 1. DAG Topology
@@ -245,6 +284,44 @@ It lives in `orchestration/dbt_profiles/`, pointed at explicitly by `DBT_PROFILE
 `int_orders` that `reevaluate_quality.py` reads *is* the table dbt writes — configured separately,
 the two would **silently point at different datasets** and re-evaluation would scan a stale or
 non-existent table without erroring. One shared variable makes that divergence impossible.
+
+### 2.11 ⚠️ Cross-timezone extraction: the business "day" is not the partition "day" ⭐
+
+Schedules are declared in `Asia/Taipei` (seeding at 09/13/17/21, extraction at 23:00), but
+`received_at` is a TIMESTAMP and BigQuery partitions by **UTC** day — `date()` rolls over in UTC,
+eight hours apart.
+
+**The mismatch is currently invisible**, because all four seeding slots fall between Taipei 08:00
+and 24:00, which maps to UTC 00:00–16:00 on the same day. **That is a consequence of the slots we
+picked, not a property of the system**: with round-the-clock ingestion, orders placed between
+Taipei 00:00 and 08:00 land in the *previous* UTC partition.
+
+The blast radius splits along a meaningful line:
+
+| | Time axis | Affected |
+|---|---|---|
+| `staging.orders` partition → Hard Gate's "latest batch" verdict | `received_at` | ✅ yes |
+| `rpt_quality_events_daily.event_date` | `event_at` | ✅ yes |
+| `source freshness` recent-window filter | `received_at` | ✅ yes |
+| `fct_orders` / `fct_order_items` / `rpt_sales_daily_by_category` | `order_date` | ❌ no |
+
+`order_date` comes from the payload and is already a `DATE` — it has no timezone. In other words:
+**the revenue numbers are right, but "which day the quality belongs to" is off by eight hours.**
+
+That distinction governs whether and when to fix it: revenue on the BI side can be read as-is,
+while the DQ dashboard will attribute a boundary-crossing incident to the wrong day.
+
+Options for an actual fix (**none taken yet, and none is a purely technical decision**):
+
+| | Approach | Cost |
+|---|---|---|
+| a | Partition staging on a business-timezone `DATE` | Most correct semantically; requires rebuilding and backfilling the table |
+| b | Keep the UTC partition, derive a `business_date` in `stg_` for downstream use | Leaves partitions alone, but adds a column whose definition must be maintained |
+| c | Declare explicitly that quality metrics are UTC-day-based and put it in the report definitions | Zero cost, but asks report readers to accept a grain that disagrees with the operating day |
+
+**Deliberately unchosen**: under the current ingestion pattern all three produce identical output
+(see "currently invisible" above) — **no choice can be validated until there is real traffic that
+crosses the day boundary.**
 
 ---
 

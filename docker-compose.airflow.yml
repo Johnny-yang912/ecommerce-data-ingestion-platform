@@ -35,6 +35,11 @@ x-airflow-common: &airflow-common
     # 本機練習用：免登入。正式環境請換掉 auth manager。
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
 
+    # 放寬 DAG 解析逾時，容忍宿主機時鐘偏移造成 dag-processor 誤殺解析子行程
+    # （WSL2 kernel 的時鐘問題，屬開發者個人環境；一般部署不會遇到，可維持預設 50）。
+    # 代價：真正卡住的解析改為 1 小時後才被砍掉重試，而非預設的 50 秒。
+    AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT: "3600"
+
     # ── 交給 task 的專案設定（BashOperator 會繼承）──────────────────────────
     # 指向同一個 compose project 裡的 db 服務（來自 docker-compose.yml）。
     # ⚠️ 這個值必須與下方 SEED_API_URL 指向【同一套系統】——灌進 A 庫、抽 B 庫的話，

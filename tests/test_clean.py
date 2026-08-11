@@ -239,19 +239,32 @@ class TestBusinessClean:
     # ── 自由文字欄位軟性長度上限（2b）────────────────────────────────────────
 
     def test_customer_name_over_soft_limit_is_flagged(self):
-        """customer_name 超過軟性上限（100）→ 標記 field_too_long，但資料仍落地。"""
-        ods = make_ods(customer_name="x" * 101)
+        """customer_name 超過軟性上限（v4：150）→ 標記 field_too_long，但資料仍落地。"""
+        ods = make_ods(customer_name="x" * 151)
         _, errors = business_clean(ods)
         assert any(e["field"] == "customer_name" and e["code"] == "field_too_long" for e in errors)
 
     def test_customer_name_at_soft_limit_is_valid(self):
-        """customer_name 等於軟性上限（100）→ 不標記。"""
-        ods = make_ods(customer_name="x" * 100)
+        """customer_name 等於軟性上限（v4：150）→ 不標記。"""
+        ods = make_ods(customer_name="x" * 150)
         _, errors = business_clean(ods)
         assert not any(e["field"] == "customer_name" for e in errors)
 
-    def test_city_over_soft_limit_is_flagged(self):
-        """city 超過軟性上限（80）→ 標記 field_too_long。"""
+    def test_customer_name_between_v3_and_v4_limits_is_now_valid(self):
+        """⭐ v4 放寬的那個區間（101~150）現在合法——這正是 Proposal B 有事可做的來源。
+
+        v3 時期以 100 為上限落進 quarantine 的記錄，在 v4 底下重新評估會變乾淨，
+        因而可以被 promote 回 Gold。這支測試釘住的是【放寬本身】，
+        而不只是新閾值：若哪天有人把 150 改回去，回溯重評估的語意會跟著反轉
+        （已 promote 的記錄無法再被 demote——quality_events 是 append-only）。
+        """
+        ods = make_ods(customer_name="x" * 120)
+        _, errors = business_clean(ods)
+        assert not any(e["field"] == "customer_name" for e in errors)
+
+    def test_city_soft_limit_unchanged_by_v4(self):
+        """city 維持 80：城市名沒有「多段姓名／頭銜」那條長尾，不適用同一個論證。
+        v4 只放寬 customer_name——這個不對稱是刻意的，也讓重評估有天然的對照組。"""
         ods = make_ods(city="x" * 81)
         _, errors = business_clean(ods)
         assert any(e["field"] == "city" and e["code"] == "field_too_long" for e in errors)

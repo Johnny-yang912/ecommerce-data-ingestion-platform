@@ -8,12 +8,19 @@ from pydantic import BaseModel
 
 from schema import ODSOrder, OrderIN
 
-DQ_RULE_VERSION = "v3"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
+DQ_RULE_VERSION = "v4"  # 每次規則改動時 bump，搭配 git tag 記錄變更內容
 # v2：新增 FIELD_TOO_LONG / NON_FINITE_NUMBER / ORDER_DATE_IN_FUTURE 規則，
 #     並以 sentinel 正規化影響值評估（同一筆 raw 重跑會得到不同 has_clean_error）。
 # v3：age 上限 120 → 130（見 AGE_MAX）。**本專案第一次「放寬」的規則改動**——
 #     v1→v2 都是變嚴、只往後生效即可；放寬則會讓舊 quarantine 有機會被撈回，
 #     這正是 Proposal B 回溯重評估存在的理由，也是它第一次真的有事可做。
+# v4：customer_name 軟性長度上限 100 → 150（見 SOFT_MAX_LENGTHS）。同樣是放寬。
+#     ⚠️ 部署順序有陷阱：`api`/`worker` 的程式碼【烤進映像】，而 Airflow 容器是
+#     bind mount。只改檔案不重建映像的話，重評估（跑在 Airflow）會是 v4、
+#     攝入路徑卻仍是 v3——資料庫裡同時存在兩個版本的判定，且
+#     `--expect-rule-version` **看不到這個分歧**（它只比對自己行程裡的版本）。
+#     規則改動的部署必須是：改碼 → `docker compose build api worker beat` → 重評估。
+#     見 ORCHESTRATION-TW §3.3。
 
 
 class DQCode:
@@ -51,8 +58,18 @@ NON_REPRODUCIBLE_CODES = frozenset({DQCode.NON_FINITE_NUMBER})
 # 由下游 quarantine 處理——對應「接受一定程度的意外，但標記出來」。
 # 此閾值刻意低於 models.py 的 DB 欄位硬牆（customer_name 255 / city 128）：
 # 偏長 → 軟規則標記並落地；離譜塞爆 → 撞 DB 硬牆，由 process.py 的 DataError fast-fail 終態 error。
+#
+# customer_name 的 100 → 150（v4）：這條規則要攔的是【疑似欄位錯置】——把整段地址
+# 或一串備註塞進姓名欄，而不是限制姓名本身能有多長。多段姓名、非拉丁字母轉寫、
+# 含頭銜或宗教名的全名超過 100 字元在真實資料裡並不罕見，100 會把合法值標成髒資料。
+# 與 AGE_MAX 同一個論證結構：**上限該取「真實值不可能觸及」的保守高標，而不是
+# 「典型值的上限」。** 150 保留餘裕，同時仍遠低於 255 的 DB 硬牆，也仍攔得住
+# 「整段地址塞進來」那種真正要防的情況。
+# city 維持 80：它沒有同樣的問題——城市名沒有多段化與頭銜的長尾。
+# **放寬規則會讓既有 quarantine 記錄有機會被 promote，故此改動需 bump
+# DQ_RULE_VERSION 並跑一次 Proposal B 重評估。**
 SOFT_MAX_LENGTHS = {
-    "customer_name": 100,
+    "customer_name": 150,
     "city": 80,
 }
 

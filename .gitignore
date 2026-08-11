@@ -24,3 +24,6 @@ orchestration/logs/
 
 # dbt 在 profiles 目錄自動產生的匿名 id（每台機器不同，不該進版控）
 orchestration/dbt_profiles/.user.yml
+
+# 本機環境筆記：只適用於開發者個人主機的問題與排查手法，不屬於作品本身
+*.local.md

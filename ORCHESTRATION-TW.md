@@ -484,6 +484,55 @@ extract 把事件送上 BQ」。**反向同樣成立，而且更容易漏**：
 刻意不做成 endpoint 或 DAG——與 Proposal C「永不做成 HTTP endpoint」同一個紀律：
 **不可逆的決定不該有方便的按鈕。**
 
+### 3.5 ⚠️ 排程靜默停擺：`is_stale` 是最先亮起、也最容易被忽略的燈 ⭐
+
+**症狀**：該跑的 DAG 沒跑，但 **UI 上看不到任何紅色**——因為根本沒有 run 被建立，
+沒有 run 就沒有 failed run 可以變紅。dag-processor 若無法完成解析，
+DAG 會在 `dag_stale_not_seen_duration`（預設 600 秒）之後被標記為 stale，
+而 **scheduler 不會為 stale 的 DAG 建立任何 run**。整條管線就此無聲停止。
+
+排查順序，由快到慢：
+
+```bash
+# ① 有沒有 DAG 是 stale 的（最快、最直接的判準）
+docker exec api-airflow-apiserver-1 airflow dags list | grep -c True   # 非 0 = 中獎
+
+# ② 解析停在什麼時候（is_stale=True 時看這個）
+docker exec api-airflow-apiserver-1 airflow dags details <dag_id> | grep -E "is_stale|last_parsed_time"
+
+# ③ dag-processor 是否在殺解析子行程
+docker logs api-airflow-dag-processor-1 | grep -c "killing it"
+
+# ④ 排除真正的語法/import 問題
+docker exec api-airflow-apiserver-1 airflow dags list-import-errors
+```
+
+> **省時間的關鍵：④ 乾淨不代表 DAG 檔沒問題，但②③有異常時，八成不是 DAG 檔的問題。**
+> 可以直接在容器裡手動解析來把程式碼排除在外：
+>
+> ```bash
+> docker exec api-airflow-dag-processor-1 python -c \
+>   "from airflow.models.dagbag import DagBag; d=DagBag('/opt/airflow/dags/<file>.py', include_examples=False); print(list(d.dags), d.import_errors)"
+> ```
+>
+> 手動解析**成功**、dag-processor 卻**失敗**，代表問題在 dag-processor 的監督機制
+> （逾時判定、資源、子行程生命週期），不在 DAG 程式碼裡。這個分岔點能省下大量時間。
+
+**兩條獨立的線，別搞混**：
+
+| 參數 | 預設 | 管什麼 |
+|---|---|---|
+| `[dag_processor] dag_file_processor_timeout` | 50 | 解析子行程活多久會被砍掉重試 |
+| `[scheduler] dag_stale_not_seen_duration` | 600 | 多久沒被成功解析會被標記 stale |
+
+調大前者**不會**延後故障被發現的時間——那是後者決定的。前者只影響「卡住的解析多久
+才會被砍掉重試」，而且對**持續性**卡死無效（砍掉只是重跑同一個檔），只對
+「重試就會過」的暫時性卡住有意義。
+
+> 由此反推的觀測缺口：**這種故障沒有任何內建告警**。要補的話，偵測器必須活在
+> Airflow 之外——DAG 全部 stale 時，寫成 DAG 的看門狗自己也不會跑。這與 §4 對
+> OpenTelemetry 的結論是同一個原則：**存活告警不能與被監控的系統同生共死。**
+
 ---
 
 ## 4. 刻意先不做的

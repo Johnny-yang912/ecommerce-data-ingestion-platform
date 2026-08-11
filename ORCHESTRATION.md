@@ -551,6 +551,60 @@ to PG's `quality_events` directly with a recorded reason. Deliberately not an en
 the same discipline as Proposal C's "never an HTTP endpoint": **irreversible decisions should not
 have convenient buttons.**
 
+### 3.5 ⚠️ Silent scheduling stall: `is_stale` is the first light to come on, and the easiest to miss ⭐
+
+**Symptom**: a DAG that should have run didn't, yet **nothing in the UI turns red** — because no
+run was ever created, and without a run there is no failed run to show. If the dag-processor
+cannot finish parsing, DAGs get marked stale after `dag_stale_not_seen_duration` (600s by
+default), and **the scheduler creates no runs at all for a stale DAG**. The pipeline stops
+without a sound.
+
+Triage order, fastest first:
+
+```bash
+# ① Is any DAG stale? (quickest, most direct signal)
+docker exec api-airflow-apiserver-1 airflow dags list | grep -c True   # non-zero = you have it
+
+# ② When did parsing stop? (check this once is_stale=True)
+docker exec api-airflow-apiserver-1 airflow dags details <dag_id> | grep -E "is_stale|last_parsed_time"
+
+# ③ Is the dag-processor killing its parse subprocesses?
+docker logs api-airflow-dag-processor-1 | grep -c "killing it"
+
+# ④ Rule out genuine syntax/import problems
+docker exec api-airflow-apiserver-1 airflow dags list-import-errors
+```
+
+> **The time-saver: a clean ④ does not prove the DAG file is fine, but if ② and ③ look wrong,
+> the DAG file is probably not the problem.** Rule the code out directly by parsing it by hand
+> inside the container:
+>
+> ```bash
+> docker exec api-airflow-dag-processor-1 python -c \
+>   "from airflow.models.dagbag import DagBag; d=DagBag('/opt/airflow/dags/<file>.py', include_examples=False); print(list(d.dags), d.import_errors)"
+> ```
+>
+> If the manual parse **succeeds** while the dag-processor **fails**, the fault is in the
+> processor's supervision machinery (timeout arithmetic, resources, subprocess lifecycle),
+> not in the DAG code. That fork in the road saves a lot of time.
+
+**Two independent knobs — don't conflate them**:
+
+| Setting | Default | Governs |
+|---|---|---|
+| `[dag_processor] dag_file_processor_timeout` | 50 | How long a parse subprocess lives before it is killed and retried |
+| `[scheduler] dag_stale_not_seen_duration` | 600 | How long without a successful parse before a DAG is marked stale |
+
+Raising the former does **not** delay detection — that is the latter's job. The former only
+changes how long a stuck parse waits before being killed and retried, and it does nothing for a
+**persistent** hang (killing it just reruns the same file); it only matters for transient hangs
+that a retry would clear.
+
+> The observability gap this implies: **this failure mode has no built-in alerting**. Any detector
+> for it must live *outside* Airflow — once every DAG is stale, a watchdog written as a DAG will
+> not run either. Same principle as §4's conclusion on OpenTelemetry: **a liveness alert must not
+> share its fate with the system it monitors.**
+
 ---
 
 ## 4. Deliberately Not Done

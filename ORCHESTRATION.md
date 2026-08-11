@@ -287,7 +287,7 @@ non-existent table without erroring. One shared variable makes that divergence i
 
 ### 2.11 ⚠️ Cross-timezone extraction: the business "day" is not the partition "day" ⭐
 
-Schedules are declared in `Asia/Taipei` (seeding at 09/13/17/21, extraction at 23:00), but
+Schedules are declared in `Asia/Taipei` (seeding at 10/13/17/21, extraction at 22:30), but
 `received_at` is a TIMESTAMP and BigQuery partitions by **UTC** day — `date()` rolls over in UTC,
 eight hours apart.
 
@@ -680,11 +680,11 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
 
 ## 6. Status and TODO
 
-- ✅ `orders_analytics_daily` (2 extracts → 4 layered dbt builds → full `dbt test`; 23:00 Taipei)
+- ✅ `orders_analytics_daily` (2 extracts → 4 layered dbt builds → full `dbt test`; 22:30 Taipei)
 - ✅ `dq_reevaluation` (manual, dry-run by default, chains into the main DAG on commit)
 - ✅ `source_freshness_watch` (standalone observability; flipped from "expected red" to "expected
   green" on 2026-08-11)
-- ✅ `seed_demo_daily` (simulated upstream; 09/13/17/21 Taipei, 800 orders/day)
+- ✅ `seed_demo_daily` (simulated upstream; 10/13/17/21 Taipei, 800 orders/day)
 - ✅ `seed_demo_gate_demo` (Hard Gate interception script, manual)
 - ✅ Image (two isolated venvs), compose overlay, env_var-driven `profiles.yml`
 - ✅ Fully in compose (db/redis/api/worker/beat and Airflow in one project, on one dataset)

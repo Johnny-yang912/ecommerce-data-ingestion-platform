@@ -77,7 +77,8 @@ services:
         condition: service_completed_successfully
     ports:
       - "8000:8000"
-    # ⭐ 排程化之後這不再只是「方便」：seed_demo_daily 在 23:00 UTC 觸發，那個時間
+    # ⭐ 排程化之後這不再只是「方便」：seed_demo_daily 每天在台北 10/13/17/21 觸發、
+    #    orders_analytics_daily 在台北 22:30 觸發，那些時間
     #    點不會有人盯著終端機。一個【排程作業的依賴，不該比排程器本身短命】——
     #    Airflow scheduler 是常駐 compose 服務，api / worker / beat 就必須同壽命。
     #    這也是 Phase 5 之後不再用「主機終端機跑 uvicorn」的根本理由。

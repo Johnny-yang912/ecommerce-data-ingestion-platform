@@ -192,7 +192,7 @@ class TestSeedDemoDaily:
         tpl = env.from_string(dag.get_task("seed_orders").bash_command)
         seeds = set()
         tpe = timezone(timedelta(hours=8))
-        for taipei_hour in (9, 13, 17, 21):
+        for taipei_hour in (10, 13, 17, 21):
             run_after = datetime(2026, 8, 12, taipei_hour, tzinfo=tpe)
             out = tpl.render(dag_run=SimpleNamespace(run_after=run_after))
             seeds.add(out.split("--seed ")[1].split()[0])
@@ -221,7 +221,7 @@ class TestSeedDemoDaily:
         assert dag.get_task("seed_orders").execution_timeout is not None
 
     @pytest.mark.parametrize("utc_hour,taipei_hour,expected_n", [
-        (1,  9,  150),   # 台北 09:00
+        (2,  10, 150),   # 台北 10:00
         (5,  13, 200),   # 台北 13:00
         (9,  17, 200),   # 台北 17:00
         (13, 21, 250),   # 台北 21:00
@@ -257,7 +257,7 @@ class TestSeedDemoDaily:
         assert "{{" not in rendered and "}}" not in rendered, f"仍有未渲染的模板：{rendered}"
 
     def test_all_slots_of_a_taipei_day_share_one_dirty_rate_seed(self, dag):
-        """⭐ cron 的 data_interval_start 是【上一個】觸發點，用它會讓每天 09:00 那批
+        """⭐ cron 的 data_interval_start 是【上一個】觸發點，用它會讓每天 10:00 那批
         取到**前一天**的日期種子——當天四批的髒率就不再一致，而 Hard Gate 的整套
         推論（它判的是全天加權平均）正是建立在那個一致性上。
 
@@ -270,7 +270,7 @@ class TestSeedDemoDaily:
         tpl = env.from_string(dag.get_task("seed_orders").bash_command)
         seeds = set()
         tpe = timezone(timedelta(hours=8))
-        for taipei_hour in (9, 13, 17, 21):
+        for taipei_hour in (10, 13, 17, 21):
             run_after = datetime(2026, 8, 12, taipei_hour, tzinfo=tpe)
             out = tpl.render(dag_run=SimpleNamespace(run_after=run_after))
             seeds.add(out.split("--dirty-rate-seed ")[1].split()[0])

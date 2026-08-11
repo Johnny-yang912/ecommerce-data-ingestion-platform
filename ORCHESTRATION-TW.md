@@ -253,7 +253,7 @@ broker——而那個 Redis 會與攝入路徑的「Celery + Redis 取代 Backgr
 
 ### 2.11 ⚠️ 跨時區抽取：業務的「日」與分區的「日」不是同一個日 ⭐
 
-排程以 `Asia/Taipei` 宣告（seeding 09/13/17/21、抽取 23:00），但 `received_at` 是 TIMESTAMP、
+排程以 `Asia/Taipei` 宣告（seeding 10/13/17/21、抽取 22:30），但 `received_at` 是 TIMESTAMP、
 BQ 按 **UTC** 日分區——`date()` 在 UTC 換日，兩者差 8 小時。
 
 **目前這個錯位看不出來**，因為 seeding 的四個時段都落在台北 08:00–24:00，恰好對應
@@ -603,10 +603,10 @@ dataset。
 
 ## 6. 現況與待辦
 
-- ✅ `orders_analytics_daily`（2 extract → 4 層 dbt build → 完整 `dbt test`；台北 23:00）
+- ✅ `orders_analytics_daily`（2 extract → 4 層 dbt build → 完整 `dbt test`；台北 22:30）
 - ✅ `dq_reevaluation`（手動觸發，預設 dry-run，commit 後自動接主 DAG）
 - ✅ `source_freshness_watch`（獨立觀測；2026-08-11 起由「預期恆紅」轉為「預期常綠」）
-- ✅ `seed_demo_daily`（模擬上游，台北 09/13/17/21，共 800 筆/天）
+- ✅ `seed_demo_daily`（模擬上游，台北 10/13/17/21，共 800 筆/天）
 - ✅ `seed_demo_gate_demo`（Hard Gate 攔截劇本，手動觸發）
 - ✅ 映像（兩個隔離 venv）、compose overlay、env_var 版 `profiles.yml`
 - ✅ 全 compose 化（db/redis/api/worker/beat 與 Airflow 同一個 project、同一套資料）

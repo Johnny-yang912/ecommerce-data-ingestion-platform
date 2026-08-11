@@ -137,12 +137,14 @@ def _dbt(command: str) -> str:
 with DAG(
     dag_id="orders_analytics_daily",
     description="ODS → BigQuery staging → dbt stg_/int_/dim_/fct_/rpt_",
-    # 台北 23:00：假想的營運團隊早上 9 點看前一天的報表，報表必須在那之前備妥。
-    # 用 Asia/Taipei 宣告而不是寫 UTC 15:00，是為了把這個推理留在程式碼裡——
+    # 台北 22:30：假想的營運團隊早上 9 點看前一天的報表，報表必須在那之前備妥。
+    # 用 Asia/Taipei 宣告而不是寫 UTC 14:30，是為了把這個推理留在程式碼裡——
     # 排程時間是【業務決策】（誰、什麼時候要看報表），不是技術參數。
     # ⚠️ 這也讓它排在 seed_demo_daily 最後一個時段（台北 21:00）之後，
     #    當天四批 seeding 都已落地才抽取。兩者的時序契約只存在於這個時間差裡。
-    schedule="0 23 * * *",
+    #    最後一批約 21:05 送完，到 22:30 有 84 分鐘餘裕——即使 seed 吃滿 20 分鐘的
+    #    execution_timeout 也不會與抽取重疊。
+    schedule="30 22 * * *",
     start_date=pendulum.datetime(2026, 8, 1, tz=pendulum.timezone("Asia/Taipei")),
     catchup=False,          # 見檔頭 ②
     max_active_runs=1,      # 見檔頭 ③

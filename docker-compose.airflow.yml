@@ -30,14 +30,11 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
 
     # ── 交給 task 的專案設定（BashOperator 會繼承）──────────────────────────
-    # 預設指向同一個 compose project 裡的 db 服務（來自 docker-compose.yml），
-    # 這是自給自足的路徑。但**業務 DB 不一定跑在 compose 裡**——本機開發常見的是
-    # 主機上的 postgres，此時容器內的 `db` 解析不到、`localhost` 又指向容器自己。
-    # 故開一個覆寫接縫：在 .env 設 AIRFLOW_TASK_DB_URL 指向主機即可。
-    #   AIRFLOW_TASK_DB_URL=postgresql://user:pw@host.docker.internal:5432/pipeline_db
-    # ⚠️ 主機 postgres 預設只監聽 127.0.0.1，容器連不到——要走這條路必須先放寬
-    #    postgresql.conf 的 listen_addresses 與 pg_hba.conf（見 ORCHESTRATION-TW §3.1）。
-    DB_URL: ${AIRFLOW_TASK_DB_URL:-postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}}
+    # 指向同一個 compose project 裡的 db 服務（來自 docker-compose.yml）。
+    # ⚠️ 這個值必須與下方 SEED_API_URL 指向【同一套系統】——灌進 A 庫、抽 B 庫的話，
+    #    DAG 會全綠、ODS 零增長、freshness 照樣紅，而且沒有任何錯誤訊息。
+    #    兩者同在一個 compose 網路，就是為了讓這件事不可能發生。
+    DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
     BQ_PROJECT: ${BQ_PROJECT}
     BQ_DBT_DATASET: ${BQ_DBT_DATASET:-dbt_dev}
     # ── seeding（Phase 5+：持續攝入）─────────────────────────────────────────
@@ -58,11 +55,15 @@ x-airflow-common: &airflow-common
     LOG_FORMAT: json
   volumes:
     - ./orchestration/dags:/opt/airflow/dags:ro
-    - ./:/opt/project:rw                       # 專案原始碼不烤進映像，改一行不必重 build
+    # ⚠️ 專案原始碼在此是 bind mount，而 api/worker/beat 是【烤進映像】的。
+    #    改 clean.py 之類的共用模組時，這一邊立刻生效、那一邊要 build——
+    #    規則版本會因此無聲分歧，見 ORCHESTRATION-TW §3.3 第 3 步。
+    - ./:/opt/project:rw
     - ${GOOGLE_APPLICATION_CREDENTIALS}:/opt/secrets/sa-key.json:ro
     - airflow-logs:/opt/airflow/logs
-  # 讓 AIRFLOW_TASK_DB_URL 能以 host.docker.internal 指回主機（Linux 上沒有這個名字，
-  # 需要 host-gateway 才解析得到；Docker Desktop 本來就有，加了也無害）。
+  # 目前沒有任何設定指向主機（DB 與 API 都在 compose 網路內）。保留這條是為了讓
+  # 「臨時要連主機上的某個服務」不必改 compose 檔；Linux 上沒有這個名字，需要
+  # host-gateway 才解析得到，Docker Desktop 本來就有，加了也無害。
   extra_hosts:
     - "host.docker.internal:host-gateway"
   depends_on:

@@ -333,28 +333,27 @@ crosses the day boundary.**
 # .env needs BQ_PROJECT and GOOGLE_APPLICATION_CREDENTIALS (host key path); AIRFLOW_UID recommended
 echo "AIRFLOW_UID=$(id -u)" >> .env
 
-docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml up -d --build
 ```
 
 UI at `http://localhost:8080` (SimpleAuthManager for local practice, no login).
-The two compose files must be layered into one project so the DAGs can reach the business
-database at the hostname `db`.
+The two compose files must be layered into one project — that is what lets the DAGs reach `db`
+and lets seeding reach `api`.
 
-#### ⚠️ When the business DB is not in the compose project (found while running it for real)
+**The business DB is in compose too** (since 2026-08-11; an earlier "business DB on the host"
+setup was supported and has been removed). With everything on one network,
+`SEED_API_URL=http://api:8000/orders` and `DB_URL=postgresql://app:app@db:5432/orders` point at
+the same system by construction.
 
-The default above assumes **postgres also runs inside compose**. If your business DB lives on the
-**host** (common in local development), `db` does not resolve inside the container and `localhost`
-points at the container itself, so `extract_*` fails with
-`OperationalError: could not translate host name`. Two options:
+> ⚠️ **`db` publishes on port 5433** (`DB_PUBLISH_PORT`). If another postgres already holds 5432
+> on the host, a `5432:5432` mapping makes the service fail to bind outright. Containers talk over
+> `db:5432` and never traverse this mapping — it exists only for `psql` from the host.
 
-| Approach | Steps |
-|---|---|
-| **A. Put the business DB in compose too** (self-contained; the default path) | `docker compose -f docker-compose.yml -f docker-compose.airflow.yml up` brings `db` up as well. ⚠️ That is a **separate, empty database** — the `raw_id`s it mints overlap with the host DB's, so extracting both into the same BQ staging **collides on the dedup key**. Never mix them in one dataset |
-| **B. Point back at the host postgres** | ① set `AIRFLOW_TASK_DB_URL=postgresql://user:pw@host.docker.internal:5432/<db>` in `.env`; ② the host postgres listens on **`127.0.0.1` only** by default, so `listen_addresses` in `postgresql.conf` and `pg_hba.conf` must be widened for the docker network, or it still cannot connect |
-
-A's warning is worth internalising: **`raw_id` is a surrogate key minted by the landing layer, and
-two independent ODS instances both start numbering at 1.** Extract them into one staging table and
-`stg_`'s `raw_id`-grained dedup will collapse unrelated orders into "copies" of each other.
+> ⚠️ **Host-side tooling (`seed_demo.py --verify`, `psql`) must connect to `localhost:5433/orders`.**
+> `.env` already points there, but **`load_dotenv` defaults to `override=False`, so an environment
+> variable beats `.env`** — if your shell has an older `DB_URL` exported, the script will quietly
+> connect somewhere else. This is why `verify()` prints the database it actually reached: that line
+> is the only place such a mistake surfaces on its own.
 
 ### 3.2 ⚠️ Consecutive DAG failures exceeding the lookback window → widen it on the first run after the fix
 
@@ -376,28 +375,60 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 > failure the pipeline tolerates**, not just a cost parameter. Airflow failure alerts must be seen
 > *before* cumulative downtime approaches the window.
 
-### 3.3 Full Proposal B demo script ⭐
+### 3.3 Deployment SOP for loosening a rule (Proposal B) ⭐
 
-⚠️ **A run today would promote 0 records.** v1→v2 was a **tightening**, and all existing data was
-ingested under v2 — re-evaluating v2 against v2 is a tautology. Seeing flow-back requires a real
-**rule loosening** first.
+**Loosening** a rule gives existing quarantine records a chance to be pulled back into Gold. That
+is what Proposal B is for, and the only situation needing this procedure — tightened rules apply
+going forward only and need no retroaction.
 
 ```
-1. Load a batch with dirty data   python seed_demo.py --n 200 --dirty-rate 0.12
-2. Run the main DAG               → confirm the record lands in int_orders_quarantine
-                                    and is absent from fct_orders
-3. Loosen a rule + bump to v3     → [DONE] age cap 120→130 (clean.AGE_MAX),
-                                  DQ_RULE_VERSION=v3. The dirty-data injector emits
-                                  age=125, which sits between the old and new caps
-4. Dry-run to size the impact     dq_reevaluation (commit=off) → check would_write
-5. Commit for real                dq_reevaluation (commit=on, expect_rule_version=v3)
-                                  → triggers the main DAG automatically
-6. Verify                         the record appears in fct_orders;
-                                  rpt_quality_events_daily.promotions is no longer always 0
+1. Confirm candidates exist   check the value range of the target code in quarantine;
+                              it must STRADDLE the old and new thresholds
+2. Change rule + bump         the threshold in clean.py + DQ_RULE_VERSION, then git tag
+3. ⚠️ Rebuild images          docker compose build api worker beat && docker compose up -d
+4. ⚠️ Run the main DAG        orders_analytics_daily (candidates are read from BQ,
+                              so the data must be up there first)
+5. Dry-run                    dq_reevaluation (commit=off, expect_rule_version=<new>)
+6. Commit for real            dq_reevaluation (commit=on, expect_rule_version=<new>)
+                              → triggers the main DAG, flowing data back into Gold
+7. Verify                     promoted rows enter fct_orders and leave quarantine;
+                              promotions > 0; the control group stays quarantined;
+                              ODS unmodified; a second run writes 0
 ```
 
-This script is itself the evidence that the DQ architecture's "rule evolution → retroactive
-re-evaluation → data flows back" path has actually been walked end to end.
+#### ⚠️ Step 1: confirm candidates first — don't bump and then discover there are none
+
+`promoted=0` looks **exactly like** "the rule didn't take effect" and "the code is broken". And
+low-weight DQCodes accumulate slowly. Checking the value distribution before bumping is far cheaper
+than diagnosing it afterwards.
+
+#### ⚠️ Step 3: the two paths deliver code differently
+
+```
+api / worker / beat   code is BAKED INTO THE IMAGE     needs a build to take effect
+Airflow containers    bind mount ./:/opt/project        takes effect IMMEDIATELY
+```
+
+Skip the rebuild and **re-evaluation (running in Airflow) is already on the new version while the
+ingestion path is still on the old one** — two rule versions judging data in the same database at
+once. And `--expect-rule-version` **cannot see that divergence**: it only compares the version
+inside its own process, so the assertion passes.
+
+> That guard protects against "running this against a deployment that hasn't got the new rules".
+> It holds only if **the whole system has a single code-delivery mechanism** — and this compose
+> topology breaks that premise.
+
+#### ⚠️ Step 4: candidates come from BQ, state comes from PG
+
+`dq_reevaluation`'s header note ④ records that "re-evaluation writes to PG's `quality_events`; an
+extract is still needed to push events to BQ before data flows back into Gold". **The reverse holds
+too, and is easier to miss:**
+
+> **The candidate list comes from BQ's `int_orders_quarantine`. Newly accumulated data that has not
+> been extracted to BQ is invisible to re-evaluation** — the symptom is a low `candidates` count
+> and `would_write=0`.
+
+Measured figures and the full record of both walkthroughs are in §5.
 
 ### 3.4 Manual write-off (`rejection`): a runbook, not a DAG
 
@@ -413,21 +444,42 @@ have convenient buttons.**
 
 | Item | Why not | Trigger |
 |---|---|---|
-| **Seeding DAG** | Would make a demo-data generator a permanent part of the system, and would **invert** the freshness stance already settled in [CLOUD_LAYER §1.7.7](./CLOUD_LAYER.md) | When BI charts need continuous data. Freshness then becomes a meaningful gate and §1.7.7's rule table must be updated in step |
 | **OpenTelemetry** | Needs continuous traffic worth observing first | A separate roadmap Phase 5 item |
 | **Cosmos (model-level tasks)** | 13 models; benefit is out of proportion to the dependency cost | When model count makes layer-level tasks too coarse to read |
 | **triggerer / deferrable** | Only `BashOperator` today | When sensors are introduced |
 | **Hourly batches** | Plan A's watermark precision is capped by DAY partitioning | When switching to HOUR partitioning or Plan B ([CLOUD_LAYER §2.2](./CLOUD_LAYER.md)) |
 | **A backfillable DAG** | Conflicts with "`>=`, rather re-fetch than miss" (§2.5) | Re-evaluate when moving to a Plan B watermark |
 
+> **2026-08-11 update**: the **Seeding DAG has been implemented** (`seed_demo_daily`) and is
+> therefore removed from the table above. The original reason for not doing it — "it would make a
+> demo-data generator a permanent part of the system" — did come true, and is now **accepted
+> deliberately**: this project has no real upstream, so seeding *is* the data source (see Scope and
+> Responsibility Boundaries). The freshness stance in
+> [CLOUD_LAYER §1.7.7](./CLOUD_LAYER.md) has been flipped in step.
+
 ---
 
-## 5. Live Verification Record (2026-08-05) ⭐
+## 5. Live Verification Record ⭐
 
-Two live runs, recorded here. **Every item below was measured**, not inferred at design time —
-which is precisely why it deserves its own section: several decisions in the six sections around
-it could only be settled by reasoning, and this is the first time they were confirmed or
-overturned by data.
+Live runs, recorded here. **Every item below was measured**, not inferred at design time — which is
+precisely why it deserves its own section: several decisions in the sections around it could only
+be settled by reasoning, and this is where they were first confirmed or overturned by data.
+
+> ⚠️ **These figures are point-in-time measurements, not current state.** The dataset was **rebuilt
+> on 2026-08-11** (old ODS and both BQ datasets wiped, migrations re-run from zero), so the row
+> counts cited in §5.1–§5.4 cannot be found in today's database. They are kept because **the design
+> conclusions those measurements confirmed or overturned still hold** — they are evidence for the
+> conclusions, not a snapshot of the present.
+
+### 5.0 The dividing line between the two verifications
+
+| | 2026-08-05 | 2026-08-11 |
+|---|---|---|
+| Environment | business DB on the host, Airflow in compose | fully in compose (§3.1) |
+| `extract_*` in-container | ⬜ blocked | ✅ passing |
+| Rule version | v3 | v4 |
+| Dataset | accumulated over time (incl. manually loaded, non-reproducible rows) | rebuilt from zero, entirely produced by `seed_demo` |
+| Ingestion mode | manual | scheduled via `seed_demo_daily` |
 
 ### 5.1 Full Proposal B flow-back (one pass of the §3.3 script)
 
@@ -522,53 +574,136 @@ Run 15 minutes after a data load, both sources **PASSED**. What
 [CLOUD_LAYER §1.7.7](./CLOUD_LAYER.md) argued — "red means you have not fed it lately, not that
 the pipeline is broken" — is no longer only an argument: **feed it and it goes green.**
 
-### 5.4 The gap only a live run exposed: `raw_id` collides across two ODS instances ⭐
+### 5.4 `raw_id` collides across two ODS instances ⭐
 
-`extract_orders` failed in-container. The surface cause is that compose hard-codes the assumption
-that the business DB runs inside the compose project, while this machine's postgres runs on the
-host and listens on `127.0.0.1` only. The fix is an `AIRFLOW_TASK_DB_URL` override seam (see the
-A/B options in §3.1).
+**The situation at the time**: the business DB ran on the host while Airflow ran in containers, and
+one way to connect them was "bring compose's `db` up too" — which gives you a **separate, empty
+database** whose `raw_id`s start at 1 and **overlap completely** with the host ODS's. Extract both
+into the same BQ staging table and `stg_`'s `raw_id`-grained dedup collapses **two unrelated orders
+into "copies" of each other**, dropping one. No error, no trace.
 
-**But the trap underneath option A is what deserves remembering**, and it is far worse than this
-failure:
+**When to watch for it**: any time there is more than one landing instance — host and container,
+blue/green deployments, several upstreams each with their own Raw table — this collision recurs.
 
-> Bringing compose's `db` service up gives you a **separate, empty database**. The `raw_id`s it
-> mints start at 1 and **overlap completely** with the host ODS's. Extract both into the same BQ
-> staging table and `stg_`'s `raw_id`-grained dedup will collapse **two unrelated orders into
-> "copies" of each other**, dropping one. No error, no trace.
+**The fix**: upgrade the dedup key to something like `(source_instance, raw_id)`, or carry an
+instance identifier from the extract onwards. **Until then, one staging table can only correspond
+to one ODS** — never mix instances into a single dataset.
 
-This is really a corollary of the [README](./README.md)〈`raw_id` is physical identity, `order_id`
-is business identity〉principle, which the original text simply did not push all the way:
-**`raw_id`'s uniqueness only holds within a single landing instance.** Choosing `raw_id` as the
-dedup key is correct (physical dedup should use physical identity), but it also welds an implicit
-premise into the pipeline — **one staging table can only correspond to one ODS**. If multi-instance
-upstreams ever get their own landing layers, the dedup key must be upgraded to something like
-`(source_instance, raw_id)`. Today there is a single instance, the premise holds, and nothing
-changes; this is recorded so whoever expands it later knows where the line is.
+This is a corollary of the [README](./README.md)〈`raw_id` is physical identity, `order_id` is
+business identity〉principle that the original text did not push all the way: **`raw_id`'s
+uniqueness only holds within a single landing instance.** Choosing `raw_id` as the dedup key is
+correct (physical dedup should use physical identity), but it welds the "single instance" premise
+into the pipeline.
+
+> **No longer a risk in this project**: it is a portfolio piece, and after moving fully into compose
+> there is exactly one ODS, so the cause is gone (§3.1). This section stays because the premise is
+> still welded in — it just happens to be permanently true.
+
+### 5.5 Full-compose rebuild and the v4 flow-back (2026-08-11) ⭐
+
+The environment moved fully into compose, the dataset was rebuilt from zero, and one rule-loosening
+cycle was walked end to end under v4.
+
+**Infrastructure**
+
+| Item | Result |
+|---|---|
+| `alembic upgrade head` from zero | all 7 migrations passed — a path a long-lived dev database never exercises |
+| Service health | 9 containers (db/redis/api/worker/beat + four Airflow services) all healthy |
+| Airflow → `api:8000` / `db:5432` | both reachable, and reading the same database (`ods=8`) — clearing §6's longest-standing ⬜ |
+| BQ rebuild after a full wipe | `extract_ods_to_bq.py`'s `create_dataset` / `create_table(exists_ok=True)` rebuilt everything with partitioning and `require_partition_filter` intact — **zero manual DDL** |
+| Main DAG | 7/7 tasks success, ~**2.5 minutes** end to end |
+| `source_freshness_watch` | both sources **PASS** — flipped from "expected red" to "expected green" |
+
+**The landed-rows gate (`--require-landed-pct`), both directions**
+
+With `worker` stopped, 3 records were posted:
+
+| | ODS | exit code |
+|---|---|---|
+| without the flag (old behaviour) | 0 rows | **0** ← silent success, exactly what it must prevent |
+| `--require-landed-pct 0.9` | 0 rows | **1** ← caught |
+
+After restarting `worker`, all 13 `pending` rows were re-dispatched by `scan_and_dispatch` —
+self-healing verified alongside.
+
+**v4 rule loosening and flow-back**
+
+3,015 rows, 265 in quarantine. Target: `customer_name` soft cap 100→150.
+
+| Step | Result |
+|---|---|
+| Dry-run | `candidates=265 promoted=3 would_write=3` |
+| Commit | `written=3`; `quality_events` = 3015 `initial_evaluation@v3` + 3 `promotion@v4` |
+| **Bounded Writeback** | ODS fingerprint **identical before and after** (3015 rows, 265 dirty, unchanged) |
+| Idempotency | second run: `promoted=0 written=0 unchanged=265` |
+| Flow-back into Gold | `int_orders +3`, `quarantine 265→262`, `fct_orders +3`, `promotions 0→3` |
+| Row-level check | all 3 show `fct_orders=1 / quarantine=0` |
+| Control group | `customer_name` 157/164/176/188/199 and 5 `city` rows **all stayed quarantined** |
+
+> The control group formed **naturally out of the same injector** (`_dirty_field_too_long` spreads
+> lengths over 110–200 and targets `city` half the time), unlike v3 which needed one prepared
+> separately. The boundary is tighter too: **146 promotes, 157 does not.**
+
+#### Two inferences overturned ⭐
+
+**① `--expect-rule-version` covers less than assumed**
+
+Measured before rebuilding the images: `api`/`worker` reported `v3 {'customer_name': 100}` while
+Airflow reported `v4 {'customer_name': 150}` — and `--expect-rule-version v4` **passed**. The guard
+only compares the version inside its own process. **It holds only if the whole system has a single
+code-delivery mechanism**, and this compose topology (baked image vs bind mount) breaks that
+premise. Handling: §3.3 step 3.
+
+**② The directionality of the candidate source was never written down**
+
+`dq_reevaluation`'s header only recorded "re-evaluation writes to PG; an extract is needed for
+flow-back into Gold". The reverse holds too: **candidates are read from BQ, so the data must reach
+BQ first.** The first dry-run returned `candidates=26 / would_write=0` — not because the rule had
+not taken effect, but because BQ still held the pre-accumulation state. Handling: §3.3 step 4.
+
+#### Measured in passing
+
+- **Unpausing a DAG immediately creates a scheduled run**: `staging.orders` therefore held
+  398 = 199×2 rows while `stg_orders` held exactly 199 — an accidental live confirmation that
+  append-only tolerance plus dedup in `stg_` works as designed.
+- **Jinja template errors surface only at runtime**: DagBag parsing was clean, `dags list` normal,
+  every structural test green — yet the task failed in 0.16s. All three variants hit (nested
+  `{{ }}`, an f-string escaping `}}` down to `}`, and `data_interval_start` being absent in manual
+  runs) are catchable **only by actually rendering the template**, so `tests/test_dags.py` gained
+  render tests.
+- **A cron `data_interval_start` is the *previous* fire point**: using it as a date seed would make
+  each day's first slot pick up **yesterday's** value, breaking the single-dirty-rate-per-day
+  invariant. Switched to `dag_run.run_after` (see `seed_demo_daily.py`'s header).
 
 ---
 
 ## 6. Status and TODO
 
-- ✅ `orders_analytics_daily` (2 extracts → 4 layered dbt builds → full `dbt test`)
+- ✅ `orders_analytics_daily` (2 extracts → 4 layered dbt builds → full `dbt test`; 23:00 Taipei)
 - ✅ `dq_reevaluation` (manual, dry-run by default, chains into the main DAG on commit)
-- ✅ `source_freshness_watch` (standalone observability)
+- ✅ `source_freshness_watch` (standalone observability; flipped from "expected red" to "expected
+  green" on 2026-08-11)
+- ✅ `seed_demo_daily` (simulated upstream; 09/13/17/21 Taipei, 800 orders/day)
+- ✅ `seed_demo_gate_demo` (Hard Gate interception script, manual)
 - ✅ Image (two isolated venvs), compose overlay, env_var-driven `profiles.yml`
-- ✅ `tests/test_dags.py` (20 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
+- ✅ Fully in compose (db/redis/api/worker/beat and Airflow in one project, on one dataset)
+- ✅ `tests/test_dags.py` (42 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
 - ✅ Verified live (2026-08-05): image builds, all four services healthy, three DAGs parsed by the
   real dag-processor with **zero import errors**, both venvs working (dbt 1.11.12 / bigquery 1.11.3),
   the env_var profile connecting to BQ from inside the container, a full successful
   `source_freshness_watch` run, and `dbt_intermediate` passing in-container with PASS=27
-- ⬜ `extract_*` executed in-container (blocked by "business DB on the host listening on 127.0.0.1
-  only" — see the A/B options in §3.1)
-- ✅ The v3 rule loosening (`age` cap 120→130) — Proposal B now has genuine promote candidates
-- ✅ The §3.3 demo script walked end to end (2026-08-05): 20 records quarantined under v2 → v3
-  loosening → re-evaluation promoted 15 → flowed back into `fct_orders`, `promotions` 0→15; the
-  5 control records (age -3/150/999) correctly stayed quarantined; a second consecutive run wrote
-  0 events (idempotency); ODS was never modified (Bounded Writeback)
-- ⬜ Seeding DAG (see §4)
+- ✅ `extract_*` executed in-container (passing as of 2026-08-11 — moving fully into compose
+  removed the whole class of obstacle; see §5.5)
+- ✅ The v3 rule loosening (`age` cap 120→130) — Proposal B's first genuine promote candidates
+- ✅ The v4 rule loosening (`customer_name` soft cap 100→150)
+- ✅ The §3.3 SOP walked end to end twice: v3 (2026-08-05, 15 promoted) and v4 (2026-08-11,
+  3 promoted); both idempotent, ODS never modified, control group left quarantined. Full figures
+  in §5.1 and §5.5
 - ✅ Celery + Redis (implemented, orthogonal to this layer; see [QUEUE.md](./QUEUE.md))
 - ⬜ OpenTelemetry (other roadmap Phase 5 items)
+- ⬜ A formal resolution for cross-timezone extraction (§2.11's a/b/c remain unchosen — none can be
+  validated without real traffic crossing the day boundary)
 
 ## 7. Dependencies and Versions
 

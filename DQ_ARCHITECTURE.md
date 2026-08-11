@@ -772,7 +772,11 @@ A Hard Gate trip stops the whole downstream from updating. The cost of a false t
 The write logic for `promotion` and `re_quarantination` is in place. It is triggered **manually / on a rule-version bump**, not on a daily schedule — with unchanged rules a re-evaluation is necessarily a no-op, so scheduling it daily would just full-scan the entire quarantine backlog for nothing. `rejection` (→ `permanently_rejected`) is deliberately **not** part of the automated task, preserving its "written off by a human" meaning.  
 **The downstream flow-back path was already in place**: `int_orders`'s effective-state composition has been test-guarded all along, so the moment events appear they take effect on the next dbt run with **zero changes to the `int_` layer** — the payoff of having built the consumer side correctly first.
 
-> **Verified live on 2026-08-05**: after v3 loosened the `age` bound, re-evaluation promoted 15 quarantine records from the v2 era back into Gold and `rpt_quality_events_daily.promotions` went from 0 to 15; a second consecutive run wrote 0 events (idempotency); ODS was never modified. Full figures in [ORCHESTRATION §5.1](./ORCHESTRATION.md).
+> **Verified live twice.**
+>
+> **v3 (2026-08-05)**: after v3 loosened the `age` bound, re-evaluation promoted 15 quarantine records from the v2 era back into Gold and `rpt_quality_events_daily.promotions` went from 0 to 15; a second consecutive run wrote 0 events (idempotency); ODS was never modified. ⚠️ That dataset was rebuilt on 2026-08-11, so these are figures of record. Full details in [ORCHESTRATION §5.1](./ORCHESTRATION.md).
+>
+> **v4 (2026-08-11, currently reproducible)**: after loosening the `customer_name` soft length cap 100→150, **3 records** were promoted out of 3,015 rows / 265 quarantined (lengths 119/129/146), `promotions` went 0→3 and `fct_orders` gained 3; the control group — five `customer_name` rows at 157–199 plus five `city` rows — all stayed quarantined; a second run wrote 0; the ODS fingerprint was byte-identical before and after. **The control group formed naturally out of the same injector rather than being prepared**, which demonstrates "loosening only affects records sitting between the old and new thresholds" more convincingly than v3 did. Deployment SOP in [ORCHESTRATION §3.3](./ORCHESTRATION.md); figures in §5.5.
 >
 > ⚠️ The "tautology" point still stands and is worth remembering: **with unchanged rules a re-evaluation run is necessarily a no-op** — which is exactly why it is `schedule=None` rather than a daily job.
 

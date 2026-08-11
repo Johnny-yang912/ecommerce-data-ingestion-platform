@@ -213,7 +213,7 @@ Ingestion in this project is **manual** (loaded through the API; `load_test.py` 
 |---|---|
 | **Phase 5's Airflow DAG must not place `dbt source freshness` ahead of extraction / `dbt build` as a pre-check** | The very same red instantly turns from "an acceptable alert" into "a permanently blocked DAG" — while all it reflects is "you haven't hand-loaded data for a few days" |
 | ~~If it goes into the DAG at all, it must be a **side-channel observability task** (its failure must not affect downstream), or have its `severity` lowered first~~ → **tightened one notch at implementation time: it becomes its own `source_freshness_watch` DAG** | A side-channel task is not enough — see 〈Implementation outcome〉 below |
-| If ingestion ever becomes **continuous** (e.g. a seeding task at the head of the DAG posting a small batch of orders periodically), this stance lapses and freshness should be restored as a meaningful gate | Only then does red genuinely mean "broken" rather than "unfed" |
+| ~~If ingestion ever becomes **continuous**, this stance lapses and freshness should be restored as a meaningful gate~~ → **condition met on 2026-08-11** (`seed_demo_daily`, four batches a day); freshness has flipped from "expected red" to "expected green" | Red now genuinely does mean broken. **But it still is not wired up as a gate** — for a different reason; see below |
 
 > **Measured on 2026-08-05**: fifteen minutes after a data load, the `source_freshness_watch` DAG
 > ran `dbt source freshness` and both sources **PASSED**. So this section's stance is not "we
@@ -225,6 +225,28 @@ Ingestion in this project is **manual** (loaded through the API; `load_test.py` 
 > This is isomorphic to how the DQ architecture treats `has_schema_drift`: **a signal's value is not the same as the authority it should hold.** Drift may alert but never intercept; under the "manual ingestion" premise, freshness likewise may only alert. Authority comes from "is it actually broken when it goes red", not from "is this metric important."
 
 Aside: continuous ingestion is simultaneously the fix for §1.7.6's "rolling 60-day ingestion window" problem — the two share **the same root cause** (no continuous ingestion), so a future decision to add seeding resolves both at once.
+
+**⚠️ The condition was met, but only half the conclusion changed (2026-08-11)**
+
+The table above anticipated "continuous ingestion → restore freshness as a gate". Continuous
+ingestion arrived (`seed_demo_daily`), and the first half holds: red no longer merely means "you
+haven't fed it". But **the second half is deliberately not carried out**, because the reason has
+been replaced by a different one:
+
+> **Seeding is this system's only data source. So the day seeding breaks *is* the day with no new
+> data — running the analytics pipeline once over yesterday's data is harmless and correct, and
+> blocking it buys nothing.**
+
+Freshness therefore moved from "a signal that shouldn't have authority because its premise doesn't
+hold" to "a signal whose premise holds, but for which **blocking itself has no value**". **Same
+conclusion, different argument** — the distinction has to be written down, or the next reader will
+assume that meeting the condition means wiring it up as a gate.
+
+"Continuous ingestion" is also qualified here: **four batches a day, not round-the-clock**. The
+26h/50h thresholds have enormous slack at that cadence (worst case is a 12-hour gap): they detect
+"nothing was loaded all day" but not "the peak stopped for three hours". Genuinely continuous
+ingestion would require re-deriving them — a question that cannot even be posed at the current
+cadence.
 
 **Implementation outcome (Phase 5): a side-channel task is not enough — it needs its own DAG** ⭐
 

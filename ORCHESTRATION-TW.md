@@ -302,19 +302,18 @@ docker compose -f docker-compose.yml -f docker-compose.airflow.yml up --build
 UI 在 `http://localhost:8080`（本機練習用 SimpleAuthManager，免登入）。
 兩個 compose 檔必須疊加成同一個 project，DAG 才能以 `db` 這個 hostname 連到業務資料庫。
 
-#### ⚠️ 業務 DB 不在 compose 裡的話（實跑踩到的）
+**業務 DB 也在 compose 裡**（2026-08-11 起；此前曾支援「業務 DB 在主機」的設定，已移除）。
+全套同網路之後，`SEED_API_URL=http://api:8000/orders` 與
+`DB_URL=postgresql://app:app@db:5432/orders` 天然指向同一套系統。
 
-上面的預設假設 **postgres 也跑在 compose 內**。若你的業務 DB 在**主機**上（本機開發常見），
-容器內 `db` 解析不到、`localhost` 又指向容器自己，`extract_*` 會以
-`OperationalError: could not translate host name` 失敗。兩個選擇：
+> ⚠️ **`db` 的對外埠是 5433**（`DB_PUBLISH_PORT`）。主機上若另有 postgres 佔著 5432，
+> `5432:5432` 會讓服務直接 bind 失敗。容器之間走 `db:5432`，不經過這個映射——
+> 它只給主機端 `psql` 除錯用。
 
-| 做法 | 步驟 |
-|---|---|
-| **A. 業務 DB 也進 compose**（自給自足，預設路徑） | `docker compose -f docker-compose.yml -f docker-compose.airflow.yml up` 連 `db` 一起起。⚠️ 那是一個**獨立的空資料庫**——它產生的 `raw_id` 會與主機 DB 的重疊，抽到同一個 BQ staging 會**撞去重鍵**，切勿與既有資料混用同一個 dataset |
-| **B. 指回主機 postgres** | ① `.env` 設 `AIRFLOW_TASK_DB_URL=postgresql://user:pw@host.docker.internal:5432/<db>`；② 主機 postgres 預設**只監聽 `127.0.0.1`**，必須放寬 `postgresql.conf` 的 `listen_addresses` 與 `pg_hba.conf` 允許 docker 網段，否則仍連不到 |
-
-A 的那個警告值得記住：**`raw_id` 是 landing 層發的代理鍵，兩個獨立的 ODS 各自從 1 開始編號。**
-把它們抽進同一張 staging，`stg_` 以 `raw_id` 為 grain 的去重會把不同訂單當成同一筆的副本收斂掉。
+> ⚠️ **主機端工具（`seed_demo.py --verify`、`psql`）要連 `localhost:5433/orders`。**
+> `.env` 已指向那裡，但 **`load_dotenv` 的 `override=False` 讓環境變數勝過 `.env`**——
+> shell 裡若 export 過舊的 `DB_URL`，腳本會安靜地連到別的地方。`verify()` 因此會印出
+> 實際連到的資料庫，那是唯一會讓這類錯誤自己現形的地方。
 
 ### 3.2 ⚠️ DAG 連續失敗超過回看窗 → 修好後第一次跑必須放大回看窗
 
@@ -333,24 +332,52 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 > 由此反推一件事：**回看窗的天數其實是在宣告「可容忍多久的無人值守失敗」**，不只是成本參數。
 > Airflow 的失敗告警必須在累積中斷天數逼近回看窗**之前**就被看見。
 
-### 3.3 Proposal B 完整 demo 劇本 ⭐
+### 3.3 規則放寬的部署 SOP（Proposal B）⭐
 
-⚠️ **現在直接跑會 promote 0 筆。** v1→v2 是**變嚴**，而現有資料都是 v2 攝入的——拿 v2
-重評估 v2 是同義反覆。要看到回流，必須先有一次真實的**規則放寬**。
+規則**放寬**會讓既有 quarantine 記錄有機會被撈回 Gold。這是 Proposal B 的用途，也是
+唯一需要這套流程的場合——變嚴的規則只往後生效，不需要回溯。
 
 ```
-1. 灌一批含髒資料          python seed_demo.py --n 200 --dirty-rate 0.12
-2. 跑主 DAG                → 確認該筆落 int_orders_quarantine、fct_orders 看不到它
-3. 放寬一條規則 + bump v3  → 【已落地】age 上限 120→130（clean.AGE_MAX），DQ_RULE_VERSION=v3
-                           髒資料注入器會產生 age=125，正好落在新舊上限之間
-4. dry-run 確認影響範圍    dq_reevaluation（commit=off）→ 看 would_write 筆數
-5. 真的寫                  dq_reevaluation（commit=on, expect_rule_version=v3）
-                           → 自動觸發主 DAG
-6. 驗收                    該筆出現在 fct_orders；
-                           rpt_quality_events_daily.promotions 不再恆為 0
+1. 確認有候選         查 quarantine 裡目標 code 的值域，確認【跨越】新舊閾值
+2. 改規則 + bump      clean.py 的閾值 + DQ_RULE_VERSION，打 git tag
+3. ⚠️ 重建映像        docker compose build api worker beat && docker compose up -d
+4. ⚠️ 跑主 DAG        orders_analytics_daily（候選讀 BQ，資料必須先上去）
+5. dry-run            dq_reevaluation（commit=off, expect_rule_version=<新版本>）
+6. 真的寫             dq_reevaluation（commit=on, expect_rule_version=<新版本>）
+                      → 自動觸發主 DAG 回流 Gold
+7. 驗收               promote 的列進 fct_orders、離開 quarantine；
+                      promotions > 0；對照組仍在 quarantine；
+                      ODS 未被修改；再跑一次 written=0
 ```
 
-這條劇本本身就是整套 DQ 架構「規則演進 → 回溯重評估 → 資料回流」真的被走通一次的證據。
+#### ⚠️ 第 1 步：先確認有候選，不要 bump 完才發現沒有
+
+`promoted=0` 與「規則沒生效」「程式壞了」在畫面上**長得一模一樣**。而權重低的 DQCode
+累積很慢——bump 之前先查一次值域分佈，不夠就先灌，比事後排查省事得多。
+
+#### ⚠️ 第 3 步：兩條路徑的程式碼交付方式不同
+
+```
+api / worker / beat   程式碼【烤進映像】           改檔案後要 build 才生效
+Airflow 容器          bind mount ./:/opt/project    改檔案【立刻】生效
+```
+
+漏掉重建的話，**重評估（跑在 Airflow）已是新版本、攝入路徑仍是舊版本**——資料庫裡
+同時存在兩個版本的判定，而 `--expect-rule-version` **看不到這個分歧**：它只比對自己
+行程裡的 `DQ_RULE_VERSION`，斷言會通過。
+
+> 那個守衛防的是「打在還沒部署新規則的環境上」。它成立的前提是**整個系統只有一套
+> 程式碼交付機制**——這個 compose 拓撲打破了那個前提。
+
+#### ⚠️ 第 4 步：候選讀 BQ，狀態讀 PG
+
+`dq_reevaluation` 檔頭 ④ 記的是「重評估寫 PG 的 `quality_events`，要回流 Gold 還需要
+extract 把事件送上 BQ」。**反向同樣成立，而且更容易漏**：
+
+> **候選清單來自 BQ 的 `int_orders_quarantine`。新累積的資料若還沒抽上 BQ，重評估就
+> 看不見它們**——症狀是 `candidates` 偏低、`would_write=0`。
+
+實測數據與兩次走完的完整記錄見 §5。
 
 ### 3.4 人工放棄（`rejection`）：runbook，不做成 DAG
 
@@ -365,19 +392,38 @@ dbt build --select path:models/staging --vars '{stg_orders_lookback_days: 10}'
 
 | 項目 | 為什麼不做 | 觸發點 |
 |---|---|---|
-| **Seeding DAG** | 會讓「示範資料產生器」變成常駐系統的一部分；且會**翻轉** [CLOUD_LAYER-TW §1.7.7](./CLOUD_LAYER-TW.md) 已寫定的 freshness 立場 | 需要 BI 圖表持續有資料時。屆時 freshness 恢復為有意義的 gate，§1.7.7 的規則表要同步改 |
 | **OpenTelemetry** | 需要先有值得觀測的持續流量 | 藍圖 Phase 5 的獨立項 |
 | **Cosmos（模型級 task）** | 13 個 model，收益與相依成本不成比例 | model 數量成長到層級 task 看不清依賴時 |
 | **triggerer / deferrable** | 目前只有 `BashOperator` | 引入 sensor 時 |
 | **小時批** | 方案 A 的 watermark 精度被 DAY 分區卡死 | 改 HOUR 分區或換方案 B 時（[CLOUD_LAYER-TW §2.2](./CLOUD_LAYER-TW.md)）|
 | **可回填的 DAG** | 與「`>=` 寧可重抓不漏抓」衝突（§2.5） | 換方案 B watermark 時重新評估 |
 
+> **2026-08-11 更新**：**Seeding DAG 已實作**（`seed_demo_daily`），故從上表移除。
+> 當初列為「不做」的理由是「會讓示範資料產生器變成常駐系統的一部分」——那個顧慮成真了，
+> 而且是**刻意接受的**：這個專案沒有真實上游，seeding 就是資料來源（見〈範圍與職責邊界〉）。
+> 連帶 [CLOUD_LAYER-TW §1.7.7](./CLOUD_LAYER-TW.md) 的 freshness 立場已同步翻轉。
+
 ---
 
-## 5. 實機驗證記錄（2026-08-05）⭐
+## 5. 實機驗證記錄 ⭐
 
-本節記錄兩次實跑。**下面每一項都是量出來的**，不是設計時的推論——這正是它值得單獨成節的
-理由：前面六節有好幾個決策當初只能靠推理定案，這裡是它們第一次被資料驗證或推翻。
+本節記錄歷次實跑。**下面每一項都是量出來的**，不是設計時的推論——這正是它值得單獨成節的
+理由：前面幾節有好些決策當初只能靠推理定案，這裡是它們第一次被資料驗證或推翻。
+
+> ⚠️ **本節數字是特定時點的量測，不是當前狀態。** 資料集已於 **2026-08-11 重建**
+> （舊 ODS 與兩個 BQ dataset 全清、從零重跑 migration），§5.1–§5.4 引用的筆數在現在的
+> 資料庫裡查不到。保留它們是因為**那幾次量測驗證或推翻的設計結論仍然成立**——
+> 它們是結論的證據，不是現況的快照。
+
+### 5.0 兩次驗證的分界
+
+| | 2026-08-05 | 2026-08-11 |
+|---|---|---|
+| 環境 | 業務 DB 在主機、Airflow 在 compose | 全 compose（§3.1） |
+| `extract_*` 於容器內 | ⬜ 受阻 | ✅ 通過 |
+| 規則版本 | v3 | v4 |
+| 資料集 | 累積而來（含手動灌入、不可重現的資料） | 從零重建，全部由 `seed_demo` 產生 |
+| 攝入模式 | 手動 | `seed_demo_daily` 排程 |
 
 ### 5.1 Proposal B 完整回流（§3.3 劇本走一次）
 
@@ -463,46 +509,119 @@ dbt build --select path:models/marts         assert_fct_orders_complete_projecti
 灌完料 15 分鐘後跑，兩個 source 皆 **PASS**。[CLOUD_LAYER-TW §1.7.7](./CLOUD_LAYER-TW.md)
 論證的「紅代表你最近沒餵它，不代表管線壞掉」不再只是論證——**餵了就綠**。
 
-### 5.4 實跑才發現的落差：`raw_id` 在兩個 ODS 之間會碰撞 ⭐
+### 5.4 `raw_id` 在兩個 ODS 之間會碰撞 ⭐
 
-`extract_orders` 在容器內失敗，表面原因是 compose 把「業務 DB 跑在 compose 內」寫死成
-假設，而本機的 postgres 在主機上、且只監聽 `127.0.0.1`。修法是開一個
-`AIRFLOW_TASK_DB_URL` 覆寫接縫（見 §3.1 的 A/B 選項）。
+**當時的狀況**：業務 DB 在主機、Airflow 在容器，兩邊要接起來時有一個選項是「讓 compose 的
+`db` 也跑起來」——那是一個**獨立的空資料庫**，它 mint 的 `raw_id` 從 1 開始，與主機 ODS
+**完全重疊**。兩者抽進同一張 BQ staging，`stg_` 以 `raw_id` 為 grain 的去重會把**兩筆不相干
+的訂單當成彼此的副本**收斂掉一筆。不報錯、不留痕跡。
 
-**但真正值得記住的是選項 A 底下那個陷阱**，它比這次的失敗嚴重得多：
+**什麼時候要注意**：只要出現「多個 landing 實例」——主機與容器各一份、藍綠部署兩份、
+多個上游各自有自己的 Raw 表——這個碰撞就會重現。
 
-> 讓 compose 的 `db` 服務一起起來，那是一個**獨立的空資料庫**。它 mint 出來的 `raw_id`
-> 從 1 開始編號，與主機 ODS 的**完全重疊**。兩者抽進同一張 BQ staging，
-> `stg_` 以 `raw_id` 為 grain 的去重會把**兩筆不相干的訂單當成彼此的副本**收斂掉一筆。
-> 不報錯、不留痕跡。
+**解法**：去重鍵升級為 `(source_instance, raw_id)` 之類的複合鍵；或在抽取時就帶上實例
+識別欄位。**在那之前，一張 staging 表只能對應一個 ODS**，不同實例的資料切勿混進同一個
+dataset。
 
-這其實是 [README](./README.zh-TW.md)〈`raw_id` 是物理身分、`order_id` 是業務身分〉那條原則
-的一個推論，只是原文沒有把它推到底：**`raw_id` 的唯一性只在「單一 landing 實例」內成立。**
-去重鍵選 `raw_id` 是對的（物理去重就該用物理身分），但它同時把一個隱含前提焊進了管線——
-**一張 staging 表只能對應一個 ODS**。多實例上游若各自有 landing，去重鍵必須升級為
-`(source_instance, raw_id)` 之類的複合鍵。目前是單實例，前提成立，故不動；
-記在這裡是為了讓未來要擴展的人知道這條線在哪。
+這是 [README](./README.zh-TW.md)〈`raw_id` 是物理身分、`order_id` 是業務身分〉那條原則的
+推論，只是原文沒推到底：**`raw_id` 的唯一性只在「單一 landing 實例」內成立。** 去重鍵選
+`raw_id` 是對的（物理去重就該用物理身分），但它同時把「單實例」這個前提焊進了管線。
+
+> **本專案已無此風險**：作品性質、全 compose 之後只有一個 ODS，成因隨之消失（§3.1）。
+> 保留本節是因為那個前提仍焊在管線裡——只是目前恆為真。
+
+### 5.5 全 compose 重建與 v4 回流（2026-08-11）⭐
+
+環境改為全 compose、資料集從零重建，並以 v4 走完一次規則放寬。
+
+**基建**
+
+| 項目 | 結果 |
+|---|---|
+| `alembic upgrade head` 從零 | 7 個 migration 全數通過——長壽的開發資料庫從沒測過這條路徑 |
+| 服務健康 | 9 個容器（db/redis/api/worker/beat + Airflow 四件）全 healthy |
+| Airflow → `api:8000` / `db:5432` | 皆通，且讀到同一個資料庫（`ods=8`）——`§6` 卡最久的 ⬜ 就此解除 |
+| BQ 全清後自動重建 | `extract_ods_to_bq.py` 的 `create_dataset/create_table(exists_ok=True)` 帶著分區與 `require_partition_filter` 設定重建，**零手工 DDL** |
+| 主 DAG | 7/7 task success，全程約 **2.5 分鐘** |
+| `source_freshness_watch` | 兩個 source 皆 **PASS**——由「預期恆紅」轉為「預期常綠」 |
+
+**落地閘門（`--require-landed-pct`）正反向**
+
+停掉 `worker` 後灌 3 筆：
+
+| | ODS | exit code |
+|---|---|---|
+| 不給旗標（舊行為） | 0 筆 | **0** ← 靜默成功，正是要防的 |
+| `--require-landed-pct 0.9` | 0 筆 | **1** ← 擋下 |
+
+重啟 `worker` 後，13 筆 `pending` 由 `scan_and_dispatch` 全數補派完成——自癒一併驗到。
+
+**v4 規則放寬回流**
+
+資料 3,015 筆、quarantine 265 筆。目標：`customer_name` 軟性上限 100→150。
+
+| 步驟 | 結果 |
+|---|---|
+| dry-run | `candidates=265 promoted=3 would_write=3` |
+| commit | `written=3`；`quality_events` 3015 `initial_evaluation@v3` + 3 `promotion@v4` |
+| **Bounded Writeback** | ODS 指紋前後**完全一致**（3015 筆、髒 265 不變） |
+| 冪等 | 再跑一次 `promoted=0 written=0 unchanged=265` |
+| Gold 回流 | `int_orders +3`、`quarantine 265→262`、`fct_orders +3`、`promotions 0→3` |
+| 逐筆確認 | 3 筆皆 `fct_orders=1 / quarantine=0` |
+| 對照組 | `customer_name` 157/164/176/188/199 與 `city` ×5 **全數留在 quarantine** |
+
+> 對照組是**同一個注入器自然形成的**（`_dirty_field_too_long` 長度散佈 110~200、
+> 且有一半打 `city`），不像 v3 那次要另外準備。邊界也更緊：**146 promote、157 不 promote**。
+
+#### 被推翻的兩個推論 ⭐
+
+**① `--expect-rule-version` 的覆蓋範圍比原本以為的窄**
+
+重建映像前實測：`api`/`worker` 回報 `v3 {'customer_name': 100}`、Airflow 回報
+`v4 {'customer_name': 150}`，而 `--expect-rule-version v4` **通過**。
+該守衛只比對自己行程裡的版本——**它成立的前提是整個系統只有一套程式碼交付機制**，
+而這個 compose 拓撲（映像 vs bind mount）打破了那個前提。處置見 §3.3 第 3 步。
+
+**② 候選來源的方向性沒被寫下來**
+
+`dq_reevaluation` 檔頭只記了「重評估寫 PG，要回流 Gold 需要 extract」。反向同樣成立：
+**候選讀 BQ，所以資料必須先上 BQ**。第一次 dry-run 得到 `candidates=26 / would_write=0`
+——不是規則沒生效，是 BQ 還停在累積前的狀態。處置見 §3.3 第 4 步。
+
+#### 順帶量到的
+
+- **unpause 一條 DAG 會立刻產生一個 scheduled run**：`staging.orders` 因此是 398 = 199×2，
+  而 `stg_orders` 正好 199——append-only 容忍重複、去重交給 `stg_` 的設計被意外驗證了一次。
+- **Jinja 模板錯誤只在 runtime 出現**：DagBag 解析乾淨、`dags list` 正常、結構測試全綠，
+  task 卻在 0.16 秒內失敗。三種踩法（巢狀 `{{ }}`、f-string 把 `}}` 跳脫成 `}`、
+  `data_interval_start` 在手動 run 不存在）都只有**真的渲染一次**才抓得到，
+  故 `tests/test_dags.py` 補了渲染測試。
+- **cron 的 `data_interval_start` 是上一個觸發點**：用它當日期種子會讓每天第一個時段取到
+  **前一天**，當日髒率不再一致。改用 `dag_run.run_after`（見 `seed_demo_daily.py` 檔頭）。
 
 ---
 
 ## 6. 現況與待辦
 
-- ✅ `orders_analytics_daily`（2 extract → 4 層 dbt build → 完整 `dbt test`）
+- ✅ `orders_analytics_daily`（2 extract → 4 層 dbt build → 完整 `dbt test`；台北 23:00）
 - ✅ `dq_reevaluation`（手動觸發，預設 dry-run，commit 後自動接主 DAG）
-- ✅ `source_freshness_watch`（獨立觀測）
+- ✅ `source_freshness_watch`（獨立觀測；2026-08-11 起由「預期恆紅」轉為「預期常綠」）
+- ✅ `seed_demo_daily`（模擬上游，台北 09/13/17/21，共 800 筆/天）
+- ✅ `seed_demo_gate_demo`（Hard Gate 攔截劇本，手動觸發）
 - ✅ 映像（兩個隔離 venv）、compose overlay、env_var 版 `profiles.yml`
-- ✅ `tests/test_dags.py`（20 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
+- ✅ 全 compose 化（db/redis/api/worker/beat 與 Airflow 同一個 project、同一套資料）
+- ✅ `tests/test_dags.py`（42 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
 - ✅ 實機驗證（2026-08-05）：映像建成、四個服務健康、3 條 DAG 由真實 dag-processor 解析且**零 import 錯誤**、
   兩個 venv 可用（dbt 1.11.12 / bigquery 1.11.3）、env_var 版 profile 在容器內連上 BQ、
   `source_freshness_watch` 完整 run 成功、`dbt_intermediate` 於容器內 PASS=27
-- ⬜ `extract_*` 於容器內實跑（受阻於「業務 DB 在主機且只監聽 127.0.0.1」，見 §3.1 的 A/B 選項）
+- ✅ `extract_*` 於容器內實跑（2026-08-11 通過——全 compose 之後阻礙整類消失，見 §5.5）
 - ✅ v3 規則放寬（`age` 上限 120→130）——Proposal B 第一次有真的可 promote 的對象
-- ✅ §3.3 demo 劇本實機走完（2026-08-05）：20 筆以 v2 落 quarantine → v3 放寬 → 重評估 promote 15
-  → 回流 `fct_orders`，`promotions` 0→15；對照組 5 筆（age -3/150/999）正確留在 quarantine；
-  連跑兩次第二次 `written=0`（冪等）；ODS 全程未被修改（Bounded Writeback）
-- ⬜ Seeding DAG（見 §4）
+- ✅ v4 規則放寬（`customer_name` 軟性上限 100→150）
+- ✅ §3.3 SOP 實機走完兩次：v3（2026-08-05，promote 15）與 v4（2026-08-11，promote 3）；
+  兩次皆冪等、ODS 未被修改、對照組留在 quarantine。完整數據見 §5.1 與 §5.5
 - ✅ Celery + Redis（已實作，與本層正交；見 [QUEUE-TW.md](./QUEUE-TW.md)）
 - ⬜ OpenTelemetry（藍圖 Phase 5 的其他項）
+- ⬜ 跨時區抽取的正式處置（§2.11 的 a/b/c 尚未選——沒有真實跨日界流量之前無法驗證）
 
 ## 7. 相依與版本
 

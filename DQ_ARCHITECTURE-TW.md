@@ -770,7 +770,11 @@ Hard Gate 一擋就是整條下游停更。誤觸的代價是「本可更新的�
 `promotion` 與 `re_quarantination` 的寫入邏輯已落地，觸發方式是**手動／規則升版時**而非日排程——規則沒變時重評估必然是 no-op，排成日批只是對全歷史 quarantine 做一次白工。`rejection`（→ `permanently_rejected`）刻意**不做進自動任務**，維持「人工放棄」的語意。  
 **下游回流路徑本來就已就緒**：`int_orders` 的有效狀態合成早有測試把關，事件一產生，下次 dbt run 即自然生效，`int_` 層一行都沒改——這是當初「先把消費端做對」這個順序的回報。
 
-> **已於 2026-08-05 實跑驗證**：v3 放寬 `age` 上限後，重評估把 15 筆 v2 時期的 quarantine 記錄 promote 回 Gold，`rpt_quality_events_daily.promotions` 由 0 變 15；連跑第二次寫入 0 筆（冪等）；ODS 全程未被修改。完整數據見 [ORCHESTRATION-TW §5.1](./ORCHESTRATION-TW.md)。
+> **已實跑驗證兩次。**
+>
+> **v3（2026-08-05）**：放寬 `age` 上限後，重評估把 15 筆 v2 時期的 quarantine 記錄 promote 回 Gold，`rpt_quality_events_daily.promotions` 由 0 變 15；連跑第二次寫入 0 筆（冪等）；ODS 全程未被修改。⚠️ 該次的資料集已於 2026-08-11 重建，數字為當時記錄。完整數據見 [ORCHESTRATION-TW §5.1](./ORCHESTRATION-TW.md)。
+>
+> **v4（2026-08-11，目前可重演）**：放寬 `customer_name` 軟性長度上限 100→150 後，3,015 筆 / quarantine 265 筆中 promote **3 筆**（長度 119/129/146），`promotions` 0→3、`fct_orders` +3；對照組——`customer_name` 157~199 共 5 筆與 `city` 5 筆——全數留在 quarantine；再跑一次 `written=0`；ODS 指紋前後完全一致。**對照組是同一個注入器自然形成的，不是刻意準備的**，比 v3 那次更能說明「放寬只影響落在新舊閾值之間的記錄」。部署 SOP 見 [ORCHESTRATION-TW §3.3](./ORCHESTRATION-TW.md)，數據見 §5.5。
 >
 > ⚠️ 但那個「同義反覆」的道理仍然成立且要記住：**規則沒變時跑重評估必然是 no-op**，這正是它 `schedule=None` 而非日排程的理由。
 

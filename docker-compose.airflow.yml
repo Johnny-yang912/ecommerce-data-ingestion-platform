@@ -41,6 +41,11 @@ x-airflow-common: &airflow-common
     #    DAG 會全綠、ODS 零增長、freshness 照樣紅，而且沒有任何錯誤訊息。
     #    兩者同在一個 compose 網路，就是為了讓這件事不可能發生。
     DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
+    # ⚠️ 必須與 worker / beat 讀到同一個值（docker-compose.yml 也有這行）。
+    #    raw_pending_watch 的門檻是【從這個值推導】出來的（見 check_raw_pending.py ③）：
+    #    只調了那一邊的話，恢復掃描變慢而探針門檻不變 → 探針開始對「正在被正確
+    #    處理的列」誤報，而且沒有任何地方會提示這兩者已經分岔。
+    SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-300}
     BQ_PROJECT: ${BQ_PROJECT}
     BQ_DBT_DATASET: ${BQ_DBT_DATASET:-dbt_dev}
     # ── seeding（Phase 5+：持續攝入）─────────────────────────────────────────

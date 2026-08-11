@@ -39,7 +39,9 @@ staging 由抽取腳本以 batch load job 灌入。BQ 的 streaming insert 按�
 
 **但它有一個必須知道的範圍邊界**：積壓被恢復掃描沖出去時，那批列的 `ods.received_at` 是**回補當下**的寫入時刻，於是攝入中斷的斷層在 ODS 的時間軸上**不存在**。因此任何建立在 `ods.received_at` 上的觀測（分區、freshness、`rpt_quality_events_daily` 的日界）都只看得見「取樣當下仍在進行中」的中斷，看不見已經恢復的。
 
-Raw→ODS 那一段的健康由別的東西回答：`raw.status='pending'` 的最舊年齡（由後續新增的 `raw_pending_watch` DAG 負責），以及未來 OTel 的 `raw.received_at` 連續性。**三個時間軸各管一段，不要讓其中一個兼差。**
+派工那一段的健康由別的東西回答：`raw.status='pending'` 的最舊年齡（由後續新增的 `raw_pending_watch` DAG 負責），以及未來 OTel 的 `raw.received_at` 連續性。**三個時間軸各管一段，不要讓其中一個兼差。**
+
+⚠️ 順帶釐清一個容易寫錯的判準：**不能用「Raw 有列但沒有對應的 ODS 列」當故障定義**。Raw 的終態是 `processed` / `duplicate` / `error`，後兩者不產生 ODS 列而且那是正確行為，照那個定義做檢查會讓每筆重複訂單都變成告警。`pending` 才是乾淨的訊號——它表示還沒有任何 worker 取走這一筆。
 
 **為什麼不改成帶入 `raw.received_at`**：第一理由是上面那句——語意本來就是對的，改了才會錯。次要理由才是代價：分區欄位語意一變就要重建表與回填，且 Hard Gate 的「最新 UTC 日分區」口徑會跟著改。
 

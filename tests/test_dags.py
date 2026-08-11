@@ -285,6 +285,53 @@ class TestSeedDemoDaily:
         assert "SLOT_SIZES[" not in cmd
 
 
+class TestRawPendingWatch:
+    """派工路徑的存活探針。它補的是 `_enqueue` 吞掉 broker 故障造成的靜默失敗
+    ——那個狀態下 API 照回 202、Raw 一直長、卻沒有任何 worker 來取件、無人報錯。
+
+    ⚠️ 它量的是「有沒有人來取」而非「有沒有寫進 ODS」：`duplicate` / `error`
+    本來就不會產生 ODS 列，拿後者當判準的話每筆重複訂單都會誤報。"""
+
+    @pytest.fixture
+    def dag(self, dagbag):
+        return dagbag.dags["raw_pending_watch"]
+
+    def test_slot_hours_match_the_seeding_dag(self, dagbag, dag):
+        """⭐ `SEED_SLOT_HOURS` 是 seed_demo_daily 排程的**重複宣告**（刻意不跨 DAG
+        檔 import，那會建立解析順序的耦合）。重複就必須被釘住，否則改了 seeding
+        時段而忘了這邊時，探針會在「什麼都不會變化」的時刻檢查——它不會紅，
+        只會安靜地失去意義，而那正是最難發現的壞法。"""
+        seeding = dagbag.dags["seed_demo_daily"]
+        seed_hours = sorted(int(h) for h in str(seeding.schedule).split()[1].split(","))
+        watch_hours = sorted(int(h) for h in str(dag.schedule).split()[1].split(","))
+        assert seed_hours == watch_hours, (
+            f"探針時段 {watch_hours} 與 seeding 時段 {seed_hours} 不一致")
+
+    def test_checks_after_the_batch_has_landed(self, dag):
+        """偏移必須大於「批次送完 + 門檻」，否則正常批次會被當成卡住。
+        250 筆 @0.8rps ≈ 5.2 分 + 60s verify ≈ 6.2 分；門檻約 20 分。"""
+        offset = int(str(dag.schedule).split()[0])
+        assert offset >= 27, f"偏移 {offset} 分鐘不足以涵蓋批次時間 + 門檻"
+
+    def test_no_retries(self, dag):
+        """唯讀且 deterministic，重試只會得到同一個答案。"""
+        for task in dag.tasks:
+            assert task.retries == 0
+
+    def test_threshold_is_not_hardcoded_in_the_dag(self, dag):
+        """⭐ 門檻必須在執行時從 `scan_interval_seconds` / `STALE_PROCESSING_MINUTES`
+        / `PENDING_GRACE_SECONDS` 推導，不能寫死。寫死等於把推導結果凍成魔術數字，
+        而下一個調 SCAN_INTERVAL_SECONDS 的人不會知道要回來改這裡。"""
+        cmd = dag.get_task("check_raw_pending").bash_command
+        assert "--max-age-seconds" not in cmd, "排程執行不該覆寫推導值（那是除錯用的旗標）"
+
+    def test_is_not_upstream_of_anything(self, dag):
+        """與 source_freshness_watch 同一條紀律：觀測訊號沒有阻斷下游的權限，
+        也沒有污染別人成功率的權限。"""
+        assert len(dag.tasks) == 1
+        assert dag.tasks[0].downstream_task_ids == set()
+
+
 class TestSeedDemoGateDemo:
 
     @pytest.fixture

@@ -46,8 +46,9 @@ That gap has concrete consequences — this is not a disclaimer:
 |---|---|
 | All seeding slots land in one UTC day partition | Round-the-clock ingestion cannot dodge the UTC day boundary; Taipei 00:00–08:00 falls into the previous day (see §2.11) |
 | The Hard Gate uses "latest UTC day partition" as a proxy for "latest batch" | Under continuous ingestion it degrades into "today so far", replaying the dilution problem within a single day |
-| Freshness needs no blocking authority (no data = nobody seeded = harmless) | An upstream outage is an incident; freshness should be restored as a gate |
-| The 26h/50h freshness thresholds | Far too much slack at four batches a day — it cannot detect "the peak stopped for three hours" |
+| Freshness needs no blocking authority (no data = nobody seeded = harmless) | An upstream outage is an incident — **but freshness is not what detects it**. It measures `ods.received_at` = the extract hop, and is structurally blind to upstream. What a real system must add is measurement on the Raw side (§2.12, OTel), not wiring freshness up as a gate |
+| The 26h/50h freshness thresholds | **Unchanged.** The thresholds come from the *loading* cadence (one extract per day → `24h + 2h grace`), not the ingestion cadence; under 24/7 ingestion the warehouse is still loaded nightly, so the thresholds stay in this range. What would change them is extract moving to hourly or streaming |
+| Freshness detects "no data all day" | It cannot detect "the peak stopped for three hours" — but that is a question of **scope**, not of thresholds, and it is answered by §2.12 and OTel (see §2.7) |
 
 **But verification maturity differs sharply between the two paths, and the distinction matters:**
 
@@ -73,21 +74,44 @@ traffic — **and every test in the repo will support that misreading.**
 
 ## 1. DAG Topology
 
+Every schedule is declared explicitly in `Asia/Taipei` (rationale in §2.5).
+
 ```
-【orders_analytics_daily】  @daily, catchup=False, max_active_runs=1
+【seed_demo_daily】  0 10,13,17,21 * * * (Taipei), catchup=False, max_active_runs=1
+
+  seed_orders               ← the simulated upstream = this system's only data source
+
+【raw_pending_watch】  30 10,13,17,21 * * * (Taipei)
+
+  check_raw_pending         ← 30 min after each seeding slot; rationale in §2.12
+
+【orders_analytics_daily】  30 22 * * * (Taipei), catchup=False, max_active_runs=1
 
   extract_orders ─────────┐
                           ├─► dbt_staging ─► dbt_intermediate ─► dbt_marts ─► dbt_reports ─► dbt_test_all
   extract_quality_events ─┘      (Hard Gate)                                                 (completeness)
 
+【source_freshness_watch】  0 8 * * * (Taipei)
+
+  dbt_source_freshness      ← rationale for it being its own DAG in §2.7
+
 【dq_reevaluation】  schedule=None (manual trigger)
 
   reevaluate ─► should_refresh (passes only when commit) ─► trigger orders_analytics_daily
 
-【source_freshness_watch】  @daily
+【seed_demo_gate_demo】  schedule=None (manual trigger)
 
-  dbt_source_freshness      ← rationale for it being its own DAG in §2.7
+  seed_dirty_batch          ← the Hard Gate interception scenario
 ```
+
+**None of the four scheduled DAGs depends on another at the Airflow level** — the
+`seed → probe → extract → freshness` ordering contract **exists only in the time gaps**
+(21:00 finishes sending → 21:30 check → 22:30 extract → 08:00 next day backstop).
+That is deliberate: wiring them with triggers would let an upstream red decide whether
+downstream runs at all, while their reds stand for completely different responses
+(see the table in §2.7). The price is that the gaps must be pinned by tests — see
+`tests/test_dags.py::TestSeedDemoDaily::test_runs_before_the_analytics_dag` and
+`TestRawPendingWatch::test_slot_hours_match_the_seeding_dag`.
 
 Files live in `orchestration/dags/`.
 
@@ -220,13 +244,42 @@ So the principle goes one step further: **freshness has neither the authority to
 nor the authority to pollute another DAG's success rate.** Once separated, each DAG's red means
 exactly one thing:
 
-| DAG | Red means |
-|---|---|
-| `orders_analytics_daily` | The pipeline is broken |
-| `source_freshness_watch` | The source is stale (under manual ingestion = **the expected state**) |
+| DAG | Red means | Where to look |
+|---|---|---|
+| `seed_demo_daily` | Nothing gets in (API refusing / the script itself broke) | API and the seeding script |
+| `raw_pending_watch` | Rows reach Raw but nobody claims them | redis / worker / beat (§2.12) |
+| `orders_analytics_daily` | The pipeline is broken (extract or dbt) | The pipeline |
+| `source_freshness_watch` | staging was not moved forward (backstop for an empty extract) | The watermark and extract |
 
 Guarded by `tests/test_dags.py::TestFreshnessIsolation`: if any DAG producing real output picks
 up `dbt source freshness`, the test goes red.
+
+**⚠️ Freshness covers exactly one hop, and that is deliberate** ⭐
+
+`loaded_at_field` points at `ods.received_at` = **the ODS landing time, not the order-receipt
+time** (full account in [CLOUD_LAYER §1.2.2](./CLOUD_LAYER.md)). And what this DAG checks is
+extract, and what extract moves *is* ODS — **so reading ODS's own clock is the correct timeline,
+not a compromise.**
+
+The scope boundary that follows: **it cannot see ingestion outages that have already recovered**
+(when a backlog is flushed by the recovery scan, those rows carry the catch-up write time, so the
+gap does not exist on the ODS timeline). That is not a defect but somebody else's job — three
+timelines, one hop each; merged, a single red would stand for two pipeline segments:
+
+| Timeline | Which hop it answers | Who watches it |
+|---|---|---|
+| `raw.received_at` | Upstream + API: can orders get in? | (after OTel) |
+| `raw.received_at` → `ods.received_at` | Dispatch: can workers claim them? | `raw_pending_watch` (§2.12) |
+| `ods.received_at` in BQ staging | extract: did it reach the warehouse? | `source_freshness_watch` |
+
+**Where 26h/50h comes from**: `26 = 24 + 2`, `50 = 48 + 2` — one **loading cycle** plus 2 hours of
+grace. The source is the loading cadence, not the ingestion cadence: staging is pushed by extract
+once a day, so the data is up to 24 hours old by design and the threshold must exceed 24h or it
+would go red before every extract. Sampling point and threshold determine each other: sampled at
+08:00 Taipei the healthy value is ~13h and one missed cycle is 37h, so 26h sits in the middle with
+~10 hours of margin on both sides. **08:00 is chosen because this is a backstop** — if extract
+reports success but moved nothing, the Hard Gate judges yesterday's partition and passes, `dbt test`
+is green too, and this is the only thing that speaks up before the ops team opens the report at 09:00.
 
 ### 2.8 The Proposal B DAG: `schedule=None` is the design, not an omission ⭐
 
@@ -322,6 +375,66 @@ Options for an actual fix (**none taken yet, and none is a purely technical deci
 **Deliberately unchosen**: under the current ingestion pattern all three produce identical output
 (see "currently invisible" above) — **no choice can be validated until there is real traffic that
 crosses the day boundary.**
+
+### 2.12 `raw_pending_watch`: the observation-signal principle, applied a second time ⭐
+
+The principle from §2.7 (an observation signal has neither blocking authority nor the authority to
+pollute another DAG's success rate) applies here for the second time: `raw_pending_watch` is
+likewise its own DAG and likewise upstream of nothing. But it brings two arguments §2.7 does not.
+
+**① ⚠️ "a Raw row with no matching ODS row" cannot be the criterion**
+
+Raw has three terminal states: `processed`, `duplicate`, `error`. **The latter two produce no ODS
+row, and that is correct behaviour** (`duplicate` is a deliberately retained monitoring signal — see
+the architecture constraints in CLAUDE.md). Built on that criterion, the probe would go red on
+**every duplicate order**.
+
+So it looks only at `status='pending'`: landed in Raw, but **not yet claimed by any worker**. That
+state has no legitimate reason to persist, which makes it a clean fault signal. Whether a claimed
+row ends up `processed` or `duplicate`/`error` is a question about data content, owned by the DQ
+mechanisms.
+
+This also means it measures the **root cause rather than the symptom**: when redis/worker dies the
+visible downstream symptom is that ODS stops growing, but the cause is on the dispatch side —
+measuring the cause is both earlier and less ambiguous than watching ODS row counts.
+
+**② Sampling frequency follows *when the measured thing can change*, not "how often feels safe"**
+
+The common magnitudes are **a reference, not a rule**: environments with a metrics stack sample every
+15–60 seconds and require the breach to persist 2–10 minutes; a scheduler-only stopgap runs every
+5–15 minutes and requires two consecutive breaches. This project checks four times a day.
+
+The same principle yields opposite numbers, because under fixed-slot ingestion **pending cannot
+structurally accumulate between slots** — measuring at 19:00 a queue that has been empty since 17:10
+does not report "healthy", it reports nothing. The actual frequency should follow four things: the
+arrival rate of the data, the cost of the check itself, the tolerable detection delay (set by the
+**reversibility** of the loss — an order never received is irreversible, a late report is not), and
+whether a suppression mechanism exists at all.
+
+**③ The threshold is derived, not chosen**
+
+Its lower bound is set by the **recovery path's own cadence**; below the self-healing time it would
+alert on rows that are being handled correctly:
+
+```
+max(enqueue failed: PENDING_GRACE + scan_interval,
+    worker died mid-flight: STALE_PROCESSING_MINUTES + scan_interval) + safety margin
+```
+
+Currently `max(360s, 900s) + 240s = 1140s` (19 minutes), and those three constants are **read at
+runtime from `config` / `process`** rather than hardcoded — `SCAN_INTERVAL_SECONDS` is tunable via
+`.env`, and freezing a number here would turn a derivation into a magic constant that the next
+person to change it will not know to revisit. ⚠️ Corollary: that variable must be injected into the
+worker/beat **and** the Airflow containers (both compose files carry it); tuning only one side lets
+the recovery scan and the probe threshold diverge silently.
+
+**④ It is a stopgap coarse filter, not an alert**
+
+Real liveness monitoring is "sample by the second, require the breach to persist", and **Airflow
+cannot express the second half** — every DAG run is an independent, memoryless sample. The other
+limit is the failure domain: it lives in the same compose stack as the system it watches. Real
+alerting waits for OTel (§4), and the first rule to write there is **absent** — "nothing happened at
+all" is precisely the question metrics are worst at answering, and precisely what this is for.
 
 ---
 
@@ -444,7 +557,7 @@ have convenient buttons.**
 
 | Item | Why not | Trigger |
 |---|---|---|
-| **OpenTelemetry** | Needs continuous traffic worth observing first | A separate roadmap Phase 5 item |
+| **OpenTelemetry** | ⚠️ The original reason was "needs continuous traffic worth observing first" — **that condition has been met** since `seed_demo_daily` went live. What is still missing is a backend that lives **outside this machine**: a liveness alarm must not share a failure domain with the system it watches | Ready to start. The first rule to write is **absent** ("how long since this source sent anything"), not a business metric — and it must live on the cloud side, because what it detects is precisely "my side can no longer speak". See §2.12 ④ |
 | **Cosmos (model-level tasks)** | 13 models; benefit is out of proportion to the dependency cost | When model count makes layer-level tasks too coarse to read |
 | **triggerer / deferrable** | Only `BashOperator` today | When sensors are introduced |
 | **Hourly batches** | Plan A's watermark precision is capped by DAY partitioning | When switching to HOUR partitioning or Plan B ([CLOUD_LAYER §2.2](./CLOUD_LAYER.md)) |
@@ -682,13 +795,15 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
 
 - ✅ `orders_analytics_daily` (2 extracts → 4 layered dbt builds → full `dbt test`; 22:30 Taipei)
 - ✅ `dq_reevaluation` (manual, dry-run by default, chains into the main DAG on commit)
-- ✅ `source_freshness_watch` (standalone observability; flipped from "expected red" to "expected
-  green" on 2026-08-11)
+- ✅ `source_freshness_watch` (backstop for extract; 08:00 Taipei; flipped from "expected red" to
+  "expected green" on 2026-08-11)
 - ✅ `seed_demo_daily` (simulated upstream; 10/13/17/21 Taipei, 800 orders/day)
+- ✅ `raw_pending_watch` (dispatch liveness; 10:30/13:30/17:30/21:30 Taipei; threshold derived from
+  the recovery path's own settings — see §2.12)
 - ✅ `seed_demo_gate_demo` (Hard Gate interception script, manual)
 - ✅ Image (two isolated venvs), compose overlay, env_var-driven `profiles.yml`
 - ✅ Fully in compose (db/redis/api/worker/beat and Airflow in one project, on one dataset)
-- ✅ `tests/test_dags.py` (42 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
+- ✅ `tests/test_dags.py` (47 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
 - ✅ Verified live (2026-08-05): image builds, all four services healthy, three DAGs parsed by the
   real dag-processor with **zero import errors**, both venvs working (dbt 1.11.12 / bigquery 1.11.3),
   the env_var profile connecting to BQ from inside the container, a full successful

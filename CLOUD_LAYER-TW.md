@@ -104,7 +104,7 @@ BQ 每個 dataset 建立當下綁定 location 不可改；跨 location 查詢會
 
 | 決策 | orders | `quality_events` | 為什麼不同 |
 |---|---|---|---|
-| 分區 | `received_at`（DAY） | `event_at`（DAY） | 各表用自己的攝入時間軸；`event_at` 同時餵 watermark（方案 A 讀最新分區）|
+| 分區 | `received_at`（DAY） | `event_at`（DAY） | 各表用自己的落地時間軸（⚠️ `received_at` 是 ODS 的落地時刻而非收單時刻，見 §1.2.2）；`event_at` 同時餵 watermark（方案 A 讀最新分區）|
 | 叢集 | `order_id` + `has_clean_error` | `raw_id` + `to_state` | 下游以 **`raw_id`** 為 grain 取「每筆記錄的最新狀態」（與 dbt `stg_` 去重同鍵）；`to_state` 供狀態過濾 |
 | 保險絲 | ✅ 開 | ❌ **關** | **關鍵差異**：orders 的查詢永遠帶 `received_at` 過濾；但 `quality_events` 的主消費者是「跨全歷史按 `raw_id` 取最新」，本質是**非分區過濾的全掃描**，開保險絲會直接擋掉這個必然查詢 |
 
@@ -204,7 +204,7 @@ ODS 在 PostgreSQL 仍是永久且完整的錨點（`raw`/`ods`/`quality_events`
 
 3. **`dbt source freshness` 會先於一切變紅，而且它量的不是你以為的東西。**
 
-   `loaded_at_field` 指向 `received_at`，那是 **ODS 的攝入時間**；`ORDERS_FIELDS` 裡**沒有任何抽取時間欄位**（整份是 ODS 的 1:1 鏡射）。所以這支檢查回答的是「最新一筆訂單多久以前**進到 ODS**」，**不是**「抽取工作多久沒跑」。
+   `loaded_at_field` 指向 `received_at`，那是 **ODS 的落地時刻**（不是收單時刻，見 §1.2.2）；`ORDERS_FIELDS` 裡**沒有任何抽取時間欄位**（整份是 ODS 的 1:1 鏡射）。所以這支檢查回答的是「最新一筆訂單多久以前**進到 ODS**」，**不是**「抽取工作多久沒跑」。
 
    後果是兩種完全不同的失敗長得一模一樣：
 
@@ -259,8 +259,18 @@ freshness 因此從「一個因為前提不成立而不該有權限的訊號」�
 條件成立後就該把它接成 gate。
 
 另外「持續攝入」在此有限定：**一天四批，不是 24 小時連續**。26h/50h 的閾值在這個節奏下
-餘裕很大（最壞只隔 12 小時），偵測得到「整天沒灌」，偵測不到「峰期停了三小時」。
-真實連續攝入下閾值要重訂——那是在目前節奏下問不出來的問題。
+餘裕很大（最壞只隔 13 小時，即 21:00 那批到隔日 10:00），偵測得到「整天沒進 staging」，
+偵測不到「峰期停了三小時」。
+
+⚠️ **上一版這裡寫「真實連續攝入下閾值要重訂」，那句話是錯的，已刪。** 閾值的來源是
+【**載入**節奏】而非攝入節奏——staging 一天只被 extract 推一次，資料設計上就有最多 24 小時
+的年齡，所以 `26 = 24 + 2`、`50 = 48 + 2`。攝入變成 24 小時連續**不會改變這個算式**，
+只要倉儲仍是夜間批次載入。會改變它的是 extract 改成小時批或串流。
+（完整推導見 [ORCHESTRATION-TW §2.7](./ORCHESTRATION-TW.md)。）
+
+而「偵測不到峰期停三小時」也不是閾值的問題，是**範圍**的問題：freshness 量的是
+`ods.received_at`＝extract 那一跳（見 §1.2.2），攝入中斷本來就不歸它管——那由
+`raw_pending_watch` 與日後的 OTel 回答。
 
 **實作結果（Phase 5）：旁路 task 不夠，必須獨立成一條 DAG** ⭐
 

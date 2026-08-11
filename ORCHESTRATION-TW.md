@@ -42,8 +42,9 @@ ODS (PostgreSQL) ──[E/L]──► BQ staging ──[T：dbt]──► stg_/i
 |---|---|
 | 所有 seeding 時段落在同一個 UTC 日分區 | 24 小時進單無法迴避 UTC 日界，台北 00:00–08:00 的資料會落到前一天（見 §2.11） |
 | Hard Gate 以「最新 UTC 日分區」代理「最近一批」 | 連續攝入下退化成「今天到目前為止」，稀釋問題在一天內重演 |
-| freshness 不需要阻斷權（沒資料＝沒灌，無害） | 上游停送是事故，freshness 應恢復為 gate |
-| 26h/50h 的 freshness 閾值 | 一天四批下餘裕過大，偵測不到「峰期停了三小時」 |
+| freshness 不需要阻斷權（沒資料＝沒灌，無害） | 上游停送是事故，**但不由 freshness 偵測**——它量的是 `ods.received_at`＝extract 那一跳，結構上看不見上游。真實系統要補的是 Raw 那一側的量測（§2.12、OTel），不是把 freshness 接成 gate |
+| 26h/50h 的 freshness 閾值 | **不變**。閾值來自【載入節奏】（一天一次 extract → `24h + 2h 寬限`），不是攝入節奏；24/7 攝入下倉儲仍是夜間批次，閾值就仍是這個量級。會改變它的是 extract 改成小時批或串流 |
+| freshness 偵測得到「整天沒資料」 | 偵測不到「峰期停了三小時」——但那是**範圍**而非閾值的問題，該由 §2.12 與 OTel 回答（見 §2.7） |
 
 **但驗證程度要分兩條路徑講，不可一概而論**：
 
@@ -60,21 +61,42 @@ ODS (PostgreSQL) ──[E/L]──► BQ staging ──[T：dbt]──► stg_/i
 
 ## 1. DAG 拓撲
 
+全部排程皆以 `Asia/Taipei` 顯式宣告（理由見 §2.5）。
+
 ```
-【orders_analytics_daily】  @daily, catchup=False, max_active_runs=1
+【seed_demo_daily】  0 10,13,17,21 * * *（台北），catchup=False, max_active_runs=1
+
+  seed_orders               ← 模擬上游＝本系統唯一的資料來源
+
+【raw_pending_watch】  30 10,13,17,21 * * *（台北）
+
+  check_raw_pending         ← 每個 seeding 時段後 30 分鐘；理由見 §2.12
+
+【orders_analytics_daily】  30 22 * * *（台北），catchup=False, max_active_runs=1
 
   extract_orders ─────────┐
                           ├─► dbt_staging ─► dbt_intermediate ─► dbt_marts ─► dbt_reports ─► dbt_test_all
   extract_quality_events ─┘      (Hard Gate)                                                 (completeness)
 
+【source_freshness_watch】  0 8 * * *（台北）
+
+  dbt_source_freshness      ← 獨立成一條 DAG 的理由見 §2.7
+
 【dq_reevaluation】  schedule=None（手動觸發）
 
   reevaluate ─► should_refresh（commit 才通過）─► trigger orders_analytics_daily
 
-【source_freshness_watch】  @daily
+【seed_demo_gate_demo】  schedule=None（手動觸發）
 
-  dbt_source_freshness      ← 獨立成一條 DAG 的理由見 §2.7
+  seed_dirty_batch          ← Hard Gate 攔截劇本
 ```
+
+**四條有排程的 DAG 之間沒有任何 Airflow 層級的相依**——`seed → 探針 → 抽取 → freshness`
+的時序契約**只存在於時間差裡**（21:00 送完 → 21:30 檢查 → 22:30 抽取 → 隔日 08:00 backstop）。
+這是刻意的：用 Trigger 串起來會讓上游的紅連帶決定下游跑不跑，而它們的紅各自代表
+完全不同的處置（見 §2.7 的表）。代價是那個時間差必須由測試釘住，見
+`tests/test_dags.py::TestSeedDemoDaily::test_runs_before_the_analytics_dag`
+與 `TestRawPendingWatch::test_slot_hours_match_the_seeding_dag`。
 
 檔案位置：`orchestration/dags/`。
 
@@ -192,15 +214,40 @@ task retry 精準得多——後者會把整個 `dbt build` 重跑一次。
 > 真正的管線故障被淹沒在每天都紅的噪音裡。
 
 所以那條原則要再推一步：**freshness 不只沒有「阻斷下游」的權限，也沒有「污染別人成功率」
-的權限。** 獨立後兩條 DAG 的紅各自代表一件事：
+的權限。** 拆開之後，每條 DAG 的紅各自對應一種處置——這就是拆開的全部收益：
 
-| DAG | 紅代表 |
-|---|---|
-| `orders_analytics_daily` | 管線壞了 |
-| `source_freshness_watch` | 資料源不新鮮（目前的手動攝入下＝**預期狀態**）|
+| DAG | 紅代表 | 處置方向 |
+|---|---|---|
+| `seed_demo_daily` | 灌不進去（API 拒收 / 腳本本身壞了） | 看 API 與腳本 |
+| `raw_pending_watch` | Raw 進得來但沒人來取 | 看 redis / worker / beat（§2.12）|
+| `orders_analytics_daily` | 管線壞了（extract 或 dbt） | 看管線 |
+| `source_freshness_watch` | staging 沒被推進（extract 空搬的 backstop） | 看 watermark 與 extract |
 
 由 `tests/test_dags.py::TestFreshnessIsolation` 把關：任何有實際產出的 DAG 混進
 `dbt source freshness`，測試就紅。
+
+**⚠️ freshness 的範圍剛好是一跳，而且那是刻意的** ⭐
+
+`loaded_at_field` 指向 `ods.received_at`＝**ODS 的落地時刻，不是收單時刻**
+（完整說明見 [CLOUD_LAYER-TW §1.2.2](./CLOUD_LAYER-TW.md)）。而本 DAG 檢查的是 extract，
+extract 搬的正是 ODS——**所以看 ODS 自己的時鐘是正確的時間軸，不是妥協**。
+
+由此得到的範圍邊界：**它看不見已經恢復的攝入中斷**（積壓被恢復掃描沖出去時，那批列的
+`received_at` 是回補當下的寫入時刻，斷層在 ODS 時間軸上不存在）。這不是缺陷，是別人的
+職責——三個時間軸各管一段，混在一起的話一個紅會同時代表兩段管線：
+
+| 時間軸 | 回答哪一段 | 誰在看 |
+|---|---|---|
+| `raw.received_at` | 上游 + API：收得到單嗎 | （OTel 之後）|
+| `raw.received_at` → `ods.received_at` | 派工：worker 取得到件嗎 | `raw_pending_watch`（§2.12）|
+| BQ staging 上的 `ods.received_at` | extract：搬進倉儲了嗎 | `source_freshness_watch` |
+
+**26h/50h 從哪來**：`26 = 24 + 2`、`50 = 48 + 2`——一個**載入週期** + 2 小時寬限。
+來源是載入節奏而非攝入節奏：staging 一天只被 extract 推一次，資料設計上就有最多 24 小時的
+年齡，閾值必須大於 24h 否則每天抽取前會自己紅。取樣點與閾值互相決定：台北 08:00 取樣時
+健康值約 13h、一個週期沒進資料是 37h，26h 落在正中間、兩邊各約 10 小時餘裕。
+**排 08:00 是因為它是 backstop**——extract 若回報成功卻沒搬東西，Hard Gate 判的是舊分區
+會通過、`dbt test` 也全綠，此時它是唯一會在營運團隊 09:00 看報表前叫的東西。
 
 ### 2.8 Proposal B 的 DAG：`schedule=None` 是設計，不是還沒設好 ⭐
 
@@ -285,6 +332,57 @@ UTC 00:00–16:00 的同一日。**但那是挑時段挑出來的結果，不是
 
 **先不選**，是因為在目前的攝入模式下三者的產出完全相同（見上方「碰巧對齊」）——
 **沒有真實跨日界流量之前，任何選擇都無法被驗證。**
+
+### 2.12 `raw_pending_watch`：觀測訊號原則的第二個案例 ⭐
+
+§2.7 立的原則（觀測訊號沒有阻斷權、也沒有污染別人成功率的權）在這裡第二次適用：
+`raw_pending_watch` 同樣是獨立 DAG、同樣不是任何東西的上游。但它帶來兩個 §2.7
+沒有的論點。
+
+**① ⚠️ 不能用「Raw 有列但沒有對應的 ODS 列」當判準**
+
+Raw 的終態有三種：`processed`、`duplicate`、`error`。**後兩者不會產生 ODS 列，
+而且那是正確行為**（`duplicate` 是刻意保留的監控訊號，見 CLAUDE.md 架構約束）。
+照那個判準做探針，**每一筆重複訂單都會讓它紅**。
+
+所以它只看 `status='pending'`：已落到 Raw、但**還沒有任何 worker 把它取走**。
+這個狀態沒有正當理由長期存在，是一個乾淨的故障訊號。取走之後變成 processed 還是
+duplicate/error，是資料內容的事，由 DQ 機制負責。
+
+這也決定了它量的是**根因而非症狀**：redis/worker 掛掉時下游看得到的症狀是 ODS 不再
+成長，但根因在派工端——量根因比盯著 ODS 有沒有變多更早、也更明確。
+
+**② 量測頻率由【被量的東西何時會變化】決定，不是由「多久看一次比較安心」**
+
+常見量級是**參考不是準則**：有 metrics stack 的環境是 15–60 秒取樣 + 要求連續超標
+2–10 分鐘；只有排程器的過渡期是 5–15 分鐘 + 連續兩次。本專案是一天四次。
+
+同一條原則推出相反的數字，因為固定時段攝入下**時段之間 pending 在結構上不可能累積**
+——19:00 去量一個從 17:10 起就空的佇列，量到的不是「健康」，是沒有資訊。
+實際頻率應由四項共同決定：資料抵達頻率、檢查本身的成本、可容忍的偵測延遲
+（由損失的**可逆性**決定——訂單沒收到不可逆，報表晚了可逆）、以及有沒有抑制機制。
+
+**③ 門檻是推導的，不是選的**
+
+下界由**恢復路徑自己的週期**決定，低於自癒時間會對「正在被正確處理的列」告警：
+
+```
+max(派工失敗 PENDING_GRACE + scan_interval,
+    worker 猝死 STALE_PROCESSING_MINUTES + scan_interval) + 安全邊際
+```
+
+現值 `max(360s, 900s) + 240s = 1140s`（19 分鐘），且**在執行時從 `config` / `process`
+讀那三個常數**而非寫死——`SCAN_INTERVAL_SECONDS` 是 `.env` 可調的，寫死一個數字等於
+把推導結果凍成魔術數字，而下一個調它的人不會知道要回來改這裡。
+⚠️ 連帶要求：該變數必須同時注入 worker/beat **與** Airflow 容器（兩份 compose 都有），
+只調一邊會讓恢復掃描與探針門檻無聲分岔。
+
+**④ 它是過渡期的粗篩，不是告警**
+
+實務上的存活監控是「秒級取樣 + 要求連續超標」，而 **Airflow 表達不了後者**——每個
+DAG run 都是獨立、無記憶的取樣。另一個限制是故障域：它與被監控的系統住在同一組
+compose。真正的告警要等 OTel（§4），而屆時第一條該寫的規則是 **absent**——
+「什麼都沒發生」正是 metrics 最不擅長回答的問題，而那正是這裡要抓的東西。
 
 ---
 
@@ -392,7 +490,7 @@ extract 把事件送上 BQ」。**反向同樣成立，而且更容易漏**：
 
 | 項目 | 為什麼不做 | 觸發點 |
 |---|---|---|
-| **OpenTelemetry** | 需要先有值得觀測的持續流量 | 藍圖 Phase 5 的獨立項 |
+| **OpenTelemetry** | ⚠️ 原本的理由是「需要先有值得觀測的持續流量」——`seed_demo_daily` 上線後**那個條件已經成立**。真正還缺的是一個**活在本機之外**的 backend：存活告警不能與被監控的系統同生共死 | 已可著手。第一條該寫的規則是 **absent**（「這個來源多久沒送資料了」），不是業務指標——那條必須寫在雲端側，因為它要偵測的正是「我這側已經沒辦法說話了」。見 §2.12 ④ |
 | **Cosmos（模型級 task）** | 13 個 model，收益與相依成本不成比例 | model 數量成長到層級 task 看不清依賴時 |
 | **triggerer / deferrable** | 目前只有 `BashOperator` | 引入 sensor 時 |
 | **小時批** | 方案 A 的 watermark 精度被 DAY 分區卡死 | 改 HOUR 分區或換方案 B 時（[CLOUD_LAYER-TW §2.2](./CLOUD_LAYER-TW.md)）|
@@ -605,12 +703,13 @@ dataset。
 
 - ✅ `orders_analytics_daily`（2 extract → 4 層 dbt build → 完整 `dbt test`；台北 22:30）
 - ✅ `dq_reevaluation`（手動觸發，預設 dry-run，commit 後自動接主 DAG）
-- ✅ `source_freshness_watch`（獨立觀測；2026-08-11 起由「預期恆紅」轉為「預期常綠」）
+- ✅ `source_freshness_watch`（extract 的 backstop；台北 08:00；2026-08-11 起由「預期恆紅」轉為「預期常綠」）
 - ✅ `seed_demo_daily`（模擬上游，台北 10/13/17/21，共 800 筆/天）
+- ✅ `raw_pending_watch`（派工存活；台北 10:30/13:30/17:30/21:30；門檻由恢復路徑的設定推導，見 §2.12）
 - ✅ `seed_demo_gate_demo`（Hard Gate 攔截劇本，手動觸發）
 - ✅ 映像（兩個隔離 venv）、compose overlay、env_var 版 `profiles.yml`
 - ✅ 全 compose 化（db/redis/api/worker/beat 與 Airflow 同一個 project、同一套資料）
-- ✅ `tests/test_dags.py`（42 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
+- ✅ `tests/test_dags.py`（47 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
 - ✅ 實機驗證（2026-08-05）：映像建成、四個服務健康、3 條 DAG 由真實 dag-processor 解析且**零 import 錯誤**、
   兩個 venv 可用（dbt 1.11.12 / bigquery 1.11.3）、env_var 版 profile 在容器內連上 BQ、
   `source_freshness_watch` 完整 run 成功、`dbt_intermediate` 於容器內 PASS=27

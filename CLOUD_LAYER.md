@@ -104,7 +104,7 @@ Its table design **does not copy orders**, because the access pattern is the opp
 
 | Decision | orders | `quality_events` | Why different |
 |---|---|---|---|
-| Partition | `received_at` (DAY) | `event_at` (DAY) | Each table uses its own ingestion time axis; `event_at` also feeds the watermark (Approach A reads the latest partition) |
+| Partition | `received_at` (DAY) | `event_at` (DAY) | Each table uses its own landing-time axis (⚠️ `received_at` is the ODS landing time, not the order-receipt time — see §1.2.2); `event_at` also feeds the watermark (Approach A reads the latest partition) |
 | Clustering | `order_id` + `has_clean_error` | `raw_id` + `to_state` | Downstream takes "the latest state per record" at **`raw_id`** grain (same key as dbt `stg_` dedup); `to_state` for state filtering |
 | Cost fuse | ✅ on | ❌ **off** | **The key difference**: orders queries always carry a `received_at` filter, but `quality_events`'s main consumer is "latest per `raw_id` across all history" — inherently a non-partition-filtered full scan, which the fuse would block |
 
@@ -204,7 +204,7 @@ Three direct corollaries:
 
 3. **`dbt source freshness` goes red before anything else does — and it does not measure what you think it measures.**
 
-   `loaded_at_field` points at `received_at`, which is **ODS ingestion time**; `ORDERS_FIELDS` contains **no extraction-time column at all** (the whole thing is a 1:1 mirror of ODS). So this check answers "how long ago did the newest order **enter ODS**", **not** "how long since the extraction job last ran."
+   `loaded_at_field` points at `received_at`, which is the **ODS landing time** (not the order-receipt time — see §1.2.2); `ORDERS_FIELDS` contains **no extraction-time column at all** (the whole thing is a 1:1 mirror of ODS). So this check answers "how long ago did the newest order **enter ODS**", **not** "how long since the extraction job last ran."
 
    The consequence is that two completely different failures look identical:
 
@@ -264,10 +264,21 @@ conclusion, different argument** — the distinction has to be written down, or 
 assume that meeting the condition means wiring it up as a gate.
 
 "Continuous ingestion" is also qualified here: **four batches a day, not round-the-clock**. The
-26h/50h thresholds have enormous slack at that cadence (worst case is a 12-hour gap): they detect
-"nothing was loaded all day" but not "the peak stopped for three hours". Genuinely continuous
-ingestion would require re-deriving them — a question that cannot even be posed at the current
-cadence.
+26h/50h thresholds have enormous slack at that cadence (worst case is a 13-hour gap, from the 21:00
+batch to 10:00 the next day): they detect "nothing reached staging all day" but not "the peak
+stopped for three hours".
+
+⚠️ **The previous version said here that "genuinely continuous ingestion would require re-deriving
+them". That sentence was wrong and has been removed.** The thresholds derive from the **loading**
+cadence, not the ingestion cadence — staging is pushed by extract once a day, so the data is up to
+24 hours old by design, hence `26 = 24 + 2` and `50 = 48 + 2`. Ingestion becoming round-the-clock
+**does not change that arithmetic** as long as the warehouse is still loaded nightly. What would
+change it is extract moving to hourly or streaming. (Full derivation in
+[ORCHESTRATION §2.7](./ORCHESTRATION.md).)
+
+And "cannot detect a three-hour stall at peak" is not a threshold problem either — it is a **scope**
+problem: freshness measures `ods.received_at` = the extract hop (see §1.2.2), and ingestion outages
+were never its job. Those are answered by `raw_pending_watch` and, later, OTel.
 
 **Implementation outcome (Phase 5): a side-channel task is not enough — it needs its own DAG** ⭐
 

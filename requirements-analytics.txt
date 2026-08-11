@@ -8,3 +8,8 @@
 # 但不該裝 pytest。過去這條線混在 dev 依賴裡，容器化時才會暴露。
 -r requirements.txt
 google-cloud-bigquery==3.41.0
+# seed_demo.py 的 HTTP client。它之所以出現在【分析】依賴而不是 dev 依賴，是因為
+# Phase 5 之後 seeding 由 Airflow 排程執行——它從「開發者手動跑的腳本」變成了
+# 管線的一部分，與 extract / reevaluate 同一個執行環境（見 orchestration/Dockerfile
+# 的 venvs/analytics）。版本與 requirements-dev.txt 對齊，兩邊不得漂移。
+httpx==0.28.1

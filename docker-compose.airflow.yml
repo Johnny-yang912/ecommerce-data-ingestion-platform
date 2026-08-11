@@ -40,6 +40,17 @@ x-airflow-common: &airflow-common
     DB_URL: ${AIRFLOW_TASK_DB_URL:-postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}}
     BQ_PROJECT: ${BQ_PROJECT}
     BQ_DBT_DATASET: ${BQ_DBT_DATASET:-dbt_dev}
+    # ── seeding（Phase 5+：持續攝入）─────────────────────────────────────────
+    # seed_demo.py 走真實的 POST /orders，所以 Airflow 需要一把 API 金鑰。
+    # 建議在 API_KEYS 另開一組 seeding 專用身分（例如 demo_seed_key:demo-seeder）：
+    # 限流是 per client_id，demo 流量才不會吃掉上游真實流量的配額；附帶讓
+    # ODS.source_client_id 能區分「demo 資料」與「真實上游」——這在 freshness
+    # 恢復為 gate 之後特別重要，否則分不出「有資料」是真有上游還是自己餵自己。
+    API_KEYS: ${API_KEYS}
+    # 預設指向同一個 compose project 裡的 api 服務。
+    # ⚠️ 這個位址與上面的 DB_URL 必須指向【同一套系統】——灌進 A 庫、抽 B 庫的話，
+    #    DAG 會全綠、ODS 零增長、freshness 照樣紅，而且沒有任何錯誤訊息。
+    SEED_API_URL: ${SEED_API_URL:-http://api:8000/orders}
     # 主機路徑掛進來後，容器內一律用這個固定路徑（bq.py 的 ADC setdefault 會讀它）。
     GOOGLE_APPLICATION_CREDENTIALS: /opt/secrets/sa-key.json
     # dbt 讀版控中的 env_var 版 profile，你本機的 ~/.dbt/profiles.yml 不受影響。

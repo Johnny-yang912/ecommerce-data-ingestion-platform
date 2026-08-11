@@ -14,6 +14,12 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: orchestration/Dockerfile
+  # ⭐ 排程器必須活得比它排的工作久——這是整個排程化的前提，不是便利設定。
+  #    主機重開之後 api/worker/beat 會自己回來（docker-compose.yml 也設了同樣的
+  #    policy），排程器若沒回來，結果是「服務都在、但什麼都不會跑」——**而且沒有
+  #    任何紅燈**，因為沒有 DAG run 被建立，也就沒有失敗可看。
+  #    ⚠️ 一次性服務（airflow-init）必須顯式覆寫回 "no"，否則它會跑完就重啟、無限循環。
+  restart: unless-stopped
   # uid 對齊主機使用者：容器要寫 bind mount 內的 dbt target/ 與 logs/。
   user: "${AIRFLOW_UID:-50000}:0"
   environment: &airflow-common-env
@@ -78,6 +84,9 @@ services:
   # 備份／還原裡。多一個容器換故障域與備份語意的清爽。
   airflow-db:
     image: postgres:16
+    # 它不套 x-airflow-common（不同映像），restart policy 因此要自己寫一次。
+    # 少了這行，重開機後三個 Airflow 服務會起來卻連不到 metadata DB。
+    restart: unless-stopped
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow

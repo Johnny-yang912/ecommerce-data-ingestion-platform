@@ -614,6 +614,98 @@ ODS 那 20 筆至今仍是 `dq_rule_version=v2, has_clean_error=TRUE`，一個�
 7.364% 讓 `error_rate_below_stg_orders_0_05` **WARN**、`_0_1` **PASS**——告警但不阻斷，
 `dbt build` 照常往下跑。這是「閾值分兩級」第一次在真實比率上被觸發。
 
+> ⚠️ **本項的測試名稱已過時。** Hard Gate 後來改成逐批口徑，現為
+> `hard_gate_latest_batch_error_rate`（最新 `received_at` 分區、0.15、**error**）
+> ＋ `monitor_dataset_error_rate`（全表、0.1、warn），見 `stg_orders.yml`。
+> 上面那組 `_0_05` / `_0_1` 已不存在。當時的觀察仍然成立，只是門檻與範圍換過了。
+
+### 5.1.1 重建 fixture 並連續走完 v2→v3→v4 的 SOP（2026-08-12）⭐
+
+遷移到原生 Docker Engine 會換掉 Docker 的 DataRoot，連帶讓業務 DB 取得全新的 volume。
+**這個代價在遷移前就評估過並接受**——fixture 是可重灌的模擬資料，為它保留備份等於為
+零價值的東西付維護成本。既然要重灌，就把它當成一次完整的 SOP 演練：用一批**刻意設計
+過形狀**的資料，把 §3.3 從 v2 一路走到 v4，補齊 §5.1 沒能涵蓋的分支。
+
+#### 一個非做不可的取捨：重演「規則狀態」，不是「commit 狀態」
+
+`git checkout dq-rules-v2` 行不通——`business_clean` 的 `(ods, as_of)` 簽章、
+`NON_REPRODUCIBLE_CODES`、`AGE_MIN/AGE_MAX` 常數**全是 v3 才加的**，真的回退會讓
+`reevaluate_quality.py` 直接 import 失敗。故改為：**HEAD 的程式碼 + 該版的閾值 + 該版的標籤**。
+
+對本次產生的兩條違規碼（`age_out_of_range`、`field_too_long`）而言，這與真實舊版
+行為一致：v2 缺的 `as_of` 在攝入路徑不傳時行為相同，`NON_REPRODUCIBLE_CODES` 只在
+重評估時起作用，而 v2 那批只被攝入、不以 v2 身分被重評估。
+**v4 那格更是完全相同**——`git diff dq-rules-v4 HEAD -- clean.py` 是空的，
+所以終點就是 `git checkout clean.py`，整趟重演在程式碼上零殘留。
+
+> 也因此**沒有動 git tag**。`dq-rules-v2/v3/v4` 指向真實的歷史 commit，
+> 為一次資料重演去新增或移動它們，等於用假的來源汙染真的紀錄。
+> §3.3 第 2 步的「打 tag」是給真的在改規則用的。
+
+#### 資料形狀
+
+| 批次 | 筆數 | 攝入版本 | 用途 |
+|---|---|---|---|
+| `SEED-*` 主語料 | 1,000（髒 57，5.7%） | v2 | 錯誤碼長尾分佈、報表底噪 |
+| `V3DEMO-*` | 20 | v2 | 15 筆 `age ∈ {121,123,125,127,130}`＋5 筆對照組 `{-3,150,999}` |
+| `V4DEMO-*` | 20 | **v3** | 15 筆 `customer_name` 長度 `{110,120,130,140,150}`＋5 筆對照組 `{160,200,240}` |
+
+**`V4DEMO` 必須在 v3 下攝入**——與 §5.1 的「刻意的順序」同一個道理：
+只有在舊規則下被判髒的資料，才有被新規則撈回的資格。
+
+#### 兩輪回流的實測
+
+| | 第一輪（v2→v3） | 第二輪（v3→v4） |
+|---|---|---|
+| candidates | 77 | **97** |
+| `would_write` / `written` | 16 | 15 |
+| `unchanged` | 61 | 82 |
+| `re_quarantined` | 0 | **0** |
+| `blocked_non_reproducible` | **4** | **4** |
+| `fct_orders` | 943 → **959** | 959 → **974** |
+| quarantine | 77 → **61** | 66 → **66**（+20 新進、−15 promote，淨 +5 對照組） |
+| 冪等複跑 | `written=0`、`unchanged=77` | — |
+
+三個值得記的觀察：
+
+**① 第二輪的 `candidates=97` 證明了 `int_orders` 那半邊的必要性。**
+97 = 61（仍隔離）+ 20（新進 V4DEMO）+ **16（第一輪已 promote 的）**。
+`candidate_sql` 把 `int_orders WHERE has_clean_error` 也 UNION 進來，正是為了讓
+`promoted → re_quarantined` 這條邊可達。這次 `re_quarantined=0`——因為 v4 是放寬——
+但那 16 筆確實每次都被重新檢查過，不是被排除在外。
+
+**② `blocked_non_reproducible=4` 補上了 §5.1 缺的那一格。**
+§5.1 那次是 0，這條分支只有單元測試。這次主語料的 `non_finite_number` 落地 4 筆，
+`NON_REPRODUCIBLE_CODES` 的擋人行為第一次在真實資料上被量到：
+**這 4 筆在兩輪重評估裡都是候選、都判「現在通過」、都沒有被 promote。**
+
+> ⚠️ 別把這條路徑與「訂單層欄位塞 inf 會 500」混為一談。`_dirty_non_finite_number`
+> **刻意只打 `items`**——items 不經 Pydantic 型別強轉（`ODSOrder.items` 是 `Any`），
+> 非有限值進得來、由 `business_clean` 攔下並正規化為 None，這條路徑是通的
+> （1,000 筆落地率 100%）。訂單層的 `tax_pct` / `customer_rating` 走 Pydantic
+> float 欄位，行為不同，那才是會炸的那條。注入器選 items 正是為了讓觸發路徑單一可預期。
+
+**③ 多出來的那 1 筆 promote 是可解釋的，不是雜訊。**
+第一輪 `written=16` 而定向批只有 15——多的是主語料裡一筆 `age=125`
+（`_dirty_age_out_of_range` 從 `[-3,125,150,999]` 抽中）。回流後的分佈是
+`age=121×3, 123×3, 125×4, 127×3, 130×3`。**append-only 的表寫入前，
+每一筆差異都要對得上帳。**
+
+#### 終態
+
+PG `ods` **1,040** ＝ BQ `stg_orders` **1,040**；PG `quality_events` **1,071**
+＝ BQ `stg_quality_events` **1,071**。事件鏈：
+
+```
+v2  initial_evaluation  943 clean / 77 quarantined
+v3  initial_evaluation   20 quarantined      +  promotion 16
+v4                                              promotion 15
+```
+
+ODS 的 `dq_rule_version` 分佈維持 v2 **1,020** / v3 **20**，一列都沒被改寫——
+**35 筆活的「永久分歧」樣本**（ODS 說髒、Gold 說乾淨），比 §5.1 那次的 15 筆更完整，
+因為現在同時有 v2→v3 與 v3→v4 兩代。
+
 ### 5.2 `--indirect-selection=buildable` 的行為驗證 ⭐
 
 §2.4 那個決策當初**只能靠推理**——三種模式的差異寫得出來，但沒有實例。這次觀察到：
@@ -765,8 +857,9 @@ dataset。
 - ✅ `extract_*` 於容器內實跑（2026-08-11 通過——全 compose 之後阻礙整類消失，見 §5.5）
 - ✅ v3 規則放寬（`age` 上限 120→130）——Proposal B 第一次有真的可 promote 的對象
 - ✅ v4 規則放寬（`customer_name` 軟性上限 100→150）
-- ✅ §3.3 SOP 實機走完兩次：v3（2026-08-05，promote 15）與 v4（2026-08-11，promote 3）；
-  兩次皆冪等、ODS 未被修改、對照組留在 quarantine。完整數據見 §5.1 與 §5.5
+- ✅ §3.3 SOP 實機走完**四次**：v3（2026-08-05，promote 15）、v4（2026-08-11，promote 3）、
+  以及 2026-08-12 fixture 重建時連續走完的 v2→v3（promote 16）與 v3→v4（promote 15）；
+  四次皆冪等、ODS 未被修改、對照組留在 quarantine。完整數據見 §5.1、**§5.1.1**、§5.5
 - ✅ Celery + Redis（已實作，與本層正交；見 [QUEUE-TW.md](./QUEUE-TW.md)）
 - ⬜ OpenTelemetry（藍圖 Phase 5 的其他項）
 - ⬜ 跨時區抽取的正式處置（§2.11 的 a/b/c 尚未選——沒有真實跨日界流量之前無法驗證）

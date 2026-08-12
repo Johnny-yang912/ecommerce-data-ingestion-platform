@@ -694,6 +694,105 @@ length is now 15 rows you can point at: **ODS says dirty (v2), Gold says clean (
 without blocking, and `dbt build` carried on downstream. This is the first time the two-tier
 threshold fired on a real ratio.
 
+> ⚠️ **The test names in this item are outdated.** The Hard Gate later moved to a per-batch
+> scope and is now `hard_gate_latest_batch_error_rate` (latest `received_at` partition, 0.15,
+> **error**) plus `monitor_dataset_error_rate` (whole table, 0.1, warn) — see `stg_orders.yml`.
+> The `_0_05` / `_0_1` pair no longer exists. The observation still holds; the thresholds and
+> scope changed underneath it.
+
+### 5.1.1 Rebuilding the fixture and walking the v2→v3→v4 SOP back to back (2026-08-12) ⭐
+
+Migrating to the native Docker Engine replaces Docker's DataRoot, which in turn gives the
+business DB a brand-new volume. **That cost was weighed and accepted before the migration** —
+the fixture is simulated data that can simply be re-seeded, and keeping backups of it would mean
+paying maintenance cost for something with no value. Since it had to be re-seeded anyway, the
+rebuild was run as a full SOP exercise: a **deliberately shaped** batch of data walked through
+§3.3 all the way from v2 to v4, filling in the branches §5.1 could not cover.
+
+#### One unavoidable trade-off: replay the *rule state*, not the *commit state*
+
+`git checkout dq-rules-v2` does not work — `business_clean`'s `(ods, as_of)` signature,
+`NON_REPRODUCIBLE_CODES`, and the `AGE_MIN`/`AGE_MAX` constants were **all introduced in v3**,
+so a genuine rollback makes `reevaluate_quality.py` fail at import. The approach instead was
+**HEAD's code + that version's thresholds + that version's label**.
+
+For the two violation codes this rebuild exercises (`age_out_of_range`, `field_too_long`) that is
+behaviourally identical to the real older versions: the `as_of` parameter v2 lacked behaves the
+same when the ingest path omits it, and `NON_REPRODUCIBLE_CODES` only matters during
+re-evaluation — while the v2 batch is only ever ingested, never re-evaluated *as* v2.
+**The v4 slot is exactly identical**: `git diff dq-rules-v4 HEAD -- clean.py` is empty, so the
+end state is simply `git checkout clean.py` and the whole replay leaves zero code residue.
+
+> For the same reason **no git tags were touched**. `dq-rules-v2/v3/v4` point at real historical
+> commits; adding or moving them for a data replay would pollute a real record with a synthetic
+> source. The "tag it" step in §3.3 is for actual rule changes.
+
+#### Data shape
+
+| Batch | Rows | Ingested under | Purpose |
+|---|---|---|---|
+| `SEED-*` main corpus | 1,000 (57 dirty, 5.7%) | v2 | Long-tail error-code distribution, report baseline |
+| `V3DEMO-*` | 20 | v2 | 15 with `age ∈ {121,123,125,127,130}` + 5 controls `{-3,150,999}` |
+| `V4DEMO-*` | 20 | **v3** | 15 with `customer_name` length `{110,120,130,140,150}` + 5 controls `{160,200,240}` |
+
+**`V4DEMO` has to be ingested under v3** — the same reasoning as §5.1's "deliberate order": only
+data judged dirty under the old rules is eligible to be rescued by the new ones.
+
+#### Both flow-back rounds, measured
+
+| | Round 1 (v2→v3) | Round 2 (v3→v4) |
+|---|---|---|
+| candidates | 77 | **97** |
+| `would_write` / `written` | 16 | 15 |
+| `unchanged` | 61 | 82 |
+| `re_quarantined` | 0 | **0** |
+| `blocked_non_reproducible` | **4** | **4** |
+| `fct_orders` | 943 → **959** | 959 → **974** |
+| quarantine | 77 → **61** | 66 → **66** (+20 new, −15 promoted, net +5 controls) |
+| Idempotency re-run | `written=0`, `unchanged=77` | — |
+
+Three observations worth recording:
+
+**① Round 2's `candidates=97` proves why the `int_orders` half of the union is needed.**
+97 = 61 (still quarantined) + 20 (newly arrived `V4DEMO`) + **16 (promoted in round 1)**.
+`candidate_sql` unions in `int_orders WHERE has_clean_error` precisely so the
+`promoted → re_quarantined` edge stays reachable. Here `re_quarantined=0` — v4 loosens rather
+than tightens — but those 16 rows were genuinely re-checked, not excluded.
+
+**② `blocked_non_reproducible=4` fills the gap §5.1 left.**
+That run recorded 0, so the branch had only unit-test coverage. This time the main corpus landed
+4 rows carrying `non_finite_number`, and `NON_REPRODUCIBLE_CODES` refusing to promote them was
+measured on real data for the first time: **all 4 were candidates in both rounds, both rounds
+judged them "clean now", and neither round promoted them.**
+
+> ⚠️ Don't conflate this path with "an order-level field set to inf returns 500".
+> `_dirty_non_finite_number` **deliberately targets `items` only** — items skip Pydantic
+> coercion (`ODSOrder.items` is `Any`), so non-finite values get in, `business_clean` flags them
+> and normalises them to None, and the path works (1,000 rows, 100% landed). The order-level
+> `tax_pct` / `customer_rating` are Pydantic float fields and behave differently — that is the
+> one that breaks. The injector picks items to keep the trigger path single and predictable.
+
+**③ The one extra promotion is explainable, not noise.**
+Round 1 wrote 16 while the targeted batch held only 15; the extra one is a main-corpus row with
+`age=125` (drawn by `_dirty_age_out_of_range` from `[-3,125,150,999]`). The post-flow-back
+distribution is `age=121×3, 123×3, 125×4, 127×3, 130×3`. **Before writing to an append-only
+table, every discrepancy has to reconcile.**
+
+#### End state
+
+PG `ods` **1,040** = BQ `stg_orders` **1,040**; PG `quality_events` **1,071** =
+BQ `stg_quality_events` **1,071**. The event chain:
+
+```
+v2  initial_evaluation  943 clean / 77 quarantined
+v3  initial_evaluation   20 quarantined      +  promotion 16
+v4                                              promotion 15
+```
+
+ODS's `dq_rule_version` distribution stays at v2 **1,020** / v3 **20** with not one row
+rewritten — **35 live "permanent divergence" samples** (ODS says dirty, Gold says clean), a
+fuller set than §5.1's 15 because it now spans two generations, v2→v3 and v3→v4.
+
 ### 5.2 Verifying `--indirect-selection=buildable` ⭐
 
 The §2.4 decision could originally **only be reasoned about** — the difference between the three
@@ -866,9 +965,10 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
   removed the whole class of obstacle; see §5.5)
 - ✅ The v3 rule loosening (`age` cap 120→130) — Proposal B's first genuine promote candidates
 - ✅ The v4 rule loosening (`customer_name` soft cap 100→150)
-- ✅ The §3.3 SOP walked end to end twice: v3 (2026-08-05, 15 promoted) and v4 (2026-08-11,
-  3 promoted); both idempotent, ODS never modified, control group left quarantined. Full figures
-  in §5.1 and §5.5
+- ✅ The §3.3 SOP walked end to end **four times**: v3 (2026-08-05, 15 promoted), v4 (2026-08-11,
+  3 promoted), and the back-to-back v2→v3 (16 promoted) and v3→v4 (15 promoted) during the
+  2026-08-12 fixture rebuild; all four idempotent, ODS never modified, control group left
+  quarantined. Full figures in §5.1, **§5.1.1**, and §5.5
 - ✅ Celery + Redis (implemented, orthogonal to this layer; see [QUEUE.md](./QUEUE.md))
 - ⬜ OpenTelemetry (other roadmap Phase 5 items)
 - ⬜ A formal resolution for cross-timezone extraction (§2.11's a/b/c remain unchosen — none can be

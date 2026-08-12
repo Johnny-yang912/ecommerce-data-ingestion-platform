@@ -6,9 +6,10 @@
 # 容器。疊加成同一個 compose project 讓兩邊共用預設網路，DAG 才能以 `db` 這個
 # hostname 連到業務資料庫。
 #
-# 【必要前置】.env 需有 BQ_PROJECT 與 GOOGLE_APPLICATION_CREDENTIALS（主機上的金鑰路徑，
-# 會被唯讀掛進容器）；建議一併設 AIRFLOW_UID=$(id -u)，否則容器以 uid 50000 寫入
-# bind mount，主機端會清不掉 dbt 產生的 target/ 與 logs/。
+# 【必要前置】.env 需有 BQ_PROJECT、GCP_KEY_DIR、GCP_KEY_FILENAME——金鑰所在的主機
+# 【目錄】與檔名，該目錄會被唯讀掛進容器（為何拆成兩個變數，見下方 volumes）。
+# 建議一併設 AIRFLOW_UID=$(id -u)，否則容器以 uid 50000 寫入 bind mount，
+# 主機端會清不掉 dbt 產生的 target/ 與 logs/。
 
 x-airflow-common: &airflow-common
   build:
@@ -64,8 +65,9 @@ x-airflow-common: &airflow-common
     # ⚠️ 這個位址與上面的 DB_URL 必須指向【同一套系統】——灌進 A 庫、抽 B 庫的話，
     #    DAG 會全綠、ODS 零增長、freshness 照樣紅，而且沒有任何錯誤訊息。
     SEED_API_URL: ${SEED_API_URL:-http://api:8000/orders}
-    # 主機路徑掛進來後，容器內一律用這個固定路徑（bq.py 的 ADC setdefault 會讀它）。
-    GOOGLE_APPLICATION_CREDENTIALS: /opt/secrets/sa-key.json
+    # 容器內的金鑰路徑（bq.py 的 ADC setdefault 與 dbt profile 的 keyfile 都讀它）。
+    # 帶主機檔名是因為下方改掛目錄——bind 目錄無法改名，改回單檔 bind 就能寫死。
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/secrets/${GCP_KEY_FILENAME}
     # dbt 讀版控中的 env_var 版 profile，你本機的 ~/.dbt/profiles.yml 不受影響。
     DBT_PROFILES_DIR: /opt/project/orchestration/dbt_profiles
     LOG_FORMAT: json
@@ -75,7 +77,12 @@ x-airflow-common: &airflow-common
     #    改 clean.py 之類的共用模組時，這一邊立刻生效、那一邊要 build——
     #    規則版本會因此無聲分歧，見 ORCHESTRATION-TW §3.3 第 3 步。
     - ./:/opt/project:rw
-    - ${GOOGLE_APPLICATION_CREDENTIALS}:/opt/secrets/sa-key.json:ro
+    # 掛金鑰所在【目錄】而非單一檔案，規避 Docker Desktop/WSL2 開機還原容器時的
+    # 掛載競態（屬開發者個人環境；一般部署不會遇到，可改回單檔 bind：
+    # `- ${GOOGLE_APPLICATION_CREDENTIALS}:/opt/secrets/sa-key.json:ro`，
+    # 那樣容器內路徑固定、也不需要 GCP_KEY_DIR/GCP_KEY_FILENAME 兩個變數）。
+    # 代價：目錄內的檔案會全部進容器，故 GCP_KEY_DIR 應指向單一用途的目錄。
+    - ${GCP_KEY_DIR}:/opt/secrets:ro
     - airflow-logs:/opt/airflow/logs
   # 目前沒有任何設定指向主機（DB 與 API 都在 compose 網路內）。保留這條是為了讓
   # 「臨時要連主機上的某個服務」不必改 compose 檔；Linux 上沒有這個名字，需要

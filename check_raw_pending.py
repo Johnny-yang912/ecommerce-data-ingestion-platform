@@ -45,6 +45,9 @@
    數字。寫死等於把一個推導結果凍結成魔術數字，而下一個調 SCAN_INTERVAL_SECONDS
    的人不會知道要回來改這裡。
 
+   兩個門檻常數讀自 `recovery_policy`（純常數模組），掃描間隔讀自 `config.settings`
+   ——前者是演算法常數、後者是環境設定，分屬兩處是刻意的（見 recovery_policy 檔頭）。
+
 ⑤ 為什麼不把 status='processing' 也算進來
    processing 是有自己逾時機制的暫態（STALE_PROCESSING_MINUTES → 重設回 pending）。
    算進來會讓同一筆列在兩個狀態下被報兩次，而它最終仍會以 pending 的身分被本檢查
@@ -72,7 +75,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import settings
 from database import SessionLocal
 from models import Raw
-from process import PENDING_GRACE_SECONDS, STALE_PROCESSING_MINUTES
+# ⚠️ 刻意【不】從 process import 這兩個門檻，儘管它們是它在用的：那會讓這支唯讀探針
+#    連坐整條寫入路徑的依賴樹（telemetry / celery / clean），而探針的價值正在於
+#    它的故障域要比被監控對象小。理由與 2026-08-17 的事故見 recovery_policy 檔頭；
+#    由 tests/test_script_deps.py 釘住，不靠人記得。
+from recovery_policy import PENDING_GRACE_SECONDS, STALE_PROCESSING_MINUTES
 
 # 安全邊際：推導出來的是【最壞的合法自癒時間】，門檻壓在它身上會在恢復路徑
 # 正常運作、只是剛好跑到最壞情況時誤報。多給 4 分鐘讓「正常但慢」不會變成紅燈。

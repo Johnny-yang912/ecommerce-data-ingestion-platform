@@ -10,6 +10,10 @@ from datetime import datetime, timedelta
 from pytz import UTC
 from clean import clean_order, detect_schema_drift, DQ_RULE_VERSION
 from sqlalchemy.exc import OperationalError, IntegrityError, DataError
+# 這兩個門檻的定義住在 recovery_policy——`check_raw_pending.py` 也要用它們推導
+# 告警線，而讓一支唯讀探針 import 本模組會把整條寫入路徑的依賴樹拖給它
+# （2026-08-17 的 OTel 事故就是這樣，見 recovery_policy 檔頭）。
+from recovery_policy import PENDING_GRACE_SECONDS, STALE_PROCESSING_MINUTES
 # 指標是 no-op-safe 的：OTel 關閉時這些是 proxy instrument，呼叫不做事也不拋錯，
 # 所以下面的埋點一律不加 `if otel_enabled` 判斷（見 telemetry.py 模組註解）。
 from telemetry import ORDERS_RESULT, PROCESSING_DURATION, RETRIES
@@ -19,20 +23,11 @@ logger = structlog.get_logger()
 MAX_CLAIM_RETRIES = 3
 MAX_PROCESS_RETRIES = 3
 MAX_STATUS_RETRIES = 3
-STALE_PROCESSING_MINUTES = 10
 
 # 單輪掃描取回的上限。原本是「一次撈完所有 pending」——在攝入量大的情境下，
 # 一次 broker 事故就會累積出數十萬筆，全部載進一個 Python list 再逐一派工，
 # 等於把攝入層的崩潰原封不動搬到恢復路徑上。
 SCAN_BATCH_SIZE = 5000
-
-# 剛攝入的 pending 不由掃描接手：正常情況下攝入路徑會在毫秒內把它派出去，
-# 掃描此時介入只會為同一筆多送一則訊息（CAS 擋得住，但純屬浪費）。
-# 只有「躺了超過寬限期還是 pending」才代表快路徑真的失手了。
-# ⚠️ 這裡用 received_at 是對的——問的正是「這筆資料躺了多久」；
-#    而 stale 判定問的是「這次處理跑了多久」，故用 processing_started_at。
-#    兩個問題不同，基準不同，別把它們混在一起（見 scan_and_recover 的說明）。
-PENDING_GRACE_SECONDS = 60
 
 
 def try_claim_raw(db, raw_id: int) -> bool:

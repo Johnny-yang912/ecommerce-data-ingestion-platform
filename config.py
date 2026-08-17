@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     # --- 日誌輸出格式：console（dev）| json（prod）---
     log_format: str = "console"
 
+    # --- Phase 5：OpenTelemetry ---
+    # 只管「開不開」，**不管「往哪送、怎麼取樣」**。後者走 OTel 規格的標準
+    # `OTEL_*` 環境變數，由 SDK 自己讀——在這裡再宣告一份 endpoint / sampler
+    # 等於把別人領域的設定表面複製過來，變成第二份會漂移的真相（同 api_keys
+    # 維持原始字串、不在此解析的理由）。
+    # 預設 False：pytest 與本機 `uvicorn --reload` 因此完全不受影響，不需要
+    # 有 Collector 在跑、也不會因為連不上而刷錯誤日誌。compose 才開啟。
+    otel_enabled: bool = False
+
     # --- Phase 4 分析管線（ODS → BigQuery）---
     # service-account 金鑰路徑（選填）：只有抽取腳本用得到，API server 不碰 BQ，
     # 故給空字串預設，避免每次 API 啟動就因缺值 fail。實際使用見 bq.get_bq_client()。

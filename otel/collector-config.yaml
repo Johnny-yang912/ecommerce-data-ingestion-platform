@@ -1,0 +1,91 @@
+# OpenTelemetry Collector — 遙測資料的唯一出口
+#
+# 為什麼要有這一層，而不是讓 app 直送 Grafana Cloud：
+#   1. 憑證只存在一處。直送的話 api / worker / beat / airflow 四個服務都要帶
+#      write token，而 Airflow 的內建 OTel 輸出還不見得帶得了認證 header。
+#   2. 換後端變成改這個檔案，而不是改四個服務並重啟。過渡期還能同時送兩個後端比對。
+#   3. 應用程式不需要知道後端是誰——它只認得 otel-collector:4318。
+#
+# 故障域：這個 Collector 與被監控的系統住在同一組 compose，主機睡著時一起死。
+# 這【不是缺陷】——那正是雲端側 absent 告警要偵測的東西。存活告警不能與被監控的
+# 系統同生共死（見 ORCHESTRATION-TW.md §4）。
+
+receivers:
+  otlp:
+    protocols:
+      # 兩種都開：app 端走 http（4318），telemetrygen 之類的工具預設走 grpc（4317）。
+      # 監聽 0.0.0.0 而非 localhost——容器內只綁 loopback 的話，同網路的其他容器連不進來。
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # ⚠️ memory_limiter 必須是 pipeline 的第一個 processor。它的作用是在記憶體壓力下
+  #    主動拒收，讓上游（app 的 SDK）自己丟棄——否則 Collector 會 OOM 被 Docker 重啟，
+  #    連帶把佇列裡還沒送出的資料一起帶走。限額刻意設小：這台機器上還有 Postgres ×2、
+  #    Redis、Airflow 三件套與 4 個 uvicorn worker 在搶記憶體。
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+  # 批次送出，減少對雲端的請求數。timeout 5s = 最壞情況下 trace 延遲 5 秒才出現在
+  # Grafana——對「事後查一條 trace」完全無感，卻能把請求數降一個量級。
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Grafana Cloud 的 OTLP gateway 走 HTTP/protobuf，不是 gRPC → 用 otlp_http 而非 otlp。
+  # endpoint 只給到 /otlp，signal 路徑（/v1/traces 等）由 exporter 自己接上。
+  # 型別名是 `otlp_http`：舊別名 `otlphttp` 在 0.158 仍可用但會發 deprecation warning，
+  # 而網路上多數範例還停在舊名——照抄會在日誌裡留一條假警訊。
+  otlp_http/grafana:
+    endpoint: ${env:GRAFANA_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:GRAFANA_OTLP_AUTH}
+    # 網路抖動時先進佇列而不是直接丟。這正是 Collector 相對於「每個 app 行程各自
+    # 重試」的價值：緩衝集中在一處，而且不佔用應用程式的記憶體。
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      # 上限刻意短：遙測是可丟的。重試太久只會讓佇列積滿、擠掉更新的資料，
+      # 而舊 trace 的價值本來就隨時間快速衰減。
+      max_elapsed_time: 300s
+
+extensions:
+  # ⚠️ 這個端點**不能**拿來做 compose 的 healthcheck：collector 映像裡沒有 shell、
+  #    也沒有 curl/wget，容器內跑不了任何探測指令（`docker run --entrypoint sh` 直接
+  #    報 executable file not found）。它的用途是**主機端**除錯：
+  #        curl -s http://localhost:13133/
+  #    → {"status":"Server available","uptime":...}
+  #    所以 compose 那邊 api/worker 對它只用 depends_on: service_started。
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/grafana]
+
+    # Metrics（B1：營運指標）。序列數的控制**在 SDK 端用 View 做**，不在這裡——
+    # View 能在來源就不計算，還能改 histogram 的 bucket，而 filter processor
+    # 兩者都做不到（它只能整條丟，且資料已經算完並送過來了）。
+    # 這裡刻意不放 filter：留給額度告急時當緊急拉桿——那條路不需要重建映像。
+    #
+    # logs 仍不走 OTLP：structlog 維持輸出 stdout，只在 log 裡注入 trace_id 做關聯。
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/grafana]
+  telemetry:
+    logs:
+      level: info

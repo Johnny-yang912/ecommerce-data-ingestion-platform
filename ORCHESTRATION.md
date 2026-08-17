@@ -268,7 +268,7 @@ timelines, one hop each; merged, a single red would stand for two pipeline segme
 
 | Timeline | Which hop it answers | Who watches it |
 |---|---|---|
-| `raw.received_at` | Upstream + API: can orders get in? | (after OTel) |
+| `raw.received_at` | Upstream + API: can orders get in? | OTel: the count of `http.server.duration{http_route="/orders"}` (live); **absent alerting not yet written**, see §4 |
 | `raw.received_at` → `ods.received_at` | Dispatch: can workers claim them? | `raw_pending_watch` (§2.12) |
 | `ods.received_at` in BQ staging | extract: did it reach the warehouse? | `source_freshness_watch` |
 
@@ -611,7 +611,7 @@ that a retry would clear.
 
 | Item | Why not | Trigger |
 |---|---|---|
-| **OpenTelemetry** | ⚠️ The original reason was "needs continuous traffic worth observing first" — **that condition has been met** since `seed_demo_daily` went live. What is still missing is a backend that lives **outside this machine**: a liveness alarm must not share a failure domain with the system it watches | Ready to start. The first rule to write is **absent** ("how long since this source sent anything"), not a business metric — and it must live on the cloud side, because what it detects is precisely "my side can no longer speak". See §2.12 ④ |
+| **OTel absent alerting** | Traces and operational metrics went live on 2026-08-17 (see the README roadmap), **but the alert itself is still unwritten** — and what blocks it is no longer technical. The threshold must be derived from observation (same discipline as §2.12 ③), yet this machine is **powered off overnight** and seeding only runs at 10/13/17/21 Taipei; a rule written today would catch "the laptop is off" rather than a pipeline fault, firing every night until you learn to ignore it | After 2–3 days of real power-cycle and seeding cadence. The first rule is still **absent** ("how long since this source sent anything") rather than a business metric, and it must live on the cloud side — what it detects is precisely "my side can no longer speak". See §2.12 ④ |
 | **Cosmos (model-level tasks)** | 13 models; benefit is out of proportion to the dependency cost | When model count makes layer-level tasks too coarse to read |
 | **triggerer / deferrable** | Only `BashOperator` today | When sensors are introduced |
 | **Hourly batches** | Plan A's watermark precision is capped by DAY partitioning | When switching to HOUR partitioning or Plan B ([CLOUD_LAYER §2.2](./CLOUD_LAYER.md)) |
@@ -970,7 +970,7 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
   2026-08-12 fixture rebuild; all four idempotent, ODS never modified, control group left
   quarantined. Full figures in §5.1, **§5.1.1**, and §5.5
 - ✅ Celery + Redis (implemented, orthogonal to this layer; see [QUEUE.md](./QUEUE.md))
-- ⬜ OpenTelemetry (other roadmap Phase 5 items)
+- 🟡 OpenTelemetry — traces + operational metrics are live (2026-08-17); Airflow integration and absent alerting are not (see §4)
 - ⬜ A formal resolution for cross-timezone extraction (§2.11's a/b/c remain unchosen — none can be
   validated without real traffic crossing the day boundary)
 

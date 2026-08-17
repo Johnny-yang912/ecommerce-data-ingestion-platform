@@ -90,7 +90,7 @@ ODS 攝入邊界產生兩個**互不混用、權限不同**的品質訊號。核
 | 改日期格式 / 時區 | 格式錯→422；時區→契約約定 | 格式錯 422+log；時區屬明文契約（見設計邊界） |
 | 沒見過的 enum | 落地；長度由超長處理；偵測留 dbt | 新值落地；超長不卡死；Phase 4 `accepted_values`（warn） |
 | 語意漂移 | — | 留 Phase 4–5 分佈監控（規則抓不到） |
-| 沒有資料 | — | 留 Phase 5 OTel volume/freshness 告警 |
+| 沒有資料 | — | OTel 管線已上線（2026-08-17），但 **absent 告警仍未寫**——門檻要從觀測推導，見 [ORCHESTRATION-TW.md](./ORCHESTRATION-TW.md) §4 |
 | 同 order_id 重送 | 既有 idempotency | first-write-wins，重複標 `duplicate` |
 | 巢狀結構非物件 | `has_schema_drift`（`NON_OBJECT_GROUP`）+ 防禦守衛 | 不崩潰；標記，該群組落地為 NULL |
 | sentinel / 假空值 | `format_clean` 正規化（字串）；range check（數值） | 字串 sentinel→NULL；數值 sentinel 標 `has_clean_error` |
@@ -649,8 +649,10 @@ logger.info("quality_metric",
 )
 ```
 
-接 Grafana（Phase 4 OTel/Loki）→ 即時 error rate、Hard Gate 觸發告警。  
-不需要新元件，structlog 基礎已在。
+接 Grafana（OTel，2026-08-17 上線）→ 即時 error rate、Hard Gate 觸發告警。  
+⚠️ **現況**：管線已通、每條 log 都帶 `trace_id`，但**這裡講的 error rate 指標尚未建立**。
+它屬於業務／DQ 指標，刻意緩做：`seed_demo_daily` 的髒率是每日決定性五選一、日內恆定，
+分鐘級的即時 error rate 答不出本層日級報表沒說過的事。有真實上游、髒率會自己變動後再啟用。
 
 ### 層次二：批次分析指標（日/週）
 
@@ -679,7 +681,7 @@ rpt_quality_backlog              快照（讀 int_orders_quarantine 當下內容
 
 接 Looker Studio，供長期趨勢分析。
 
-**定位邊界（接 OTel 之後仍成立）**：本層是【資料可信度與規則效果的**分析**】，**不是管線健康監控**。分鐘級 error rate、Hard Gate 即時告警、批次 SLA 屬層次一（OTel/Grafana）。兩層刻意重疊一部分信號（error rate 兩邊都有），差別在消費形態——層次一是「現在、單一數字、為了告警」，層次二是「歷史、可切片、為了歸因」。三件事讓品質分析**不能只放 OTel**：① TSDB 撐不住 `error_code × field × client × version` 的高基數切片；② metric 會被降採樣，跨季度的規則效果比較做不了；③ 只有在倉裡才能 join `dim_`/`fct_`，把品質從工程指標翻譯成**業務曝險**。
+**定位邊界（接 OTel 之後仍成立）**：本層是【資料可信度與規則效果的**分析**】，**不是管線健康監控**。分鐘級 error rate、Hard Gate 即時告警、批次 SLA 屬層次一（OTel/Grafana）。兩層刻意重疊一部分信號（error rate 兩邊都有），差別在消費形態——層次一是「現在、單一數字、為了告警」，層次二是「歷史、可切片、為了歸因」。三件事讓品質分析**不能只放 OTel**：① TSDB 撐不住 `error_code × field × client × version` 的高基數切片；② metric 會被降採樣，跨季度的規則效果比較做不了；③ 只有在倉裡才能 join `dim_`/`fct_`，把品質從工程指標翻譯成**業務曝險**。（2026-08-17 更新：層次一的**管線**已建起，但目前只放營運指標；品質指標仍只在層次二。）
 
 ### 歷史指標為何不會被追溯性改寫
 

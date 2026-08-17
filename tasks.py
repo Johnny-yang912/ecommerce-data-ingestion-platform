@@ -21,6 +21,7 @@ import structlog
 from celery_app import celery_app
 from config import settings
 from process import SCAN_BATCH_SIZE, process_raw_event, scan_and_recover
+from telemetry import RECOVERY_DISPATCHED
 
 logger = structlog.get_logger()
 
@@ -143,5 +144,8 @@ def scan_and_dispatch_task() -> int:
                     max_rounds=SCAN_MAX_ROUNDS,
                 )
 
+        # 補派筆數。持續 > 0 是「即時派工正在漏」的直接訊號——而那在 raw.status
+        # 上完全看不出來：被補派成功的記錄，終態一樣是 processed。
+        RECOVERY_DISPATCHED.add(total)
         logger.info("recovery scan 完成", count=total)
         return total

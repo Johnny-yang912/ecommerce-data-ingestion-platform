@@ -117,6 +117,125 @@ class TestClaimRetry:
         assert mock_db.add.call_count == 0  # ODS 不應被寫入
 
 
+# ─── B1 營運指標 ──────────────────────────────────────────────────────────────
+
+class TestOperationalMetrics:
+    """
+    指標的埋點位置與 label。
+
+    這裡驗的是「數字對不對」而不是「有沒有送出去」——後者是 SDK 的事。
+    指標一旦上了 dashboard 與告警，錯誤的計數比沒有計數更危險：它看起來是健康的。
+    """
+
+    def test_duration_not_recorded_when_claim_lost(self):
+        """
+        claim 落空不計入耗時分佈。
+
+        那是毫秒級的 no-op；把它混進來，愈多 worker 競爭、P95 看起來愈漂亮，
+        而真實情況正好相反——這種指標會在事故當下給出反向訊號。
+        """
+        mock_db = make_mock_db(exec_results=[claim_result(0)], commit_effects=[None])
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch("process.PROCESSING_DURATION") as duration:
+            process_raw_event(1)
+
+        duration.record.assert_not_called()
+
+    def test_duration_recorded_once_when_claimed(self):
+        """claim 成功就記一次，且是秒為單位的正數。"""
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),
+            ],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch("process.PROCESSING_DURATION") as duration:
+            process_raw_event(1)
+
+        duration.record.assert_called_once()
+        assert duration.record.call_args.args[0] >= 0
+
+    def test_processed_counted_with_result_label(self):
+        """成功終態 → result=processed。processed 是唯一不走 _commit_raw_status 的。"""
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1),
+                select_result(mock_raw),
+                no_ods_result(),
+                MagicMock(),
+            ],
+            commit_effects=[None, None],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch("process.ORDERS_RESULT") as counter:
+            process_raw_event(1)
+
+        counter.add.assert_called_once_with(1, {"result": "processed"})
+
+    @pytest.mark.parametrize("status", ["error", "duplicate"])
+    def test_failure_terminals_counted_at_single_choke_point(self, status):
+        """
+        error / duplicate 的七個呼叫點全部匯流到 _commit_raw_status，
+        所以那一行的計數就涵蓋全部失敗終態——這是埋點只有兩處的原因。
+        """
+        mock_db = make_mock_db(exec_results=[MagicMock()], commit_effects=[None])
+
+        with patch("process.ORDERS_RESULT") as counter:
+            _commit_raw_status(mock_db, 1, status, "boom")
+
+        counter.add.assert_called_once_with(1, {"result": status})
+
+    def test_no_result_counted_when_status_commit_never_succeeds(self):
+        """
+        status 更新用盡重試仍失敗 → **不能**計數。
+
+        這筆記錄其實卡在 processing、沒有進入任何終態；計了就會讓
+        「終態總數」與 raw.status 的真相對不起來，而對帳正是這個指標的驗收條件。
+        """
+        mock_db = make_mock_db(
+            exec_results=[MagicMock()] * MAX_STATUS_RETRIES,
+            commit_effects=[Exception("boom")] * MAX_STATUS_RETRIES,
+        )
+
+        with patch("process.time.sleep"), \
+             patch("process.ORDERS_RESULT") as counter:
+            _commit_raw_status(mock_db, 1, "error", "boom")
+
+        counter.add.assert_not_called()
+
+    def test_claim_retry_counted_with_stage_label(self):
+        """retry 的 stage label 要能區分四層，否則分佈混在一起等於沒有資訊。"""
+        mock_raw = make_mock_raw()
+        mock_db = make_mock_db(
+            exec_results=[
+                claim_result(1), claim_result(1), select_result(mock_raw),
+                no_ods_result(), MagicMock(),
+            ],
+            commit_effects=[
+                OperationalError("connection lost", None, None), None, None,
+            ],
+        )
+
+        with patch("process.SessionLocal", return_value=mock_db), \
+             patch("process.time.sleep"), \
+             patch("process.RETRIES") as retries:
+            process_raw_event(1)
+
+        retries.add.assert_called_once_with(1, {"stage": "claim"})
+
+
 # ─── Point 2: Processing retry ───────────────────────────────────────────────
 
 class TestProcessingRetry:

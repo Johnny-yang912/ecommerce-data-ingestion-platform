@@ -13,3 +13,17 @@ celery[redis]==5.6.3
 # redis 明確鎖版：celery[redis] 的 extra 只給範圍（kombu 目前上界 <7），
 # 不鎖的話 build 時間不同會裝到不同版本，違反本檔「一律鎖版」的前提。
 redis==6.4.0
+
+# --- Phase 5：OpenTelemetry（traces）---
+# 兩組版號刻意不同步，這不是筆誤：core（api/sdk/exporter）走 1.x 穩定線，
+# instrumentation 走 0.xxbN 的 beta 線，對應關係是 1.44.0 ↔ 0.65b0。
+# 升級時兩組必須【一起】換，混搭會在 import 期就炸（instrumentation 依賴 core 的
+# 內部介面，而那些介面在 beta 線之間會變）。
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+# 只裝 http exporter 不裝 grpc：Grafana Cloud 的 gateway 走 HTTP/protobuf，
+# 而 grpc 版會多拉進 grpcio（含 C 擴充，映像大且與 gevent/prefork 容易起衝突）。
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-celery==0.65b0
+opentelemetry-instrumentation-sqlalchemy==0.65b0
+opentelemetry-instrumentation-redis==0.65b0

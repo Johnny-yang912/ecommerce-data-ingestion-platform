@@ -39,7 +39,7 @@ staging 由抽取腳本以 batch load job 灌入。BQ 的 streaming insert 按�
 
 **但它有一個必須知道的範圍邊界**：積壓被恢復掃描沖出去時，那批列的 `ods.received_at` 是**回補當下**的寫入時刻，於是攝入中斷的斷層在 ODS 的時間軸上**不存在**。因此任何建立在 `ods.received_at` 上的觀測（分區、freshness、`rpt_quality_events_daily` 的日界）都只看得見「取樣當下仍在進行中」的中斷，看不見已經恢復的。
 
-派工那一段的健康由別的東西回答：`raw.status='pending'` 的最舊年齡（由後續新增的 `raw_pending_watch` DAG 負責），以及未來 OTel 的 `raw.received_at` 連續性。**三個時間軸各管一段，不要讓其中一個兼差。**
+派工那一段的健康由別的東西回答：`raw.status='pending'` 的最舊年齡（由後續新增的 `raw_pending_watch` DAG 負責），以及 `raw.received_at` 的連續性（OTel 管線已於 2026-08-17 上線，但 **absent 告警尚未寫**，見 ORCHESTRATION-TW §4）。**三個時間軸各管一段，不要讓其中一個兼差。**
 
 ⚠️ 順帶釐清一個容易寫錯的判準：**不能用「Raw 有列但沒有對應的 ODS 列」當故障定義**。Raw 的終態是 `processed` / `duplicate` / `error`，後兩者不產生 ODS 列而且那是正確行為，照那個定義做檢查會讓每筆重複訂單都變成告警。`pending` 才是乾淨的訊號——它表示還沒有任何 worker 取走這一筆。
 
@@ -270,7 +270,7 @@ freshness 因此從「一個因為前提不成立而不該有權限的訊號」�
 
 而「偵測不到峰期停三小時」也不是閾值的問題，是**範圍**的問題：freshness 量的是
 `ods.received_at`＝extract 那一跳（見 §1.2.2），攝入中斷本來就不歸它管——那由
-`raw_pending_watch` 與日後的 OTel 回答。
+`raw_pending_watch` 與 OTel 的 absent 告警回答（後者尚未寫，見 ORCHESTRATION-TW §4）。
 
 **實作結果（Phase 5）：旁路 task 不夠，必須獨立成一條 DAG** ⭐
 

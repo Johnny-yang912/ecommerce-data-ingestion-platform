@@ -19,8 +19,17 @@ from logging_config import configure_logging
 from auth import verify_api_key
 from circuit_breaker import CircuitBreaker, CircuitOpen
 from config import settings
+from telemetry import (
+    RETRIES,
+    configure_telemetry,
+    instrument_fastapi,
+    observe_circuit_breaker,
+)
 
 configure_logging()
+# API 行程：uvicorn 的每個 worker 各自 import 本模組，因此這裡就是「fork 之後」，
+# 可以直接在模組層初始化（worker 端的情況不同，見 telemetry.py 模組註解）。
+configure_telemetry("order-api")
 logger = structlog.get_logger()
 
 def _client_id_key(request: Request) -> str:
@@ -77,6 +86,10 @@ _enqueue_breaker = CircuitBreaker(
     name="celery_enqueue",
 )
 
+# 把熔斷器狀態暴露成 gauge。由這裡傳入 breaker 物件而非讓 telemetry 去 import
+# main（會成環），也讓 circuit_breaker.py 維持零專案外依賴——見 telemetry.py。
+observe_circuit_breaker(_enqueue_breaker)
+
 # Schema 由 Alembic 管理（alembic upgrade head），啟動時不再 create_all。
 
 
@@ -130,6 +143,11 @@ def _enqueue(raw_id: int) -> bool:
 # 移走之後 API 行程不再持有任何背景狀態，啟動時也不做任何恢復工作。
 app = FastAPI()
 app.add_middleware(RequestContextMiddleware)
+# ⚠️ 必須在 RequestContextMiddleware 之後才掛：Starlette 的 add_middleware 是往外
+# 疊的（後加的在外層），所以這個順序才能讓 OTel 的 span 涵蓋整個請求，
+# 進而讓 RequestContextMiddleware 內與其後的每一行 log 都帶得到 trace_id。
+# 反過來的話 span 會晚一步開始，最外層那段 log 就關聯不上。
+instrument_fastapi(app)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -188,6 +206,7 @@ async def create_order(request: Request, order: OrderIN,
                 db.rollback()
                 if attempt < MAX_RAW_WRITE_RETRIES - 1:
                     logger.warning("raw 寫入失敗", attempt=attempt + 1, order_id=order.order_id, error=str(e))
+                    RETRIES.add(1, {"stage": "raw_write"})
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     db.add(raw)
                 else:

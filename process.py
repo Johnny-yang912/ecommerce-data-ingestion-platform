@@ -10,6 +10,9 @@ from datetime import datetime, timedelta
 from pytz import UTC
 from clean import clean_order, detect_schema_drift, DQ_RULE_VERSION
 from sqlalchemy.exc import OperationalError, IntegrityError, DataError
+# 指標是 no-op-safe 的：OTel 關閉時這些是 proxy instrument，呼叫不做事也不拋錯，
+# 所以下面的埋點一律不加 `if otel_enabled` 判斷（見 telemetry.py 模組註解）。
+from telemetry import ORDERS_RESULT, PROCESSING_DURATION, RETRIES
 
 logger = structlog.get_logger()
 
@@ -56,11 +59,15 @@ def _commit_raw_status(db, raw_id: int, status: str, error_message=None) -> None
                 )
             )
             db.commit()
+            # 這裡是 error / duplicate 七個終態的唯一匯流點（只有 processed 走
+            # 成功分支自己更新），所以結果計數埋在這一行就涵蓋全部失敗終態。
+            ORDERS_RESULT.add(1, {"result": status})
             return
         except Exception as e:
             db.rollback()
             if attempt < MAX_STATUS_RETRIES - 1:
                 logger.warning("status 更新失敗", attempt=attempt + 1)
+                RETRIES.add(1, {"stage": "status_update"})
                 time.sleep(0.5 * (2 ** attempt))
             else:
                 logger.critical("status 更新失敗，record 可能永久卡在 processing", exc_info=True)
@@ -71,9 +78,14 @@ def process_raw_event(raw_id: int) -> None:
     bind_contextvars(raw_id=raw_id)
     logger.info("開始處理")
     db = SessionLocal()
+    # 耗時量測起點。用 monotonic 而非 time.time()：後者會被 NTP 校正與睡眠回復
+    # 拉扯，而這台機器有時鐘漂移的前科（見 TROUBLESHOOTING 的 WSL 時鐘一節），
+    # 那會產生負的或荒謬的耗時，直接污染 histogram 而且無法回頭修。
+    started = time.monotonic()
+    # claimed 提到 try 之外：finally 要靠它判斷這一筆到底有沒有真的做事。
+    claimed = False
     try:
         # Point 3: claim retry，區分 DB 例外 vs 正常搶佔失敗
-        claimed = False
         for attempt in range(MAX_CLAIM_RETRIES):
             try:
                 claimed = try_claim_raw(db, raw_id)
@@ -83,6 +95,7 @@ def process_raw_event(raw_id: int) -> None:
                 db.rollback()
                 if attempt < MAX_CLAIM_RETRIES - 1:
                     logger.warning("claim DB 例外", attempt=attempt + 1, error=str(e))
+                    RETRIES.add(1, {"stage": "claim"})
                     time.sleep(0.5 * (2 ** attempt))
                 else:
                     logger.error("claim 失敗，已達最大重試次數，放棄", exc_info=True)
@@ -176,6 +189,7 @@ def process_raw_event(raw_id: int) -> None:
                 db.rollback()
                 if attempt < MAX_PROCESS_RETRIES - 1:
                     logger.warning("處理失敗", attempt=attempt + 1, error=str(e))
+                    RETRIES.add(1, {"stage": "processing"})
                     time.sleep(0.5 * (2 ** attempt))
                     raw = db.execute(select(Raw).where(Raw.id == raw_id)).scalar_one()
                 else:
@@ -216,6 +230,8 @@ def process_raw_event(raw_id: int) -> None:
                     )
                 )
                 db.commit()
+                # processed 是唯一不走 _commit_raw_status 的終態，故單獨計一次。
+                ORDERS_RESULT.add(1, {"result": "processed"})
                 logger.info("處理完成", order_id=raw.order_id)
                 logger.info("quality_metric",
                     rule_version=DQ_RULE_VERSION,
@@ -260,6 +276,7 @@ def process_raw_event(raw_id: int) -> None:
                 db.rollback()
                 if status_attempt < MAX_STATUS_RETRIES - 1:
                     logger.warning("commit 失敗", attempt=status_attempt + 1)
+                    RETRIES.add(1, {"stage": "status_update"})
                     time.sleep(0.5 * (2 ** status_attempt))
                     db.add(ods)
                     db.add(quality_event)
@@ -267,6 +284,10 @@ def process_raw_event(raw_id: int) -> None:
                     logger.critical("commit 失敗達上限，ODS 未寫入，record 卡在 processing", exc_info=True)
 
     finally:
+        # 只記「真的 claim 到」的那些。claim 落空是毫秒級的 no-op，把它們混進來
+        # 會在有競爭時把整個分佈往左拉——P95 會愈忙看起來愈健康，正好相反。
+        if claimed:
+            PROCESSING_DURATION.record(time.monotonic() - started)
         clear_contextvars()
         db.close()
 

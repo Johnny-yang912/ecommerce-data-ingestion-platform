@@ -126,6 +126,48 @@ class TestWorkerProcessInit:
 
         mock_engine.dispose.assert_called_once()
 
+    def test_telemetry_configured_on_worker_process_init(self):
+        """
+        遙測必須在 **fork 之後**（prefork 子行程）初始化。
+
+        掛在父行程的話，BatchSpanProcessor 的背景執行緒不會被 fork 繼承——子行程
+        拿到有佇列卻沒有搬運工的 processor，span 永遠送不出去且不報錯。
+        與上面 dispose engine 是同一個成因，故掛同一個 signal。
+        """
+        from celery_app import _configure_worker_telemetry
+
+        with patch("celery_app.configure_telemetry") as mock_cfg:
+            _configure_worker_telemetry()
+
+        mock_cfg.assert_called_once_with("order-worker")
+
+
+class TestBeatInit:
+
+    def test_telemetry_configured_on_beat_init(self):
+        """beat 行程也要有自己的 service.name，否則三個服務在 Grafana 會併成一個。"""
+        from celery_app import _configure_beat_telemetry
+
+        with patch("celery_app.configure_telemetry") as mock_cfg:
+            _configure_beat_telemetry()
+
+        mock_cfg.assert_called_once_with("order-beat")
+
+    def test_telemetry_receiver_registered_before_initial_scan(self):
+        """
+        註冊順序是正確性的一部分，不只是風格。
+
+        `_initial_recovery_scan` 會在 beat 啟動時立刻派一則訊息；若遙測晚一步
+        初始化，那則訊息不帶 trace context，beat 重啟後的第一輪掃描就憑空斷掉。
+        Celery 依註冊順序呼叫接收者，所以遙測必須排在前面。
+        """
+        from celery.signals import beat_init
+
+        names = [r[1]().__name__ if callable(r[1]) else None
+                 for r in beat_init.receivers]
+        assert "_configure_beat_telemetry" in names
+        assert names.index("_configure_beat_telemetry") < names.index("_initial_recovery_scan")
+
 
 # ─── tasks 薄包裝 ─────────────────────────────────────────────────────────────
 

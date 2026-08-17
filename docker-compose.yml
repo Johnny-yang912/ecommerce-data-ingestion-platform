@@ -1,3 +1,29 @@
+# api / worker / beat 三個服務的遙測設定完全相同（服務名由程式碼傳入，不走環境變數，
+# 見 telemetry.py），故抽成 anchor——與 docker-compose.airflow.yml 的 x-airflow-common
+# 同一個做法。三份手抄最容易出現的錯是「只改了兩份」，而遙測設定漂掉是靜默的。
+x-otel-env: &otel-env
+  OTEL_ENABLED: "true"
+  # ⚠️ 標準名在此指向【本機 Collector】，不是 Grafana Cloud。雲端 endpoint 與憑證
+  #    只有 otel-collector 服務看得到（.env 裡叫 GRAFANA_OTLP_*），這樣 app 就算
+  #    設定寫錯也不可能直連雲端。
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev
+  # 取樣率。現在是 seed_demo 每天 800 筆，全量送遠低於免費額度（50GB traces）。
+  # ⚠️ 跑 load_test.py 之前務必先調低 ARG——那支腳本的量級與日常流量差好幾個數量級，
+  #    一次壓測就可能吃掉可觀的額度，而超額不會有錯誤訊息。
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "1.0"
+  # --- Metrics（B1）。以下三個都是「現在的預設值」，但全部明確釘死 ---
+  # ⚠️ ASGI instrumentation 會依這個變數決定要不要【同時】送新舊兩套 duration
+  #    histogram。不釘死的話，某次依賴升級就會讓序列數無聲翻倍——沒有錯誤訊息，
+  #    只有帳單或截流。空字串 = 只送舊版（目前的預設）。
+  OTEL_SEMCONV_STABILITY_OPT_IN: ""
+  # Prometheus / Mimir 吃的是累積型。目前就是預設，但這是會隨版本漂的預設。
+  OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: cumulative
+  # 匯出間隔。縮短會等比增加資料點數與成本，而這些指標沒有一個需要秒級解析度。
+  OTEL_METRIC_EXPORT_INTERVAL: "60000"
+
 services:
   db:
     image: postgres:16
@@ -36,6 +62,31 @@ services:
     ports:
       - "${REDIS_PUBLISH_PORT:-6379}:6379"   # 本機除錯用，正式可移除
 
+  # 遙測的唯一出口。設定與理由見 otel/collector-config.yaml。
+  #
+  # ⚠️ 放在主 compose 而非獨立 overlay（對照 airflow 是 overlay）：Airflow 是可選的，
+  #    Collector 不是——它是 api / worker / beat 的固定下游。做成 overlay 的話，
+  #    忘了帶 -f 的後果不是「沒有遙測」，而是三個服務對著不存在的 host 持續重試、
+  #    把日誌刷滿，而遙測仍然是靜默丟失的。
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      # ${...:?} 守衛：缺值時 compose 在解析階段就報錯，不會起一個必然 401 的
+      # collector（同 airflow overlay 對 GCP_SA_KEY_PATH 的處理）。
+      GRAFANA_OTLP_ENDPOINT: ${GRAFANA_OTLP_ENDPOINT:?請在 .env 設定，見 .env.example}
+      GRAFANA_OTLP_AUTH: ${GRAFANA_OTLP_AUTH:?請在 .env 設定，見 .env.example}
+    volumes:
+      - ./otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      # 只發布 health_check 端點給主機除錯用（curl http://localhost:13133/）。
+      # OTLP 的 4317/4318 不發布：只有同網路的容器需要連，發布出去只是擴大暴露面。
+      - "${OTEL_HEALTH_PUBLISH_PORT:-13133}:13133"
+    # ⚠️ 沒有 healthcheck 是刻意的，不是漏寫：這個映像裡沒有 shell 也沒有 curl/wget，
+    #    容器內跑不了任何探測指令。存活要從主機端 curl 13133，或直接看 Grafana 有沒有
+    #    資料——而後者本來就是雲端 absent 告警要回答的問題。
+    restart: unless-stopped
+
   # 一次性 migration 服務：跑完即退出，api 等它成功才起
   migrate:
     build: .
@@ -55,6 +106,7 @@ services:
       uvicorn main:app --host 0.0.0.0 --port 8000
       --workers ${UVICORN_WORKERS:-4}
     environment:
+      <<: *otel-env
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
       API_KEYS: ${API_KEYS}
       LOG_FORMAT: json
@@ -75,6 +127,10 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # 只要求 started、不要求 healthy：遙測**絕不能**成為 app 的啟動門檻。
+      # 這裡的相依只為了排序（避免啟動瞬間對著不存在的 host 刷連線錯誤）。
+      otel-collector:
+        condition: service_started
     ports:
       - "8000:8000"
     # ⭐ 排程化之後這不再只是「方便」：seed_demo_daily 每天在台北 10/13/17/21 觸發、
@@ -96,6 +152,7 @@ services:
     build: .
     command: celery -A celery_app worker --loglevel=INFO --concurrency=4
     environment:
+      <<: *otel-env
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
       LOG_FORMAT: json
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -111,6 +168,10 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # 只要求 started、不要求 healthy：遙測**絕不能**成為 app 的啟動門檻。
+      # 這裡的相依只為了排序（避免啟動瞬間對著不存在的 host 刷連線錯誤）。
+      otel-collector:
+        condition: service_started
     restart: unless-stopped          # 同 api：排程作業的依賴不該比排程器短命
     healthcheck:
       # inspect ping 是廣播＋等回覆，比 HTTP 探針慢得多 → 間隔與 start_period 都放寬。
@@ -133,6 +194,7 @@ services:
     # 重新計時即可），沒必要污染程式碼目錄，也免去唯讀根檔案系統時的麻煩。
     command: celery -A celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
     environment:
+      <<: *otel-env
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
       LOG_FORMAT: json
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -144,6 +206,10 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # 只要求 started、不要求 healthy：遙測**絕不能**成為 app 的啟動門檻。
+      # 這裡的相依只為了排序（避免啟動瞬間對著不存在的 host 刷連線錯誤）。
+      otel-collector:
+        condition: service_started
     # Beat 在手動灌資料時可以不起（broker 健康時每筆都派得出去），但排程化之後
     # 必須常駐：它是 broker 短暫抽風時 scan_and_dispatch 補派的唯一來源，而無人
     # 值守正是最需要那層兜底的場景。

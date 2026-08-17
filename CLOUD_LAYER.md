@@ -39,7 +39,7 @@ The column name means different things on the two tables, and three downstream m
 
 **But it carries a scope boundary you must know**: when a backlog is flushed by the recovery scan, those rows get an `ods.received_at` of the *catch-up write*, so the ingestion gap does not exist on the ODS timeline at all. Anything built on `ods.received_at` (partitioning, freshness, the day boundary in `rpt_quality_events_daily`) therefore only sees outages **still in progress at sampling time** — never ones that have already recovered.
 
-The health of the dispatch hop is answered elsewhere: the oldest age of `raw.status='pending'` (owned by the `raw_pending_watch` DAG added in a follow-up change), and later the continuity of `raw.received_at` via OTel. **Three timelines, one hop each — none of them moonlights.**
+The health of the dispatch hop is answered elsewhere: the oldest age of `raw.status='pending'` (owned by the `raw_pending_watch` DAG added in a follow-up change), and the continuity of `raw.received_at` via OTel (the pipeline went live 2026-08-17, but **absent alerting is not yet written** — see ORCHESTRATION.md §4). **Three timelines, one hop each — none of them moonlights.**
 
 ⚠️ One easy-to-get-wrong criterion, spelled out: **"a Raw row with no matching ODS row" cannot be the definition of a fault.** Raw's terminal states are `processed` / `duplicate` / `error`; the latter two produce no ODS row *and that is correct behaviour*, so that definition would raise an alert on every duplicate order. `pending` is the clean signal — it means no worker has claimed the row yet.
 
@@ -278,7 +278,7 @@ change it is extract moving to hourly or streaming. (Full derivation in
 
 And "cannot detect a three-hour stall at peak" is not a threshold problem either — it is a **scope**
 problem: freshness measures `ods.received_at` = the extract hop (see §1.2.2), and ingestion outages
-were never its job. Those are answered by `raw_pending_watch` and, later, OTel.
+were never its job. Those are answered by `raw_pending_watch` and by OTel's absent alerting (the latter is not yet written — see ORCHESTRATION.md §4).
 
 **Implementation outcome (Phase 5): a side-channel task is not enough — it needs its own DAG** ⭐
 

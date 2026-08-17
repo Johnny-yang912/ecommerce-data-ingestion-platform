@@ -92,7 +92,7 @@ The third quadrant is the key design point: **an otherwise-good order that merel
 | Changed date format / timezone | format error → 422; timezone → contract | Format error 422 + log; timezone is a written contract (see boundaries) |
 | Unseen enum value | lands; length handled by over-long path; detection deferred | New value lands; over-long no longer stalls; Phase 4 `accepted_values` (warn) |
 | Semantic drift | — | Deferred to Phase 4–5 distribution monitoring (rules cannot catch it) |
-| No data at all | — | Deferred to Phase 5 OTel volume/freshness alerting |
+| No data at all | — | The OTel pipeline is live (2026-08-17), but **absent alerting is still unwritten** — the threshold must be derived from observation, see [ORCHESTRATION.md](./ORCHESTRATION.md) §4 |
 | Same order_id resent | existing idempotency | first-write-wins; duplicates marked `duplicate` |
 | Non-object nested group | `has_schema_drift` (`NON_OBJECT_GROUP`) + defensive guard | No crash; flagged, that group lands as NULL |
 | sentinel / fake nulls | `format_clean` normalization (strings); range check (numbers) | String sentinels → NULL; numeric sentinels flagged `has_clean_error` |
@@ -651,8 +651,12 @@ logger.info("quality_metric",
 )
 ```
 
-Routes to Grafana via Phase 4 OTel/Loki → real-time error rate, Hard Gate trigger alerts.  
-No new components required — structlog infrastructure already exists.
+Routes to Grafana via OTel (live 2026-08-17) → real-time error rate, Hard Gate trigger alerts.  
+⚠️ **Current state**: the pipeline is up and every log line carries a `trace_id`, but **the error-rate
+metric described here does not exist yet**. It belongs to the business / DQ metrics, deliberately
+deferred: `seed_demo_daily` picks its dirty rate deterministically from five choices per day and is
+therefore constant within a day, so a minute-level error rate says nothing this tier's daily reports
+do not already say. Enable it once there is a real upstream whose dirty rate moves on its own.
 
 ### Tier 2: Batch analytical metrics (daily / weekly)
 
@@ -681,7 +685,7 @@ rpt_quality_backlog              snapshot (current contents of int_orders_quaran
 
 Connected to Looker Studio for long-term trend analysis.
 
-**Scope boundary (still holds once OTel lands)**: this tier is **analysis of data trustworthiness and rule effectiveness**, **not pipeline health monitoring**. Minute-level error rate, real-time Hard Gate alerting, and batch SLA belong to Tier 1 (OTel/Grafana). The two tiers deliberately overlap on some signals (error rate exists in both); the difference is the mode of consumption — Tier 1 is "now, a single number, for alerting", Tier 2 is "history, sliceable, for attribution". Three things make quality analysis unable to live in OTel alone: ① a TSDB can't sustain the high-cardinality slicing of `error_code × field × client × version`; ② metrics get downsampled, so cross-quarter rule-effectiveness comparison becomes impossible; ③ only in the warehouse can you join `dim_`/`fct_` and translate quality from an engineering metric into **business exposure**.
+**Scope boundary (still holds once OTel lands)**: this tier is **analysis of data trustworthiness and rule effectiveness**, **not pipeline health monitoring**. Minute-level error rate, real-time Hard Gate alerting, and batch SLA belong to Tier 1 (OTel/Grafana). The two tiers deliberately overlap on some signals (error rate exists in both); the difference is the mode of consumption — Tier 1 is "now, a single number, for alerting", Tier 2 is "history, sliceable, for attribution". Three things make quality analysis unable to live in OTel alone: ① a TSDB can't sustain the high-cardinality slicing of `error_code × field × client × version`; ② metrics get downsampled, so cross-quarter rule-effectiveness comparison becomes impossible; ③ only in the warehouse can you join `dim_`/`fct_` and translate quality from an engineering metric into **business exposure**. (2026-08-17 update: the Tier 1 **pipeline** now exists, but it currently carries operational metrics only; quality metrics still live solely in Tier 2.)
 
 ### Why historical metrics are never retroactively rewritten
 

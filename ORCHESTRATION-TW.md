@@ -238,7 +238,7 @@ extract 搬的正是 ODS——**所以看 ODS 自己的時鐘是正確的時間�
 
 | 時間軸 | 回答哪一段 | 誰在看 |
 |---|---|---|
-| `raw.received_at` | 上游 + API：收得到單嗎 | （OTel 之後）|
+| `raw.received_at` | 上游 + API：收得到單嗎 | OTel：`http.server.duration{http_route="/orders"}` 的計數（已上線）；**absent 告警未寫**，見 §4 |
 | `raw.received_at` → `ods.received_at` | 派工：worker 取得到件嗎 | `raw_pending_watch`（§2.12）|
 | BQ staging 上的 `ods.received_at` | extract：搬進倉儲了嗎 | `source_freshness_watch` |
 
@@ -539,7 +539,7 @@ docker exec api-airflow-apiserver-1 airflow dags list-import-errors
 
 | 項目 | 為什麼不做 | 觸發點 |
 |---|---|---|
-| **OpenTelemetry** | ⚠️ 原本的理由是「需要先有值得觀測的持續流量」——`seed_demo_daily` 上線後**那個條件已經成立**。真正還缺的是一個**活在本機之外**的 backend：存活告警不能與被監控的系統同生共死 | 已可著手。第一條該寫的規則是 **absent**（「這個來源多久沒送資料了」），不是業務指標——那條必須寫在雲端側，因為它要偵測的正是「我這側已經沒辦法說話了」。見 §2.12 ④ |
+| **OTel 的 absent 告警** | Traces 與營運 metrics 已於 2026-08-17 上線（見 README 藍圖），**但告警還沒寫**——擋住它的不再是技術。門檻必須從觀測推導（同 §2.12 ③），而這台機器**夜間是關的**、seeding 只在台北 10/13/17/21；現在寫規則，抓到的會是「筆電關機」而不是管線故障，每晚誤報一次，然後就會學會忽略它 | 累積 2–3 天真實開關機與 seeding 節奏之後。第一條規則仍是 **absent**（「這個來源多久沒送資料了」）而非業務指標，且必須寫在雲端側——它要偵測的正是「我這側已經沒辦法說話了」。見 §2.12 ④ |
 | **Cosmos（模型級 task）** | 13 個 model，收益與相依成本不成比例 | model 數量成長到層級 task 看不清依賴時 |
 | **triggerer / deferrable** | 目前只有 `BashOperator` | 引入 sensor 時 |
 | **小時批** | 方案 A 的 watermark 精度被 DAY 分區卡死 | 改 HOUR 分區或換方案 B 時（[CLOUD_LAYER-TW §2.2](./CLOUD_LAYER-TW.md)）|
@@ -861,7 +861,7 @@ dataset。
   以及 2026-08-12 fixture 重建時連續走完的 v2→v3（promote 16）與 v3→v4（promote 15）；
   四次皆冪等、ODS 未被修改、對照組留在 quarantine。完整數據見 §5.1、**§5.1.1**、§5.5
 - ✅ Celery + Redis（已實作，與本層正交；見 [QUEUE-TW.md](./QUEUE-TW.md)）
-- ⬜ OpenTelemetry（藍圖 Phase 5 的其他項）
+- 🟡 OpenTelemetry — Traces + 營運 metrics 已上線（2026-08-17）；Airflow 接入與 absent 告警未做（見 §4）
 - ⬜ 跨時區抽取的正式處置（§2.11 的 a/b/c 尚未選——沒有真實跨日界流量之前無法驗證）
 
 ## 7. 相依與版本

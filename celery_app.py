@@ -15,6 +15,7 @@ from celery.signals import beat_init, setup_logging, worker_process_init
 
 from config import settings
 from logging_config import configure_logging
+from telemetry import configure_telemetry
 
 celery_app = Celery(
     "orders_ingestion",
@@ -96,6 +97,22 @@ celery_app.conf.update(
 
 
 @beat_init.connect
+def _configure_beat_telemetry(**_kwargs) -> None:
+    """
+    Beat 行程的遙測初始化。
+
+    ⚠️ 註冊順序有意義：Celery 依接收者的註冊順序呼叫，而下面的
+    `_initial_recovery_scan` 會立刻派一則訊息出去。若遙測晚一步初始化，
+    那則訊息就不帶 trace context——beat 重啟後的第一輪掃描會憑空斷掉。
+    所以這個函式必須定義在它【前面】。
+
+    beat 是單行程、不 fork，本來可以在模組層初始化；掛在 beat_init 是為了
+    與 worker 的掛載方式一致，讓「遙測何時開始」在三個行程裡是同一個答案。
+    """
+    configure_telemetry("order-beat")
+
+
+@beat_init.connect
 def _initial_recovery_scan(**_kwargs) -> None:
     """
     Beat 啟動時立刻補一次掃描。
@@ -142,3 +159,19 @@ def _dispose_inherited_engine(**_kwargs) -> None:
     from database import engine
 
     engine.dispose()
+
+
+@worker_process_init.connect
+def _configure_worker_telemetry(**_kwargs) -> None:
+    """
+    prefork 子行程的遙測初始化。
+
+    掛在這裡而不是模組層，是因為 `BatchSpanProcessor` 是背景執行緒，而**執行緒
+    不會被 fork 繼承**：父行程初始化的話，子行程會拿到一個有佇列卻沒有搬運工的
+    processor，span 堆著永遠送不出去，且**沒有任何錯誤訊息**。
+
+    這與上面 `_dispose_inherited_engine` 是同一個成因（fork 繼承了不該繼承的
+    資源），故用同一個 signal 解決。順序上刻意排在它後面：先讓子行程拿到乾淨的
+    engine，再把 instrumentor 掛上去。
+    """
+    configure_telemetry("order-worker")

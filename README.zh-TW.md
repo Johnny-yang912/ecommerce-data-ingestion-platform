@@ -615,8 +615,13 @@ Looker Studio（直連 BigQuery）
 - [v] 派工熔斷器（`circuit_breaker.py`）——broker 不可用時的退化是**超線性**的（kombu producer pool 每行程上限 10），實測 48 併發下 47 筆在 120 秒內拿不到回應，而它們的 Raw **其實都已寫入**，客戶端只看到逾時、於是重送。連續失敗三次即開路，之後不再碰 Redis：p50 從「逾時」降到 **5ms**。連帶修掉 `db.refresh()` 開啟的交易跨越派工的問題（實測 60 併發時 32 個 pool 槽位有 23 個卡在 `idle in transaction`）
 - [v] 有界的恢復掃描——熔斷器讓事故期間攝入維持全速，代價是 `pending` 也全速累積，原本「一次撈完所有 pending 逐一派工」等於把剛避開的崩潰搬到恢復路徑。改為 `LIMIT` + `id` 游標分頁（派工不改 status，光有 LIMIT 每輪會撈到同一批）、單輪頁數上限、Redis 鎖擋重疊，並加寬限期讓剛攝入的 pending 留給攝入路徑。實測 120,000 積壓：掃描 #1 送出 100,000（上限）、#2 送出 20,000，ODS 恰好 +120,000、重複 0 筆。⚠️ **前提未完備**：`raw.status` 目前沒有索引，分頁收斂的是記憶體與派工量而非查詢成本；索引形狀需由真實流量決定，不能用自造資料的 `EXPLAIN` 下結論（見 [QUEUE-TW §6.1](./QUEUE-TW.md)）
 - [v] Docker 擴展：補上 Redis + Celery Worker + Beat；api 開 4 個 uvicorn worker，限流計數器改走 Redis
-- [ ] OpenTelemetry — 在現有 structlog 基礎上接入 OTel SDK，補全可觀測性的三個 pillar：
-  - **Logs**：structlog 輸出接 OTel Log Exporter，與 Metrics / Traces 共用同一套 context（`trace_id` / `span_id` 自動注入每條 log，跨服務 log 可關聯）
-  - **Metrics**：透過 OTel Metrics API 量化業務指標——訂單寫入量、ODS 處理成功 / 失敗 / duplicate 比率、processing 延遲分佈（P50/P95/P99）、DB pool 壓力、Retry 次數分佈
-  - **Traces**：對「API 接單 → Worker 處理 → Airflow 抽取 → BigQuery 寫入」全鏈路做分散式追蹤，定位跨服務延遲與瓶頸
-  - Exporter 目標：Grafana Cloud（Loki + Prometheus + Tempo）或 GCP Cloud Trace / Cloud Monitoring
+- [v] OpenTelemetry — Traces + 營運 Metrics（2026-08-17）
+  - **Collector 常駐**（contrib 0.158.0，`otel/collector-config.yaml`）：app 一律送本機 Collector，雲端 endpoint 與憑證只存在那一處。⚠️ `.env` 刻意**不用** OTel 標準名 `OTEL_EXPORTER_OTLP_ENDPOINT`——任何 SDK 看到那個名字就會直連雲端、靜默繞過 Collector（沒有錯誤、資料照樣進得去），標準名保留給「app → Collector」
+  - **Traces**：`api` → Celery → `worker` 全鏈路串通（實測同一 `trace_id` 跨行程出現），自動涵蓋 SQLAlchemy / Redis。SDK 初始化掛在 `worker_process_init`，因為 `BatchSpanProcessor` 是背景執行緒、**不會被 fork 繼承**——與 `_dispose_inherited_engine` 是同一個成因、同一個掛載點
+  - **Logs**：structlog 注入 `trace_id` / `span_id`（W3C 32/16 位十六進位）。**不走 OTLP**：Python 的 logs pillar 最晚穩定，而跨 pillar 關聯需要的只有這兩個欄位
+  - **Metrics（營運）**：`orders.raw.result`、`orders.processing.duration`、`orders.retry`、`circuit_breaker.state`、`recovery_scan.dispatched`；另有 `http.server.duration`（P50/95/99）與 `db.client.connections.usage`（pool 壓力）由 instrumentation 免費提供。序列預算由 SDK View 控制——實測 **320 active series（免費額度 10k 的 3.2%）**。⚠️ 反直覺的結論是：**貴的是自動指標不是自訂的**。三條 Drop view 砍掉的 `http.server.request/response.size` 與 `flower.task.runtime.seconds` 原本佔 27%，而後者用毫秒級 bucket 量秒級的值，等於有資料零解析度
+  - Exporter：Grafana Cloud（`ap-southeast-1`，Tempo + Prometheus）
+- [ ] OpenTelemetry 未竟項
+  - **業務 / DQ Metrics**：刻意緩做。`seed_demo_daily` 的髒率是每日決定性五選一 → **日內恆定**，分鐘級 error rate 答不出 `rpt_quality_events_daily` 沒說過的事；高基數切片按定義屬倉裡（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md) 的層次一/二邊界）
+  - **Airflow 接入**：Collector 已備妥（明文送本機即可），待查證 Airflow 內建 OTel 輸出的認證能力
+  - **absent 告警與 dashboard**：門檻必須從觀測推導，而本機夜間關機會讓規則天天誤報——需先累積 2–3 天真實節奏

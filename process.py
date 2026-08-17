@@ -58,7 +58,7 @@ def _commit_raw_status(db, raw_id: int, status: str, error_message=None) -> None
             # 成功分支自己更新），所以結果計數埋在這一行就涵蓋全部失敗終態。
             ORDERS_RESULT.add(1, {"result": status})
             return
-        except Exception as e:
+        except Exception:
             db.rollback()
             if attempt < MAX_STATUS_RETRIES - 1:
                 logger.warning("status 更新失敗", attempt=attempt + 1)

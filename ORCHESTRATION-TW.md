@@ -238,7 +238,7 @@ extract 搬的正是 ODS——**所以看 ODS 自己的時鐘是正確的時間�
 
 | 時間軸 | 回答哪一段 | 誰在看 |
 |---|---|---|
-| `raw.received_at` | 上游 + API：收得到單嗎 | OTel：`http.server.duration{http_route="/orders"}` 的計數（已上線）；**absent 告警未寫**，見 §4 |
+| `raw.received_at` | 上游 + API：收得到單嗎 | OTel：`http_server_duration_milliseconds_count{job="order-api",http_target="/orders"}`（已上線）；**absent 告警未寫**，見 §4 |
 | `raw.received_at` → `ods.received_at` | 派工：worker 取得到件嗎 | `raw_pending_watch`（§2.12）|
 | BQ staging 上的 `ods.received_at` | extract：搬進倉儲了嗎 | `source_freshness_watch` |
 

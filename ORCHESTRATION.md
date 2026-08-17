@@ -268,7 +268,7 @@ timelines, one hop each; merged, a single red would stand for two pipeline segme
 
 | Timeline | Which hop it answers | Who watches it |
 |---|---|---|
-| `raw.received_at` | Upstream + API: can orders get in? | OTel: the count of `http.server.duration{http_route="/orders"}` (live); **absent alerting not yet written**, see §4 |
+| `raw.received_at` | Upstream + API: can orders get in? | OTel: `http_server_duration_milliseconds_count{job="order-api",http_target="/orders"}` (live); **absent alerting not yet written**, see §4 |
 | `raw.received_at` → `ods.received_at` | Dispatch: can workers claim them? | `raw_pending_watch` (§2.12) |
 | `ods.received_at` in BQ staging | extract: did it reach the warehouse? | `source_freshness_watch` |
 

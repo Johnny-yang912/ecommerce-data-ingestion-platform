@@ -1073,7 +1073,9 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
   2026-08-12 fixture rebuild; all four idempotent, ODS never modified, control group left
   quarantined. Full figures in §5.1, **§5.1.1**, and §5.5
 - ✅ Celery + Redis (implemented, orthogonal to this layer; see [QUEUE.md](./QUEUE.md))
-- 🟡 OpenTelemetry — traces + operational metrics are live (2026-08-17); Airflow integration and absent alerting are not (see §4)
+- ✅ OpenTelemetry — traces + operational metrics are live (2026-08-17). Airflow integration, absent
+  alerting and dashboards are now **deliberately not done**, each with a trigger (see §4 and §4.1) —
+  nothing on this line is left dangling
 - 🟡 Failure notification — wiring and per-DAG response semantics are done for the four scheduled DAGs
   (2026-08-24, §2.13); the transport defaults to a log line and a real channel is one env var away.
   **"Should have run, didn't" is still uncovered**

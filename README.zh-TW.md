@@ -622,7 +622,7 @@ Looker Studio（直連 BigQuery）
   - **Logs**：structlog 注入 `trace_id` / `span_id`（W3C 32/16 位十六進位）。**不走 OTLP**：Python 的 logs pillar 最晚穩定，而跨 pillar 關聯需要的只有這兩個欄位
   - **Metrics（營運）**：`orders.raw.result`、`orders.processing.duration`、`orders.retry`、`circuit_breaker.state`、`recovery_scan.dispatched`；另有 `http.server.duration`（P50/95/99）與 `db.client.connections.usage`（pool 壓力）由 instrumentation 免費提供。序列預算由 SDK View 控制——實測 **320 active series（免費額度 10k 的 3.2%）**。⚠️ 反直覺的結論是：**貴的是自動指標不是自訂的**。三條 Drop view 砍掉的 `http.server.request/response.size` 與 `flower.task.runtime.seconds` 原本佔 27%，而後者用毫秒級 bucket 量秒級的值，等於有資料零解析度
   - Exporter：Grafana Cloud（`ap-southeast-1`，Tempo + Prometheus）
-- [ ] OpenTelemetry 未竟項
-  - **業務 / DQ Metrics**：刻意緩做。`seed_demo_daily` 的髒率是每日決定性五選一 → **日內恆定**，分鐘級 error rate 答不出 `rpt_quality_events_daily` 沒說過的事；高基數切片按定義屬倉裡（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md) 的層次一/二邊界）
-  - **Airflow 接入**：Collector 已備妥（明文送本機即可），待查證 Airflow 內建 OTel 輸出的認證能力
-  - **absent 告警與 dashboard**：對**連續訊號**而言門檻必須從觀測推導，而本機夜間關機會讓規則天天誤報——需先累積 2–3 天真實節奏。⚠️ 這個理由**不延伸到排程批次**：`orders_analytics_daily` 的窗口直接來自它的 cron 宣告，而筆電在 22:30 是關的，對日批是真陽性而非誤報。失敗通知（見上方 Phase 5）已涵蓋「跑了而且失敗」，「該跑卻沒跑」正是這些規則要補的洞
+- [—] OpenTelemetry — **刻意不做的三項**（`[—]` ＝已決定不做、各有觸發點，不是待辦）
+  - **業務 / DQ metrics**：`seed_demo_daily` 的髒率是每日決定性五選一 → **日內恆定**，分鐘級 error rate 答不出 `rpt_quality_events_daily` 沒說過的事；高基數切片按定義屬倉裡（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md) 的層次一/二邊界）。**觸發點**：有真實上游、髒率會在日內波動時
+  - **absent 告警與 dashboard**：存活型規則的門檻來自**排程宣告**而非流量分佈，所以它今天就寫得出來——不寫的理由不是做不到，是**這是作品、沒有真實流量**：值型門檻（延遲、錯誤率）與處置手段都要真實流量才長得出來，而規則住在 Grafana Cloud 的 UI 裡，進不了版控也無法被 review。**推導本身才是交付物**——六條訂定原則寫在 [ORCHESTRATION-TW §4.1](./ORCHESTRATION-TW.md)，含一個反直覺的結論：cumulative temporality 下序列永遠不會 absent，`absent()` 抓的是行程死亡、不是上游停擺。**觸發點**：真的要用這套系統監控自己的那天
+  - **Airflow 接入**：Collector 早就備妥（明文送 `otel-collector:4318`，認證由 Collector 補，兩者本就在同一個 compose 網路上），所以**擋點不是技術**。不接是因為它的消費端都已經決定不做：最強的理由是提供分析管線的存活訊號，而規則不寫；次強的是 dashboard 素材，而 dashboard 已降級；剩下的診斷價值（extract 的 PG vs BQ 耗時拆解）對一天兩個樣本的日批偏低——trace 的差異化價值在拆解併發，而 extract 是單行程順序執行的四步直線。**觸發點**：開始寫存活規則，或 extract / dbt 出現真實延遲問題時

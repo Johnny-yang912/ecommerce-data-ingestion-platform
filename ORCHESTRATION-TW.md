@@ -954,7 +954,8 @@ dataset。
   以及 2026-08-12 fixture 重建時連續走完的 v2→v3（promote 16）與 v3→v4（promote 15）；
   四次皆冪等、ODS 未被修改、對照組留在 quarantine。完整數據見 §5.1、**§5.1.1**、§5.5
 - ✅ Celery + Redis（已實作，與本層正交；見 [QUEUE-TW.md](./QUEUE-TW.md)）
-- 🟡 OpenTelemetry — Traces + 營運 metrics 已上線（2026-08-17）；Airflow 接入與 absent 告警未做（見 §4）
+- ✅ OpenTelemetry — Traces + 營運 metrics 已上線（2026-08-17）。Airflow 接入、absent 告警與 dashboard
+  **已轉為刻意不做**（各有觸發點，見 §4 與 §4.1）——這條線沒有懸空的待辦
 - 🟡 失敗通知 — 四支排程 DAG 的接線與處置語意已完成（2026-08-24，§2.13）；
   傳輸通道預設為 log，接真通道是設一個環境變數。**「該跑卻沒跑」仍未涵蓋**
 - ⬜ 跨時區抽取的正式處置（§2.11 的 a/b/c 尚未選——沒有真實跨日界流量之前無法驗證）

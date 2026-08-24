@@ -657,7 +657,7 @@ that a retry would clear.
 
 | Item | Why not | Trigger |
 |---|---|---|
-| **OTel absent alerting** | Traces and operational metrics went live on 2026-08-17 (see the README roadmap). Failure notification followed on 2026-08-24 (§2.13), but that only covers "ran and failed" — **"should have run, didn't" still has nothing watching it**. And an absent rule's threshold must be derived from observation (same discipline as §2.12 ③), yet this machine is **powered off overnight** and seeding only runs at 10/13/17/21 Taipei; for a continuous signal, a rule written today would catch "the laptop is off" rather than a pipeline fault, firing every night until you learn to ignore it | After 2–3 days of real power-cycle and seeding cadence. ⚠️ That "wait for observation" argument does **not** actually hold for a **daily batch** — `orders_analytics_daily`'s window comes straight from `schedule="30 22 * * *"` and needs no measurement, and a laptop that is off at 22:30 is a **true positive** for a batch, not a false alarm. So the batch absent rule is writable today; it simply hasn't been written. The rule must live on the cloud side — what it detects is precisely "my side can no longer speak". See §2.12 ④ |
+| **OTel absent alerting** | Traces and operational metrics went live on 2026-08-17 (see the README roadmap). Failure notification followed on 2026-08-24 (§2.13), but that only covers "ran and failed" — **"should have run, didn't" still has nothing watching it**. And an absent rule's threshold must be derived from observation (same discipline as §2.12 ③), yet this machine is **powered off overnight** and seeding only runs at 10/13/17/21 Taipei; for a continuous signal, a rule written today would catch "the laptop is off" rather than a pipeline fault, firing every night until you learn to ignore it | After 2–3 days of real power-cycle and seeding cadence. ⚠️ That "wait for observation" argument does **not** actually hold for a **daily batch** — `orders_analytics_daily`'s window comes straight from `schedule="30 22 * * *"` and needs no measurement, and a laptop that is off at 22:30 is a **true positive** for a batch, not a false alarm. So the batch absent rule is writable today; it simply hasn't been written. The rule must live on the cloud side — what it detects is precisely "my side can no longer speak". See §2.12 ④. ⚠️ Additional reason (2026-08-24): **this is a portfolio project with no real traffic** — value thresholds (latency, error rate) and response procedures both need real traffic to grow, and while liveness rules *are* writable, their value lies in the **principles behind them** rather than in the few lines of PromQL: the rules live in Grafana Cloud's UI, where they cannot be version-controlled or reviewed. So the principles are written down in §4.1 and the rules themselves are not. One separate gap remains: the analytics pipeline's liveness rule **still lacks a signal** — extract is deliberately uninstrumented and Airflow itself is not yet integrated, so no series disappears when `orders_analytics_daily` fails to run |
 | **A real transport for failure notification** | The wiring and the message content are done (§2.13), but the channel defaults to a log line. A webhook URL hardcoded into the repo is worth nothing to a reader (they cannot use it either) and will rot | Set `NOTIFY_WEBHOOK_URL`; see `.env.example` |
 | **Cosmos (model-level tasks)** | 13 models; benefit is out of proportion to the dependency cost | When model count makes layer-level tasks too coarse to read |
 | **triggerer / deferrable** | Only `BashOperator` today | When sensors are introduced |
@@ -670,6 +670,62 @@ that a retry would clear.
 > deliberately**: this project has no real upstream, so seeding *is* the data source (see Scope and
 > Responsibility Boundaries). The freshness stance in
 > [CLOUD_LAYER §1.7.7](./CLOUD_LAYER.md) has been flipped in step.
+
+### 4.1 Principles for setting liveness alerts ⭐
+
+This project writes no rules (see the table above). What follows are the **principles that govern
+writing them** — none of which depend on traffic volume, and all of which apply directly to a real
+deployment.
+
+**① Liveness and value thresholds come from different places, and should not be conflated**
+
+Value thresholds (latency, error rate) **must be derived from observation** — without the
+distribution of real traffic, any number is a guess. Liveness thresholds ("how long without a word
+from this source counts as wrong") **come from a declaration**: a batch's window is written in its
+cron expression, a continuous ingest's window in the upstream's SLA. Applying "wait for real
+traffic" to a liveness rule is over-extending the argument.
+
+**② "No data" does not satisfy any condition** ⭐
+
+An ordinary rule asks whether a value crossed a threshold. When the data does not exist, the query
+returns an empty set, and **an empty set satisfies no condition — the rule sits quietly in Normal**.
+A naive "latency > 500ms" rule therefore stays silent precisely when the whole system is dead.
+Liveness must be **its own rule**; it cannot be expected to fall out of a value rule.
+
+**③ ⚠️ Cumulative temporality makes `absent()` catch the wrong thing**
+
+In cumulative mode the OTel SDK exports the running total on a fixed interval **even when nothing
+happened**. So as long as the process is alive the series always exists and is never absent. Two
+failures need two rules:
+
+| Question | Form | What it catches |
+|---|---|---|
+| The source stopped speaking | `absent(...)`, or Grafana's No Data state handling | Process dead, collector dead, machine off, network down |
+| The source is alive but nothing is happening | `increase(<counter>[window]) == 0` | Upstream stopped — everything green, all containers Up, zero data |
+
+**The second is what a pipeline most needs, and it is exactly the one `absent()` cannot catch.**
+Choosing wrong does not cost you a false alarm; it costs you a rule that looks perfectly reasonable
+and will never fire.
+
+**④ Mute timings suppress notification, not state transitions**
+
+If you choose "short window + mute the expected quiet period (overnight, a maintenance window)"
+over "a window long enough to span the quiet period", note that a rule already in Firing during the
+mute **notifies the instant the mute lifts**. The mute interval has to extend past the point where
+the first expected data actually lands, not to the nominal end of the quiet period.
+
+**⑤ Liveness rules must live outside the system they watch**
+
+What they detect is precisely "my side can no longer speak" (same as §2.12 ④). This is also how
+they divide labour with §2.13's failure notification: that one runs inside Airflow's task process
+and dies with the machine; this one runs in the cloud and fires even when the machine is off
+entirely. They are not substitutes but **two independent paths in different failure domains** —
+either one alone has a structural blind spot.
+
+**⑥ An alert should carry the response, not just the number that moved**
+
+Same reasoning as §2.13 ①: whoever receives the alert needs to know where to look first, and that
+information never appears on its own in a metric name.
 
 ---
 

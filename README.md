@@ -132,7 +132,7 @@ Limits are **per authenticated client, with no global limit** — a global cap w
 | BI (Looker Studio on `rpt_`) | ✅ |
 | Alerting · monitoring dashboards | ⏸ deferred — thresholds need real traffic |
 
-**437 unit + integration tests** (100% coverage of gated modules, Python 3.10/3.12 matrix) · **52 DAG tests** in a separate workflow · **93 dbt tests**.
+**445 unit + integration tests** (100% coverage of gated modules, Python 3.10/3.12 matrix) · **52 DAG tests** in a separate workflow · **93 dbt tests**.
 
 ⚠️ **A green CI check does not mean the DB-layer contracts are verified** — CAS, dedup and crash recovery use a mocked database in CI and are corroborated by manual scripts. See [design/testing](./docs/en/design/testing.md).
 

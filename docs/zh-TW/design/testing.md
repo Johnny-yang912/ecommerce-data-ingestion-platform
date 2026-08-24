@@ -10,7 +10,7 @@
 
 | 層 | 數量 | 在哪 | 需要 |
 |---|---|---|---|
-| 單元 + 整合（mock DB） | 437 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
+| 單元 + 整合（mock DB） | 445 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
 | DAG 結構 | 52 | CI，`dags.yml` | Airflow，不需 DB、不需專案環境變數 |
 | dbt | 93 | 在 DAG 內 | BigQuery |
 | 手動腳本 | 3 | 手動 | 真實 server + 真實 Postgres |
@@ -69,6 +69,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 | `test_schema_bq_consistency` | `FIELDS` 與 `models.py` 相符——否則忘記的欄位會**靜默**失敗（[ADR-0026](../adr/0026-fields-single-source.md)） |
 | `test_script_deps` | 唯讀探針不繼承寫入路徑的依賴樹（[ADR-0039](../adr/0039-observation-signals-own-dag.md)） |
 | `test_seed_demo` | 缺少的選填欄位不可以變成髒資料——產生器的跨模組不變式 |
+| `test_dag_param_injection` | 進 `bash_command` 的 string 型 DAG param 必須**同時**受約束（`pattern`）與被包裹（`\| q`）。worker 容器握有 `DB_URL`、`API_KEYS` 與 GCP 金鑰，**這條路徑的失效是任意程式碼執行，不是壞掉的參數** |
 
 **這些不是普通的單元測試。** 每一個都把一份紀律轉成一個機制，**而降級其中任何一個，都會移除它所保護的那個設計決策的正當性。**
 

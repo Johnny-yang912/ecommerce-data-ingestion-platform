@@ -10,7 +10,7 @@ What is tested, where, and — most importantly — **where the tests are blind*
 
 | Layer | Count | Where | Needs |
 |---|---|---|---|
-| Unit + integration (mock DB) | 437 | CI, `ci.yml` | nothing — seconds to run |
+| Unit + integration (mock DB) | 445 | CI, `ci.yml` | nothing — seconds to run |
 | DAG structure | 52 | CI, `dags.yml` | Airflow, no DB, no project env |
 | dbt | 93 | in the DAG | BigQuery |
 | Manual scripts | 3 | by hand | a real server + real Postgres |
@@ -69,6 +69,7 @@ A handful of tests exist to stop a future change from silently removing a guaran
 | `test_schema_bq_consistency` | `FIELDS` matches `models.py` — otherwise a forgotten column fails **silently** ([ADR-0026](../adr/0026-fields-single-source.md)) |
 | `test_script_deps` | the read-only probe does not inherit the write path's dependency tree ([ADR-0039](../adr/0039-observation-signals-own-dag.md)) |
 | `test_seed_demo` | missing optional fields must not become dirty data — a cross-module invariant on the generator |
+| `test_dag_param_injection` | a string-typed DAG param reaching `bash_command` must be **both** constrained (`pattern`) and quoted (`\| q`). The worker container holds `DB_URL`, `API_KEYS` and the GCP key, so a failure on this path is arbitrary code execution — not a bad parameter |
 
 **These are not ordinary unit tests.** Each one converts a discipline into a mechanism, and downgrading any of them removes the justification for the design decision it protects.
 

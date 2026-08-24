@@ -132,7 +132,7 @@ pytest
 | BI（Looker Studio 接 `rpt_`） | ✅ |
 | 告警 · 監控儀表板 | ⏸ 暫緩——閾值需要真實流量 |
 
-**393 個單元 + 整合測試**（受管模組 100% 覆蓋、Python 3.10/3.12 矩陣）· **52 個 DAG 測試**（獨立 workflow）· **93 個 dbt 測試**。
+**437 個單元 + 整合測試**（受管模組 100% 覆蓋、Python 3.10/3.12 矩陣）· **52 個 DAG 測試**（獨立 workflow）· **93 個 dbt 測試**。
 
 ⚠️ **CI 的綠燈不代表 DB 層契約已被驗證**——CAS、去重與崩潰恢復在 CI 裡用的是 mock 資料庫，靠手動腳本佐證。見 [design/testing](./docs/zh-TW/design/testing.md)。
 

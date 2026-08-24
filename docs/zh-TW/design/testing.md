@@ -10,12 +10,22 @@
 
 | 層 | 數量 | 在哪 | 需要 |
 |---|---|---|---|
-| 單元 + 整合（mock DB） | 393 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
+| 單元 + 整合（mock DB） | 437 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
 | DAG 結構 | 52 | CI，`dags.yml` | Airflow，不需 DB、不需專案環境變數 |
 | dbt | 93 | 在 DAG 內 | BigQuery |
 | 手動腳本 | 3 | 手動 | 真實 server + 真實 Postgres |
 
 單元測試覆蓋率為**受管的 12 個模組 100%**，跨 **Python 3.10 與 3.12** 矩陣。測試依賴釘在 `requirements-dev.txt`。
+
+> **這些數字會過期。重新取得它，而不是相信它**——上表最後一次核對是 2026-08-24：
+>
+> ```bash
+> pytest --collect-only -q | tail -1            # 單元 + 整合
+> pytest tests/test_dags.py --collect-only -q   # DAG（需 Airflow；本機自動跳過）
+> python -c "import json;print(sum(1 for r in json.load(open('ecommerce_dbt/target/run_results.json'))['results'] if r['unique_id'].startswith('test.')))"
+> ```
+>
+> **一個被寫進文件的數字，沒有任何機制讓它保持為真。指令有。**
 
 ---
 

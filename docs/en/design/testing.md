@@ -10,12 +10,22 @@ What is tested, where, and — most importantly — **where the tests are blind*
 
 | Layer | Count | Where | Needs |
 |---|---|---|---|
-| Unit + integration (mock DB) | 393 | CI, `ci.yml` | nothing — seconds to run |
+| Unit + integration (mock DB) | 437 | CI, `ci.yml` | nothing — seconds to run |
 | DAG structure | 52 | CI, `dags.yml` | Airflow, no DB, no project env |
 | dbt | 93 | in the DAG | BigQuery |
 | Manual scripts | 3 | by hand | a real server + real Postgres |
 
 Unit coverage is **100% of the 12 gated modules**, across a **Python 3.10 and 3.12** matrix. Test dependencies are pinned in `requirements-dev.txt`.
+
+> **These counts go stale. Regenerate them rather than trusting them** — the numbers above were last verified 2026-08-24:
+>
+> ```bash
+> pytest --collect-only -q | tail -1            # unit + integration
+> pytest tests/test_dags.py --collect-only -q   # DAG (needs Airflow; auto-skips locally)
+> python -c "import json;print(sum(1 for r in json.load(open('ecommerce_dbt/target/run_results.json'))['results'] if r['unique_id'].startswith('test.')))"
+> ```
+>
+> A number written into a document has no mechanism keeping it true. **The command does.**
 
 ---
 

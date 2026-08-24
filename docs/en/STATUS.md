@@ -122,7 +122,7 @@ The distinction that matters: **⛔ is "should not", ⏸ is "should but cannot",
 
 | Item | State | Detail |
 |---|---|---|
-| Unit + integration suite | ✅ | 393 tests, 100% coverage of gated modules, Python 3.10/3.12 matrix |
+| Unit + integration suite | ✅ | 437 tests, 100% coverage of gated modules, Python 3.10/3.12 matrix |
 | DAG parse suite | ✅ | 52 tests in a separate workflow, under official Airflow constraints |
 | dbt tests | ✅ | 93 tests including custom generic and singular invariants |
 | End-to-end against a real database | ⏸ | Container-startup flake maintenance costs more than the present risk |

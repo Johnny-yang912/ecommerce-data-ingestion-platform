@@ -85,6 +85,8 @@ import pendulum
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 
+from _notify import build_failure_callback
+
 DBT_DIR = "/opt/project/ecommerce_dbt"
 DBT = "/home/airflow/venvs/dbt/bin/dbt"
 
@@ -107,6 +109,12 @@ with DAG(
         "owner": "data-eng",
         # 不重試：stale 是 deterministic 的，重跑必然得到同一個答案。
         "retries": 0,
+        # ⚠️ 只在 error（50h）觸發。warn（26h）是 exit 0，task 綠燈、callback 不響——
+        #    也就是說「不新鮮」的第一個等級不會通知任何人。見 _notify.py 檔頭 ③。
+        "on_failure_callback": build_failure_callback(
+            "staging 的資料已 stale 超過 error 門檻。上游的抽取大概已經連續失敗兩晚，"
+            "先回頭看 orders_analytics_daily 而不是查這支。"
+        ),
     },
     tags=["observability", "dbt"],
     doc_md=__doc__,

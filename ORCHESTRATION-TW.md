@@ -384,6 +384,48 @@ DAG run 都是獨立、無記憶的取樣。另一個限制是故障域：它與
 compose。真正的告警要等 OTel（§4），而屆時第一條該寫的規則是 **absent**——
 「什麼都沒發生」正是 metrics 最不擅長回答的問題，而那正是這裡要抓的東西。
 
+⚠️ 2026-08-24 補上的失敗通知（§2.13）**沒有改變這一段的結論**：它讓「紅了」說得出話，
+但這支探針最該抓的「什麼都沒發生」仍然不會產生任何 task run，因此也不會有 failure。
+
+### 2.13 失敗通知：接線做完，通道留白 ⭐
+
+四支排程 DAG 的 `default_args` 掛上 `on_failure_callback`（`orchestration/dags/_notify.py`）。
+三個設計點：
+
+**① 訊息內容是「處置語意」，不是 task 名稱**
+
+`build_failure_callback()` 的參數是「這支紅了代表什麼、該先看哪裡」。這是 §1 那句
+「四支排程 DAG 互不相依、每一個的紅意味著不同處置」的落地位置——那個資訊原本只存在於
+各 DAG 檔的 docstring 裡，而**出事的人不會去讀 docstring**。
+
+**② 預設通道是 log，而不是先掛一個指向 Slack 的 notifier** ⭐
+
+指向不存在 connection 的 notifier，行為是：task 紅 → callback 觸發 → 拋例外 →
+Airflow 記 log → 沒有任何人收到東西。那正是 §3.5 與 collector 那段一再強調的形態，
+**「以為有告警但其實沒有」比「明擺著沒有告警」危險得多**。所以預設走一個必然送得出去
+的通道，真實通道由 `NOTIFY_WEBHOOK_URL` 啟用（見 `.env.example`），且失敗訊息一律
+帶上 `channel=`——看到 `channel=log` 就知道沒有人被通知，不必回頭翻設定確認。
+
+代價要講明白：**預設狀態下這不是告警**。log 與被監控系統同故障域、且要人主動去看。
+它買到的是訊息內容與接線，不是送達。
+
+**③ 掛在 task 層而非 DAG 層**
+
+下游進入 `upstream_failed` 不會觸發 `on_failure_callback`，所以
+`orders_analytics_daily` 七個 task 的鏈條斷掉只發一則，而那一則帶得出是哪個 task 斷的。
+`extract_*` 的 `retries=2` 也不會製造噪音——中途重試走 `on_retry_callback`。
+
+**涵蓋範圍（三個已知的洞，都要靠 §4 的 absent 告警補）**
+
+| 抓不到 | 為什麼 |
+|---|---|
+| 該跑卻沒跑 | 沒有 task run 就沒有 failure。Airflow 3 已移除 SLA 功能（`sla` 參數還在 `BaseOperator` 簽章裡，別依賴） |
+| 機器關機／斷網 | callback 與被監控系統同一台機器 |
+| `source_freshness_watch` 的 warn（26h） | `dbt source freshness` 的 warn 是 exit 0，task 綠燈 |
+
+實機驗證：`airflow tasks test` 跑一個必然失敗的 task，確認 Airflow 3.0.0 會呼叫
+callback、context 欄位取得到、訊息如期渲染（2026-08-24）。
+
 ---
 
 ## 3. Runbook
@@ -539,7 +581,8 @@ docker exec api-airflow-apiserver-1 airflow dags list-import-errors
 
 | 項目 | 為什麼不做 | 觸發點 |
 |---|---|---|
-| **OTel 的 absent 告警** | Traces 與營運 metrics 已於 2026-08-17 上線（見 README 藍圖），**但告警還沒寫**——擋住它的不再是技術。門檻必須從觀測推導（同 §2.12 ③），而這台機器**夜間是關的**、seeding 只在台北 10/13/17/21；現在寫規則，抓到的會是「筆電關機」而不是管線故障，每晚誤報一次，然後就會學會忽略它 | 累積 2–3 天真實開關機與 seeding 節奏之後。第一條規則仍是 **absent**（「這個來源多久沒送資料了」）而非業務指標，且必須寫在雲端側——它要偵測的正是「我這側已經沒辦法說話了」。見 §2.12 ④ |
+| **OTel 的 absent 告警** | Traces 與營運 metrics 已於 2026-08-17 上線（見 README 藍圖）。失敗通知已於 2026-08-24 補上（§2.13），但那只涵蓋「跑了而且失敗」——**「該跑卻沒跑」仍然沒有任何東西在看**。而 absent 規則的門檻必須從觀測推導（同 §2.12 ③），這台機器**夜間是關的**、seeding 只在台北 10/13/17/21；對連續訊號現在寫規則，抓到的會是「筆電關機」而不是管線故障，每晚誤報一次，然後就會學會忽略它 | 累積 2–3 天真實開關機與 seeding 節奏之後。⚠️ 這個「等觀測」的理由對**日批**其實不成立——`orders_analytics_daily` 的窗口直接來自 `schedule="30 22 * * *"`，不必量；而筆電在 22:30 是關的對日批是**真陽性**而非誤報。也就是說排程批次的 absent 規則今天就寫得出來，只是還沒寫。規則必須在雲端側——它要偵測的正是「我這側已經沒辦法說話了」。見 §2.12 ④ |
+| **失敗通知的真實通道** | 接線與訊息內容已完成（§2.13），但通道預設是 log。一個硬編在 repo 裡的 webhook URL 對讀者價值為零（他們也用不了），且會腐爛 | 設一個 `NOTIFY_WEBHOOK_URL` 即可，見 `.env.example` |
 | **Cosmos（模型級 task）** | 13 個 model，收益與相依成本不成比例 | model 數量成長到層級 task 看不清依賴時 |
 | **triggerer / deferrable** | 目前只有 `BashOperator` | 引入 sensor 時 |
 | **小時批** | 方案 A 的 watermark 精度被 DAY 分區卡死 | 改 HOUR 分區或換方案 B 時（[CLOUD_LAYER-TW §2.2](./CLOUD_LAYER-TW.md)）|
@@ -850,7 +893,7 @@ dataset。
 - ✅ `seed_demo_gate_demo`（Hard Gate 攔截劇本，手動觸發）
 - ✅ 映像（兩個隔離 venv）、compose overlay、env_var 版 `profiles.yml`
 - ✅ 全 compose 化（db/redis/api/worker/beat 與 Airflow 同一個 project、同一套資料）
-- ✅ `tests/test_dags.py`（47 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
+- ✅ `tests/test_dags.py`（52 支）+ 獨立 CI job（`.github/workflows/dags.yml`）
 - ✅ 實機驗證（2026-08-05）：映像建成、四個服務健康、3 條 DAG 由真實 dag-processor 解析且**零 import 錯誤**、
   兩個 venv 可用（dbt 1.11.12 / bigquery 1.11.3）、env_var 版 profile 在容器內連上 BQ、
   `source_freshness_watch` 完整 run 成功、`dbt_intermediate` 於容器內 PASS=27
@@ -862,6 +905,8 @@ dataset。
   四次皆冪等、ODS 未被修改、對照組留在 quarantine。完整數據見 §5.1、**§5.1.1**、§5.5
 - ✅ Celery + Redis（已實作，與本層正交；見 [QUEUE-TW.md](./QUEUE-TW.md)）
 - 🟡 OpenTelemetry — Traces + 營運 metrics 已上線（2026-08-17）；Airflow 接入與 absent 告警未做（見 §4）
+- 🟡 失敗通知 — 四支排程 DAG 的接線與處置語意已完成（2026-08-24，§2.13）；
+  傳輸通道預設為 log，接真通道是設一個環境變數。**「該跑卻沒跑」仍未涵蓋**
 - ⬜ 跨時區抽取的正式處置（§2.11 的 a/b/c 尚未選——沒有真實跨日界流量之前無法驗證）
 
 ## 7. 相依與版本

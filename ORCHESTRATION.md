@@ -436,6 +436,52 @@ limit is the failure domain: it lives in the same compose stack as the system it
 alerting waits for OTel (§4), and the first rule to write there is **absent** — "nothing happened at
 all" is precisely the question metrics are worst at answering, and precisely what this is for.
 
+⚠️ The failure notification added on 2026-08-24 (§2.13) **does not change this conclusion**: it gives
+"went red" a voice, but the thing this probe most needs to catch — "nothing happened at all" —
+produces no task run, and therefore no failure either.
+
+### 2.13 Failure notification: the wiring is done, the channel is left blank ⭐
+
+The four scheduled DAGs carry an `on_failure_callback` in `default_args`
+(`orchestration/dags/_notify.py`). Three design points:
+
+**① The message carries the *response*, not the task name**
+
+The argument to `build_failure_callback()` is "what this red means and where to look first". This is
+where §1's "the four scheduled DAGs depend on nothing but each other's time gaps, and each one's red
+means a different response" actually lands — that information previously existed only in each DAG
+file's docstring, and **the person handling the incident does not read docstrings**.
+
+**② The default channel is a log line, not a Slack notifier pointed at a connection that doesn't exist** ⭐
+
+A notifier pointed at a missing connection behaves like this: task goes red → callback fires → it
+raises → Airflow logs it → nobody receives anything. That is exactly the shape §3.5 and the collector
+config keep warning about: **"believing you have alerting when you don't" is far more dangerous than
+plainly having none**. So the default is a channel that cannot fail to deliver, the real channel is
+enabled by `NOTIFY_WEBHOOK_URL` (see `.env.example`), and every failure message carries `channel=` —
+seeing `channel=log` tells you nobody was notified, without going back to check the config.
+
+The cost stated plainly: **by default this is not alerting**. The log shares a failure domain with the
+system it watches and still requires someone to go look. What it buys is the message and the wiring,
+not delivery.
+
+**③ Attached at task level, not DAG level**
+
+Downstream tasks entering `upstream_failed` do not fire `on_failure_callback`, so a broken chain in
+`orders_analytics_daily` sends exactly one message — and that message names the task that actually
+broke. `extract_*`'s `retries=2` also creates no noise: intermediate retries go to `on_retry_callback`.
+
+**Coverage (three known holes, all of which need §4's absent alerting)**
+
+| Not caught | Why |
+|---|---|
+| Should have run, didn't | No task run means no failure. Airflow 3 removed the SLA feature (the `sla` parameter survives in the `BaseOperator` signature — do not rely on it) |
+| Machine off / network down | The callback lives on the same machine as the system it watches |
+| `source_freshness_watch`'s warn (26h) | `dbt source freshness` exits 0 on warn, so the task is green |
+
+Verified on the real stack: `airflow tasks test` against a task that must fail, confirming Airflow
+3.0.0 invokes the callback, the context fields resolve, and the message renders (2026-08-24).
+
 ---
 
 ## 3. Runbook
@@ -611,7 +657,8 @@ that a retry would clear.
 
 | Item | Why not | Trigger |
 |---|---|---|
-| **OTel absent alerting** | Traces and operational metrics went live on 2026-08-17 (see the README roadmap), **but the alert itself is still unwritten** — and what blocks it is no longer technical. The threshold must be derived from observation (same discipline as §2.12 ③), yet this machine is **powered off overnight** and seeding only runs at 10/13/17/21 Taipei; a rule written today would catch "the laptop is off" rather than a pipeline fault, firing every night until you learn to ignore it | After 2–3 days of real power-cycle and seeding cadence. The first rule is still **absent** ("how long since this source sent anything") rather than a business metric, and it must live on the cloud side — what it detects is precisely "my side can no longer speak". See §2.12 ④ |
+| **OTel absent alerting** | Traces and operational metrics went live on 2026-08-17 (see the README roadmap). Failure notification followed on 2026-08-24 (§2.13), but that only covers "ran and failed" — **"should have run, didn't" still has nothing watching it**. And an absent rule's threshold must be derived from observation (same discipline as §2.12 ③), yet this machine is **powered off overnight** and seeding only runs at 10/13/17/21 Taipei; for a continuous signal, a rule written today would catch "the laptop is off" rather than a pipeline fault, firing every night until you learn to ignore it | After 2–3 days of real power-cycle and seeding cadence. ⚠️ That "wait for observation" argument does **not** actually hold for a **daily batch** — `orders_analytics_daily`'s window comes straight from `schedule="30 22 * * *"` and needs no measurement, and a laptop that is off at 22:30 is a **true positive** for a batch, not a false alarm. So the batch absent rule is writable today; it simply hasn't been written. The rule must live on the cloud side — what it detects is precisely "my side can no longer speak". See §2.12 ④ |
+| **A real transport for failure notification** | The wiring and the message content are done (§2.13), but the channel defaults to a log line. A webhook URL hardcoded into the repo is worth nothing to a reader (they cannot use it either) and will rot | Set `NOTIFY_WEBHOOK_URL`; see `.env.example` |
 | **Cosmos (model-level tasks)** | 13 models; benefit is out of proportion to the dependency cost | When model count makes layer-level tasks too coarse to read |
 | **triggerer / deferrable** | Only `BashOperator` today | When sensors are introduced |
 | **Hourly batches** | Plan A's watermark precision is capped by DAY partitioning | When switching to HOUR partitioning or Plan B ([CLOUD_LAYER §2.2](./CLOUD_LAYER.md)) |
@@ -956,7 +1003,7 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
 - ✅ `seed_demo_gate_demo` (Hard Gate interception script, manual)
 - ✅ Image (two isolated venvs), compose overlay, env_var-driven `profiles.yml`
 - ✅ Fully in compose (db/redis/api/worker/beat and Airflow in one project, on one dataset)
-- ✅ `tests/test_dags.py` (47 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
+- ✅ `tests/test_dags.py` (52 tests) + a dedicated CI job (`.github/workflows/dags.yml`)
 - ✅ Verified live (2026-08-05): image builds, all four services healthy, three DAGs parsed by the
   real dag-processor with **zero import errors**, both venvs working (dbt 1.11.12 / bigquery 1.11.3),
   the env_var profile connecting to BQ from inside the container, a full successful
@@ -971,6 +1018,9 @@ not taken effect, but because BQ still held the pre-accumulation state. Handling
   quarantined. Full figures in §5.1, **§5.1.1**, and §5.5
 - ✅ Celery + Redis (implemented, orthogonal to this layer; see [QUEUE.md](./QUEUE.md))
 - 🟡 OpenTelemetry — traces + operational metrics are live (2026-08-17); Airflow integration and absent alerting are not (see §4)
+- 🟡 Failure notification — wiring and per-DAG response semantics are done for the four scheduled DAGs
+  (2026-08-24, §2.13); the transport defaults to a log line and a real channel is one env var away.
+  **"Should have run, didn't" is still uncovered**
 - ⬜ A formal resolution for cross-timezone extraction (§2.11's a/b/c remain unchosen — none can be
   validated without real traffic crossing the day boundary)
 

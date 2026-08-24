@@ -123,6 +123,8 @@ import pendulum
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 
+from _notify import build_failure_callback
+
 PROJECT_DIR = "/opt/project"
 PY_ANALYTICS = "/home/airflow/venvs/analytics/bin/python"
 
@@ -202,6 +204,9 @@ with DAG(
         "owner": "data-eng",
         "retries": 0,       # 見檔頭 ⑤
         "email_on_failure": False,
+        "on_failure_callback": build_failure_callback(
+            "唯一的資料來源停了。這一時段沒有新訂單，當晚的抽取與隔天的報表都會是空的增量。"
+        ),
     },
     user_defined_macros={
         "SLOT_SIZES": SLOT_SIZES,

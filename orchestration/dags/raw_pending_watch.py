@@ -97,6 +97,8 @@ import pendulum
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 
+from _notify import build_failure_callback
+
 PROJECT_DIR = "/opt/project"
 PY_ANALYTICS = "/home/airflow/venvs/analytics/bin/python"
 
@@ -121,6 +123,10 @@ with DAG(
         "owner": "data-eng",
         "retries": 0,       # 見檔頭 ⑦
         "email_on_failure": False,
+        "on_failure_callback": build_failure_callback(
+            "派工路徑在漏：有 Raw 列超過恢復路徑的自癒時間仍未被取走。"
+            "先看 worker 與 broker 是否還活著，再看熔斷器狀態。"
+        ),
     },
     tags=["observability", "ingestion"],
     doc_md=__doc__,

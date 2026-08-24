@@ -112,6 +112,8 @@ import pendulum
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 
+from _notify import build_failure_callback
+
 PROJECT_DIR = "/opt/project"
 DBT_DIR = f"{PROJECT_DIR}/ecommerce_dbt"
 PY_ANALYTICS = "/home/airflow/venvs/analytics/bin/python"
@@ -126,6 +128,12 @@ default_args = {
     "owner": "data-eng",
     "depends_on_past": False,
     "email_on_failure": False,
+    # 掛在 task 層而非 DAG 層：下游進入 upstream_failed 不會觸發 on_failure_callback，
+    # 所以七個 task 的鏈條斷掉只會發一則，而那一則帶得出是哪個 task 斷的。
+    # extract_* 設了 retries=2，中途重試走 on_retry_callback，這裡只在重試耗盡後響。
+    "on_failure_callback": build_failure_callback(
+        "分析管線斷了，隔天早上的報表停在前一天。先看是 extract 還是哪一層 dbt。"
+    ),
 }
 
 

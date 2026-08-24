@@ -72,6 +72,11 @@ x-airflow-common: &airflow-common
     # dbt 讀版控中的 env_var 版 profile，你本機的 ~/.dbt/profiles.yml 不受影響。
     DBT_PROFILES_DIR: /opt/project/orchestration/dbt_profiles
     LOG_FORMAT: json
+    # 失敗通知的通道（見 orchestration/dags/_notify.py）。刻意【不】用 `${...:?}`
+    # 守衛——對照 otel-collector 的 GRAFANA_OTLP_*，那兩個缺值就必然 401，起來也沒用；
+    # 這裡「沒設定」是合法狀態（通道退回 log），拿它擋住整組 Airflow 啟動是過度反應。
+    NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+    NOTIFY_WEBHOOK_TIMEOUT_S: ${NOTIFY_WEBHOOK_TIMEOUT_S:-3}
   volumes:
     - ./orchestration/dags:/opt/airflow/dags:ro
     # ⚠️ 專案原始碼在此是 bind mount，而 api/worker/beat 是【烤進映像】的。

@@ -333,7 +333,7 @@ raw table 的 order_id 欄位只有 index，沒有 UNIQUE 約束，100 筆重複
 
 每次 push 到 `main` 與所有 Pull Request 會自動觸發 GitHub Actions（`.github/workflows/ci.yml`），在 **Python 3.10 與 3.12** 雙版本矩陣下安裝依賴並執行完整測試套件（393 個測試，受管模組 100% 覆蓋）。
 
-另有一條**獨立的 DAG workflow**（`.github/workflows/dags.yml`，47 個測試）：以官方 constraints 安裝 Airflow 並用 DagBag 解析 `orchestration/dags/`。刻意不併進主 job——Airflow 安裝很重且 pin 了大量套件版本，會毀掉主 job「mock DB、數秒跑完」的速度優勢。它不需要 `DB_URL`，因為 DAG 檔刻意不 top-level import 專案模組（見 [ORCHESTRATION-TW §2.2](./ORCHESTRATION-TW.md)）。
+另有一條**獨立的 DAG workflow**（`.github/workflows/dags.yml`，52 個測試）：以官方 constraints 安裝 Airflow 並用 DagBag 解析 `orchestration/dags/`。刻意不併進主 job——Airflow 安裝很重且 pin 了大量套件版本，會毀掉主 job「mock DB、數秒跑完」的速度優勢。它不需要 `DB_URL`，因為 DAG 檔刻意不 top-level import 專案模組（見 [ORCHESTRATION-TW §2.2](./ORCHESTRATION-TW.md)）。
 
 - 測試全為單元/整合層（mock DB），不需真實資料庫即可執行，數秒內完成。
 - 測試依賴集中於 `requirements-dev.txt`（`-r requirements.txt` + pytest 等）。
@@ -589,7 +589,7 @@ Looker Studio（直連 BigQuery）
 - [v] Rate Limiting — per-client 限流（slowapi，以認證 `client_id` 為 key、IP fallback），`POST /orders` 60/min、`POST /process_raw` 20/min、`GET /raw` 120/min；不加全域上限（見設計決策）
 
 **Phase 2 — 可驗證性**
-- [v] Pytest — 393 個測試，12 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 47 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
+- [v] Pytest — 393 個測試，12 個受管模組全部 100% 覆蓋（`pytest --cov`；另有 52 個 DAG 測試跑在獨立 CI job）；涵蓋所有 retry 路徑（Point 1–4）、CAS claim、idempotency、crash recovery scan、`format_clean`、`business_clean`、`ODSOrder.from_nested`、quality_events 各寫入路徑、API Key 驗證（缺失/無效/有效/輪替/parser 容錯）；`asyncio_mode=auto` 取代手寫 `asyncio.run()`；`reset_limiter` fixture 解決 rate limit 計數器跨測試污染問題；驗證以 `dependency_overrides` 旁路，讓非 auth 測試不必每個請求塞 header。目前僅單元測試與整合測試（HTTP 層），無端到端測試；待 Phase 3 Docker / docker-compose 建立後，再補上真實 DB 的 E2E 測試。
 - [v] 資料品質控管架構（ODS 層）— 完整設計文件（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md)）；ODS 層已實作：`DQ_RULE_VERSION` 規則版本常數、`dq_rule_version` 欄位（ODS）、`quality_events` 表（append-only 品質事件日誌，狀態機起點）、structlog `quality_metric` 事件；BQ Analytics 層（Hard Gate、Row Filter、`int_orders_quarantine`、Airflow 重評估、`rpt_quality_*`）除 Airflow 重評估外皆已實作
 
 **Phase 3 — 工程化**
@@ -608,6 +608,7 @@ Looker Studio（直連 BigQuery）
 
 **Phase 5 — 自動化 + Queue 升級**
 - [v] Airflow（本地，3.0.0 + LocalExecutor）六條 DAG，排程一律以 `Asia/Taipei` 顯式宣告——`seed_demo_daily`（模擬上游＝本系統唯一的資料來源，10/13/17/21 各一批共 800 筆/天）、`raw_pending_watch`（派工存活探針，每個 seeding 時段後 30 分鐘；門檻由恢復路徑的設定推導而非寫死）、`orders_analytics_daily`（22:30，2 個 extract task → 4 層 `dbt build` → 完整 `dbt test`）、`source_freshness_watch`（08:00，extract 的 backstop）、`dq_reevaluation`（Proposal B，手動觸發、預設 dry-run、commit 後自動接主 DAG）、`seed_demo_gate_demo`（Hard Gate 攔截劇本，手動觸發）。**四條有排程的 DAG 之間沒有 Airflow 層級的相依，時序契約只存在於時間差裡**，且各自的紅代表不同處置——這是它們被拆開的全部理由。dbt 與分析腳本各自獨立 venv；DAG 檔不 import 專案模組故可進 CI；決策見 [ORCHESTRATION-TW.md](./ORCHESTRATION-TW.md)
+- [v] 失敗通知（`orchestration/dags/_notify.py`，2026-08-24）——四條排程 DAG 掛上 `on_failure_callback`，訊息帶的是**處置語意**（「分析管線斷了，隔天早上的報表停在前一天」）而非 task 名稱：那個資訊原本只存在於 DAG 檔的 docstring 裡，而出事的人不會去讀 docstring。掛在 task 層而非 DAG 層，因為下游的 `upstream_failed` 不觸發 callback → 七個 task 的鏈條斷掉只發一則，且帶得出是哪個 task 斷的。⚠️ **傳輸通道預設是 log，接真通道是設一個 `NOTIFY_WEBHOOK_URL`**——刻意不先掛一個指向不存在 connection 的 notifier，因為那的行為是「紅 → callback 觸發 → 拋例外 → 沒有任何人收到」，而**「以為有告警但其實沒有」比「明擺著沒有告警」危險得多**；故失敗訊息一律帶 `channel=`，看到 `channel=log` 就知道沒有人被通知。**只涵蓋「跑了而且失敗」**：該跑沒跑（Airflow 3 已移除 SLA）、機器關機、以及 freshness 的 warn（exit 0、task 綠）都抓不到，那三個洞要靠 absent 告警。見 [ORCHESTRATION-TW §2.13](./ORCHESTRATION-TW.md)
 - [v] Proposal B 事件產生端（`reevaluate_quality.py`）——候選讀 BQ `int_` 層（與 Row Filter 同一份有效品質狀態定義）、狀態判定讀 PG（冪等不能建立在有保留期的鏡射上）、只在狀態改變時 append；`business_clean` 加 `as_of` 讓時間相依規則可重現，`NON_REPRODUCIBLE_CODES` 擋掉「證據消失式」的偽 promote
 - [v] Celery + Redis（取代 BackgroundTasks）——`process_raw_event` 以薄包裝進 Celery task（`process.py` 零 Celery 依賴，保留手動補跑的救援路徑）；不開 result backend（任務狀態的真相是 `raw.status`）；`acks_late` + `reject_on_worker_lost`；broker 掛掉時 `POST /orders` 仍回 200 `pending`，由恢復掃描接手。設計與實測見 [QUEUE-TW.md](./QUEUE-TW.md)
 - [v] 恢復掃描搬到 Celery Beat——原本掛在 FastAPI lifespan 的 asyncio 迴圈是行程內狀態，移走後 API 才得以多行程；Beat 啟動時另補一次掃描，填住第一個排程間隔的空窗
@@ -624,4 +625,4 @@ Looker Studio（直連 BigQuery）
 - [ ] OpenTelemetry 未竟項
   - **業務 / DQ Metrics**：刻意緩做。`seed_demo_daily` 的髒率是每日決定性五選一 → **日內恆定**，分鐘級 error rate 答不出 `rpt_quality_events_daily` 沒說過的事；高基數切片按定義屬倉裡（見 [DQ_ARCHITECTURE-TW.md](./DQ_ARCHITECTURE-TW.md) 的層次一/二邊界）
   - **Airflow 接入**：Collector 已備妥（明文送本機即可），待查證 Airflow 內建 OTel 輸出的認證能力
-  - **absent 告警與 dashboard**：門檻必須從觀測推導，而本機夜間關機會讓規則天天誤報——需先累積 2–3 天真實節奏
+  - **absent 告警與 dashboard**：對**連續訊號**而言門檻必須從觀測推導，而本機夜間關機會讓規則天天誤報——需先累積 2–3 天真實節奏。⚠️ 這個理由**不延伸到排程批次**：`orders_analytics_daily` 的窗口直接來自它的 cron 宣告，而筆電在 22:30 是關的，對日批是真陽性而非誤報。失敗通知（見上方 Phase 5）已涵蓋「跑了而且失敗」，「該跑卻沒跑」正是這些規則要補的洞

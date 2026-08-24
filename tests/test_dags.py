@@ -11,6 +11,7 @@
 pin 打架。見 .github/workflows/dags.yml。
 """
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,11 @@ pytest.importorskip("airflow.models", reason="DAG 測試需要 Airflow，見 .gi
 from airflow.models.dagbag import DagBag  # noqa: E402
 
 DAGS_FOLDER = str(Path(__file__).resolve().parent.parent / "orchestration" / "dags")
+
+# DAG 檔之間共用的模組（`_notify`）靠「dags 資料夾在 import 路徑上」被找到。
+# Airflow 執行時與 DagBag 解析時都會自己加，但這裡有測試【不經過 DagBag】直接
+# import _notify，故顯式加上，讓那些測試不依賴 fixture 的執行順序。
+sys.path.insert(0, DAGS_FOLDER)
 
 
 @pytest.fixture(scope="module")
@@ -414,3 +420,63 @@ class TestDqReevaluation:
         append-only 表更重要。"""
         for task in dag.tasks:
             assert task.retries == 0
+
+
+class TestFailureNotification:
+    """失敗通知的接線。
+
+    這組測試守的是【漏掛】——一支排程 DAG 沒掛 callback 的後果不是報錯，
+    而是它安靜地不通知任何人，跟其他三支看起來一模一樣。日後新增排程 DAG 時，
+    SCHEDULED_DAG_IDS 這份清單就是提醒你補上的地方。
+    """
+
+    # 排程執行的四支：沒人盯著，失敗必須主動說話。
+    SCHEDULED_DAG_IDS = [
+        "orders_analytics_daily",
+        "seed_demo_daily",
+        "raw_pending_watch",
+        "source_freshness_watch",
+    ]
+
+    # 人工觸發的兩支：觸發的人就在旁邊看著 UI，通知是噪音。
+    MANUAL_DAG_IDS = ["seed_demo_gate_demo", "dq_reevaluation"]
+
+    def test_scheduled_dags_notify_on_failure(self, dagbag):
+        for dag_id in self.SCHEDULED_DAG_IDS:
+            for task in dagbag.dags[dag_id].tasks:
+                assert task.on_failure_callback, (
+                    f"{dag_id}.{task.task_id} 沒有 on_failure_callback："
+                    f"它失敗時不會通知任何人"
+                )
+
+    def test_manual_dags_do_not_notify(self, dagbag):
+        """反向斷言：避免日後有人「順手全部加上」而讓手動 DAG 也開始吵。"""
+        for dag_id in self.MANUAL_DAG_IDS:
+            for task in dagbag.dags[dag_id].tasks:
+                assert not task.on_failure_callback, (
+                    f"{dag_id}.{task.task_id} 掛了 on_failure_callback，"
+                    f"但它是人工觸發的"
+                )
+
+    def test_every_scheduled_dag_is_covered_by_this_list(self, dagbag):
+        """清單不得與實際的排程 DAG 漂移——否則新增一支排程 DAG 時，
+        上面那條斷言會因為「不在清單裡」而靜默地放它過去。"""
+        scheduled = {
+            dag_id for dag_id, dag in dagbag.dags.items() if dag.schedule is not None
+        }
+        assert scheduled == set(self.SCHEDULED_DAG_IDS)
+
+    def test_default_channel_is_log(self):
+        """預設不得指向任何外部端點：clone 下來就能跑，且不會出現一個
+        指向不存在端點、實際上誰也通知不到的 callback。見 _notify.py 檔頭 ①。"""
+        import _notify
+
+        assert _notify.CHANNEL == _notify.CHANNEL_LOG
+
+    def test_notification_never_raises(self):
+        """通知在組裝或送出時拋例外 = 通知消失，而且 Airflow 記下的會是
+        「通知系統壞了」而不是「你的 DAG 壞了」。故意餵一個空 context。"""
+        import _notify
+
+        callback = _notify.build_failure_callback("測試用語意")
+        callback({})          # 沒有 task_instance / dag_run / exception

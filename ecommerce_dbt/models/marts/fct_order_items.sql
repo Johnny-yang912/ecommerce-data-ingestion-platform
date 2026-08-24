@@ -51,7 +51,7 @@ select
 
     -- ── line 度量 ───────────────────────────────────────────────────────────
     -- 全部承自 int_order_items 的 safe_cast + 嚴格 NULL 傳播：任一輸入為 NULL
-    -- 則衍生金額為 NULL。刻意不 COALESCE（CLOUD_LAYER-TW §5.5.5），
+    -- 則衍生金額為 NULL。刻意不 COALESCE（docs/zh-TW/design/cloud-layer.md），
     -- 訂單層的加總可信度由 fct_orders.items_missing_amount 表達。
     i.quantity,
     i.unit_price,

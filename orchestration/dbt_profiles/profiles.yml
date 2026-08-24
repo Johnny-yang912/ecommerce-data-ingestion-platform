@@ -20,7 +20,7 @@ ecommerce_dbt:
       keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS') }}"
       project: "{{ env_var('BQ_PROJECT') }}"
       dataset: "{{ env_var('BQ_DBT_DATASET', 'dbt_dev') }}"
-      location: US                     # 所有 dataset 一致在 US（CLOUD_LAYER §1.5）
+      location: US                     # 所有 dataset 一致在 US（docs/en/design/cloud-layer.md）
       threads: 4
       job_execution_timeout_seconds: 300
       # BQ 的暫時性錯誤（5xx / rateLimitExceeded）在 adapter 層重試，比 Airflow

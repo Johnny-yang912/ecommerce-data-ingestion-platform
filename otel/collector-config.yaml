@@ -8,7 +8,7 @@
 #
 # 故障域：這個 Collector 與被監控的系統住在同一組 compose，主機睡著時一起死。
 # 這【不是缺陷】——那正是雲端側 absent 告警要偵測的東西。存活告警不能與被監控的
-# 系統同生共死（見 ORCHESTRATION-TW.md §4）。
+# 系統同生共死（見 docs/zh-TW/design/orchestration.md）。
 
 receivers:
   otlp:

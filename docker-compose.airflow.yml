@@ -81,7 +81,7 @@ x-airflow-common: &airflow-common
     - ./orchestration/dags:/opt/airflow/dags:ro
     # ⚠️ 專案原始碼在此是 bind mount，而 api/worker/beat 是【烤進映像】的。
     #    改 clean.py 之類的共用模組時，這一邊立刻生效、那一邊要 build——
-    #    規則版本會因此無聲分歧，見 ORCHESTRATION-TW §3.3 第 3 步。
+    #    規則版本會因此無聲分歧，見 docs/zh-TW/runbooks/proposal-b-rollout.md 第 3 步。
     - ./:/opt/project:rw
     # 金鑰單檔唯讀掛到固定路徑。左側由 compose 在【主機】上替換，右側是【容器內】路徑。
     # ⭐ 來源檔不存在時，容器會在 create 階段就 exit 127——這是刻意選的失敗方式。

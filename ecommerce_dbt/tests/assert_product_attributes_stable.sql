@@ -9,7 +9,7 @@
 -- ⚠️ severity 刻意是 warn，不是 error：
 --   這是【上游契約訊號】，不是本層的正確性缺陷——product_id 若無法唯一決定商品屬性，
 --   該修的是上游或 data contract，不是讓整條 DAG 停下來。判斷邏輯與
---   DQ_ARCHITECTURE-TW 的 has_schema_drift 一致：drift 沒有攔截權限，只能告警。
+--   docs/zh-TW/design/data-quality.md 的 has_schema_drift 一致：drift 沒有攔截權限，只能告警。
 --   （對照組：assert_orders_split_is_partition 與 assert_fct_orders_* 是 error，
 --     因為那些是【我們自己的 SQL 對不對】。）
 --

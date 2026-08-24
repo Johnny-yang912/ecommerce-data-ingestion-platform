@@ -101,7 +101,7 @@ def scan_and_dispatch_task() -> int:
     掃描迴圈。把它移出去，API 行程才真正無狀態、可水平擴展。
 
     **持久化佇列並沒有讓這個掃描變成冗餘**，反而讓它更關鍵——它負責的正是佇列
-    自己救不回來的那一半，見 QUEUE-TW.md〈CAS claim 與重新投遞的交互作用〉：
+    自己救不回來的那一半，見 docs/zh-TW/design/queue.md〈CAS claim 與重新投遞的交互作用〉：
       - worker 崩在 claim commit 之前 → status 仍 pending，訊息重投遞就能自行復原。
       - worker 崩在 claim commit 之後 → status 已是 processing，重投遞會 CAS 失敗、
         任務直接 return。**只有這裡的 stale 掃描能救它。**

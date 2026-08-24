@@ -220,7 +220,7 @@ class TestPlanEvents:
         """⭐ v3 的實際回流案例：age=125 在 v2（上限 120）被隔離，v3（上限 130）通過。
 
         `seed_demo._dirty_age_out_of_range` 會注入 125，所以這條路徑在真實資料上
-        走得通——它是 ORCHESTRATION-TW §3.3 demo 劇本的自動化版本。
+        走得通——它是 docs/zh-TW/runbooks/proposal-b-rollout.md demo 劇本的自動化版本。
         """
         row = make_row(raw_id=125, age=125,
                        clean_error_message=codes(DQCode.AGE_OUT_OF_RANGE))

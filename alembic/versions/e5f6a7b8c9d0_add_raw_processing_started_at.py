@@ -10,7 +10,7 @@ Create Date: 2026-08-10 14:20:00.000000
 躺了多久」，而不是「這次處理跑了多久」。平時兩者幾乎相等，積壓時則相差極大——
 於是正在被處理的記錄會被誤判為逾時、收回改回 pending 並重新派工，造成同一個
 raw_id 被兩個 worker 並行處理（CAS 擋不住，因為狀態已被第三方倒退回 pending）。
-詳見 process.scan_and_recover 的時間軸說明與 QUEUE-TW.md §3.1。
+詳見 process.scan_and_recover 的時間軸說明與 docs/zh-TW/design/queue.md。
 
 Backfill：升級當下已在 processing 的記錄補上 received_at 作為近似值。不補的話
 它們的 processing_started_at 為 NULL，永遠不符合 stale 條件 → 永久卡死。

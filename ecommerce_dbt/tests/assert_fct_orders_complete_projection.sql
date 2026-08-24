@@ -1,6 +1,6 @@
 -- 完整投影不變式：Gold 不得靜默掉列
 --
--- 攔截已經在 int_ 層做完了（DQ_ARCHITECTURE-TW 機制二）——fct_orders 對 int_orders
+-- 攔截已經在 int_ 層做完了（docs/zh-TW/design/data-quality.md 機制二）——fct_orders 對 int_orders
 -- 應該是【無損投影】，不再過濾任何一列。這支測試守的就是那個契約，
 -- 它要抓的是「某個 join 悄悄變成 INNER」這類失效（Gold 最危險的失效模式，
 -- 因為它不報錯、只是數字慢慢變小）。

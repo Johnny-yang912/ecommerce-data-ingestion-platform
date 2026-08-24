@@ -6,7 +6,7 @@
 --   ★ 去重鍵＝id（事件 PK），【不是】raw_id——quality_events 是狀態機日誌，
 --     一個 raw_id 合法地有多個事件（initial_evaluation → promotion → rejection…）。
 --     照 raw_id 去重會把事件歷史壓成一列、毀掉狀態機。「按 raw_id 取最新狀態」的
---     收斂是下游 int_ 的責任（見 DQ_ARCHITECTURE-TW〈機制二：Row Filter〉），不在此層。
+--     收斂是下游 int_ 的責任（見 docs/zh-TW/design/data-quality.md〈機制二：Row Filter〉），不在此層。
 --
 -- 物化＝incremental + insert_overwrite，依 event_at(DAY) 分區（比照 stg_orders）：
 --   例行跑批只重算「回看窗」內的近期分區，成本 ∝ 近期資料、不隨歷史總量成長。

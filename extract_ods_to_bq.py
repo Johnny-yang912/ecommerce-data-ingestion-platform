@@ -23,7 +23,7 @@
     python extract_ods_to_bq.py --table orders       # 單表，供 Airflow 一表一 task
 
   單表模式是 Phase 5 的形狀：gate 從「腳本內彙整後 raise」搬到「Airflow 的依賴邊」——
-  dbt task 的上游＝兩個 extract task 都 success，語意與 ② 完全相同（見 CLOUD_LAYER-TW §3.2）。
+  dbt task 的上游＝兩個 extract task 都 success，語意與 ② 完全相同（見 docs/zh-TW/design/cloud-layer.md）。
   之所以值得拆，是因為 ① 的自癒本來就是【逐表】的：一張失敗只該重試那一張，
   合成一個 task 會讓重試連帶重跑已經成功的另一張，也看不出是哪張壞了。
 """

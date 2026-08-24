@@ -99,7 +99,7 @@ class TestScanAndRecover:
 
 # ─── 逾時基準：processing_started_at ⭐ ───────────────────────────────────────
 #
-# 這組守的是一個實測過的迴歸（見 QUEUE-TW.md §3.1／§5.4）：逾時基準若用 received_at，
+# 這組守的是一個實測過的迴歸（見 docs/zh-TW/design/queue.md）：逾時基準若用 received_at，
 # 積壓中的記錄會在「剛被搶佔、正在處理」時就符合逾時條件，被掃描收回改回 pending
 # 並重新派工 → 同一個 raw_id 兩個 worker 並行 → 落敗方被誤標為 duplicate。
 # CAS 擋不住這件事，因為狀態是被第三方倒退回 pending 的。

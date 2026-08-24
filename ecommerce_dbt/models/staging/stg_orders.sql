@@ -1,11 +1,11 @@
 -- stg_orders：ODS.orders 的 Silver 入口
 --
--- 職責（DQ_ARCHITECTURE-TW Q0 / CLOUD_LAYER-TW）：
+-- 職責（docs/zh-TW/design/data-quality.md / docs/zh-TW/design/cloud-layer.md）：
 --   1. 1:1 對應 ODS，型別對齊、欄位命名標準化（顯式欄位清單＝改名接縫）
 --   2. 品質＝與 ODS 相同：保留所有資料「含髒的」（has_clean_error 不過濾；攔截在 int_）
 --   3. 把 staging 的 append 重複列還原回 ODS 粒度（去重）
 --
--- 物化＝incremental + insert_overwrite，依 received_at(DAY) 分區（見 CLOUD_LAYER-TW §1.2）：
+-- 物化＝incremental + insert_overwrite，依 received_at(DAY) 分區（見 docs/zh-TW/design/cloud-layer.md）：
 --   例行跑批只重算「回看窗」內的近期分區，成本 ∝ 近期資料、不隨歷史總量成長。
 --   正確性靠不變式「同 raw_id 的所有副本都在同一 received_at 分區」：insert_overwrite
 --   整分區原子覆寫，窗內去重完整無漏。首建 / --full-refresh 走全表路徑。
@@ -16,7 +16,7 @@
 --
 -- on_schema_change='append_new_columns'：加欄走 ALTER ADD COLUMN（metadata、免費、
 --   既有列自動 NULL），只覆寫回看窗分區，避開大表 --full-refresh 的全表掃＋全分區重寫成本。
---   成本 ∝ 近期資料，是 staging 端 ALLOW_FIELD_ADDITION 的鏡像（CLOUD_LAYER-TW §5.2）。
+--   成本 ∝ 近期資料，是 staging 端 ALLOW_FIELD_ADDITION 的鏡像（docs/zh-TW/design/cloud-layer.md）。
 --   觸發閘門＝下方顯式欄位清單：staging 靠 ALLOW_FIELD_ADDITION 長的欄，未加進 SELECT 前
 --   偵測不到、不會自己 ALTER——只在刻意改清單（進 git、被 review）時才觸發，不吃 drift。
 --   刻意不用 sync_all_columns：它會 DROP 欄，牴觸「staging 只做加法、刪欄留 legacy」（§5.2/§5.3）。

@@ -3,7 +3,7 @@
     reevaluate ─► should_refresh (commit 才通過) ─► trigger orders_analytics_daily
 
 事件產生端是 `reevaluate_quality.py`；本 DAG 只負責「什麼時候跑、跑完接什麼」。
-設計與邊界見 DQ_ARCHITECTURE-TW〈Proposal B〉與 ORCHESTRATION-TW.md。
+設計與邊界見 docs/zh-TW/design/data-quality.md〈Proposal B〉與 docs/zh-TW/design/orchestration.md。
 
 ────────────────────────────────────────────────────────────────────────────
 ① `schedule=None`：這是**事件驅動的操作，不是週期性作業** ⭐

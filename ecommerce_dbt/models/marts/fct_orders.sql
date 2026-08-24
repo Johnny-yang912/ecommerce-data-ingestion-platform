@@ -9,7 +9,7 @@
 --   理由與 int_ 層「刻意複製 + assert_orders_split_is_partition 買回風險」同構：
 --   用一支測試把「兩處數字可能不一致」從紀律保證升級成機制保證，換來單表可查詢。
 --
--- ⭐ 嚴格 NULL 傳播在 rollup 處的陷阱（CLOUD_LAYER-TW §5.5.5）：
+-- ⭐ 嚴格 NULL 傳播在 rollup 處的陷阱（docs/zh-TW/design/cloud-layer.md）：
 --   int_order_items 的金額是嚴格 NULL 傳播的（任一輸入 NULL → 結果 NULL），
 --   而 BQ 的 SUM() 【會靜默忽略 NULL】——一筆訂單裡只要有一個 item 的 discount_pct
 --   safe_cast 失敗，訂單總額就會少算一個品項，不報錯、不留痕跡。
@@ -39,7 +39,7 @@
 --   歧義改用文件補（見 _marts__models.yml 該欄描述）。
 --
 -- 分區（決策：見 README.zh-TW §6.2）：按 order_date(DAY)，因為 Gold 服務分析師，
---   最常、最貴的查詢是按業務時間過濾（CLOUD_LAYER-TW §1.2）。
+--   最常、最貴的查詢是按業務時間過濾（docs/zh-TW/design/cloud-layer.md）。
 --   實測（2026-08，540 筆）：cluster_by 單獨已裁掉 82% 掃描量，分區再往下拿 9pp——
 --   分區的主要價值不在裁切量，而在【成本可預測】（分區裁切由 metadata 在查詢前決定，
 --   dry run 準確；clustering 是 block 級、dry run 會高估）與【分區級操作】。
@@ -50,7 +50,7 @@
 --
 -- ⚠️ partition_expiration_days 用 var gate 住，預設不輸出：BQ sandbox 硬鎖 60 天，
 --   任何 > 60 天的設定會讓 job 回 billingNotEnabled 而【整個 dbt run 失敗】
---   （實測見 CLOUD_LAYER-TW §1.7）。啟用帳單後：
+--   （實測見 docs/zh-TW/design/cloud-layer.md）。啟用帳單後：
 --     dbt run --vars '{gold_partition_expiration_days: 1825}'
 --   1825 天（5 年）是為了避開單表 4000 分區上限——DAY 粒度約 11 年就撞頂，
 --   而 Gold 與 staging 不同，是要留全歷史的。超過 5 年的需求改 MONTH 粒度（需重建表）。

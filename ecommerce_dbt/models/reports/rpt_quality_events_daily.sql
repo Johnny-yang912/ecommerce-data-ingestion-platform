@@ -2,7 +2,7 @@
 --
 -- 定位：【資料可信度與規則效果的分析】，不是管線健康監控。
 --   後者（分鐘級 error rate、Hard Gate 即時告警、批次 SLA）屬 OTel/Grafana，
---   即 DQ_ARCHITECTURE-TW〈層次一：即時運維指標〉。本模型是〈層次二：批次分析指標〉。
+--   即 docs/zh-TW/design/data-quality.md〈層次一：即時運維指標〉。本模型是〈層次二：批次分析指標〉。
 --   兩者刻意重疊一部分信號（error rate 兩邊都有），差別在消費形態：
 --   OTel 那份是「現在、單一數字、為了告警」，本表是「歷史、可切片、為了歸因」。
 --   這一行定位寫在這裡，是為了防止日後兩邊功能漂移互相蓋台。
@@ -15,7 +15,7 @@
 --        會隨每次 promote 而變，那是狀態不是事件。狀態由 rpt_quality_backlog 承載。）
 --   2. 因此本模型【可以增量】，且是本專案唯一一個增量在語意上天生正確的下游模型——
 --      時間軸與「什麼會變」對齊，回看窗就夠，不需要 int_/fct_ 那套受影響分區 discovery。
---   3. 它直接對應 DQ_ARCHITECTURE-TW〈歷史指標為何不會被追溯性改寫〉那兩支範例 SQL。
+--   3. 它直接對應 docs/zh-TW/design/data-quality.md〈歷史指標為何不會被追溯性改寫〉那兩支範例 SQL。
 --
 -- ⭐ 刻意【不】輸出 quarantine_rate / promotion_rate 等比率欄位，只輸出可加的分子與分母。
 --   預聚合層存比率是頭號陷阱：BI 一旦把日粒度 roll up 到週，Looker Studio 算的是
@@ -27,11 +27,11 @@
 -- 寬表（每個狀態一個計數欄）而非長表（event_type × to_state 各一列），兩個理由：
 --   1. rate 的分子與分母必須落在【同一列】，BI 才做得出 SUM(num)/SUM(den)；
 --   2. event_type / to_state 的值域是【狀態機定義的封閉小集合】（models.py:101-107、
---      DQ_ARCHITECTURE-TW 的事件 schema），寬表最大的風險——值域擴張要改 schema——
+--      docs/zh-TW/design/data-quality.md 的事件 schema），寬表最大的風險——值域擴張要改 schema——
 --      在這裡不存在。值域真的擴張時，assert_rpt_quality_events_split 會先紅給你看。
 --
 -- ⚠️ 現況：Proposal B（Airflow 重評估）尚未實作，quality_events 目前只有攝入時的
---   initial_evaluation 事件（DQ_ARCHITECTURE-TW §「Proposal B 尚未實作」）。
+--   initial_evaluation 事件（docs/zh-TW/design/data-quality.md §「Proposal B 尚未實作」）。
 --   → promotions / rejections / re_quarantines 目前【恆為 0】。
 --   欄位先留著是對的（事件產生端一上線就有值，不需改 schema），
 --   但 BI 上先不要放一張永遠空白的「回流趨勢」圖。

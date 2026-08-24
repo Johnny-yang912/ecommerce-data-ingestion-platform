@@ -3,7 +3,7 @@
 -- 對象＝Raw.status='processed' 且有效品質狀態仍為 quarantined / permanently_rejected。
 --   這些記錄「已在 ODS」，只是不流入 dim_/fct_。它們的問題是【規則評估】而非 pipeline 失敗，
 --   故 remediation 走 Proposal B（規則升版重評估），不是 force=true（對 processed 回 400）。
---   見 DQ_ARCHITECTURE-TW Q2〈Remediation：A + B + C 並用〉。
+--   見 docs/zh-TW/design/data-quality.md〈Remediation：A + B + C 並用〉。
 --
 -- quarantined_at 語意：刻意【不】用 CURRENT_TIMESTAMP()（DQ 文件早期範例）。
 --   本模型是 table 全量重建，CURRENT_TIMESTAMP 每次跑批都會變，記錄的是「這次 run 的時間」
@@ -14,7 +14,7 @@
 --   ⚠️ 早期版本另記了「本表是 ORDER_DATE_IN_FUTURE 髒列的收容處，離譜的未來日期會超出
 --      BQ 分區合法區間、讓整張表建立失敗」——【該理由經 2026-08 實測推翻】：超出
 --      1960-01-01 ~ 2159-12-31 的值不會炸表，會靜默落進 __UNPARTITIONED__ 分區
---      （見 CLOUD_LAYER-TW §1.7.3）。不分區的決定仍然成立，但只剩上面那一條理由。
+--      （見 docs/zh-TW/design/cloud-layer.md）。不分區的決定仍然成立，但只剩上面那一條理由。
 --
 -- 物化＝table：理由同 int_orders（Proposal B 的狀態變更落在舊分區，按 received_at
 --   增量會看不到）。兩模型的物化策略必須一致，否則劃分不變式會在跑批之間破裂。
@@ -64,7 +64,7 @@ resolved as (
         -- ⚠️ coalesce 不可省：has_clean_error=TRUE 且無事件時，
         --    FALSE OR NULL = NULL，`where not NULL` 也是 NULL
         --    → 該列會從「兩張」表同時消失（靜默漏資料）。
-        -- 事件缺席 → fall back 到 ODS 快照，即 CLOUD_LAYER-TW §3.2 要求的「保守合成」：
+        -- 事件缺席 → fall back 到 ODS 快照，即 docs/zh-TW/design/cloud-layer.md 要求的「保守合成」：
         --    orders 上了但 quality_events 沒上時，乾淨照流、髒的續留 quarantine，
         --    只造成延遲、不造成髒資料。
         coalesce(

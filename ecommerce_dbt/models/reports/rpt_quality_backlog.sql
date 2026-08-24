@@ -6,7 +6,7 @@
 -- ⭐ 為什麼需要這張，而不是從事件軸累加算出 backlog：
 --   理論上 backlog(t) = 累計 quarantined − 累計 promoted − 累計 rejected，
 --   事件流是狀態的完整導數，看似不必另存。但 quality_events 有 60 天分區過期
---   （event_at 軸，CLOUD_LAYER-TW §1.6）——【過期之後累加的起點就丟了，曲線會系統性失真】，
+--   （event_at 軸，docs/zh-TW/design/cloud-layer.md）——【過期之後累加的起點就丟了，曲線會系統性失真】，
 --   而且失真是單向的（起點永遠只會少算 quarantined，backlog 被低估）。
 --   本表直接讀 int_orders_quarantine 的當下內容，不受事件保留期影響。
 --
@@ -46,7 +46,7 @@ with quarantined as (
 
         -- ODS.dq_rule_version 是 nullable（models.py:88）→ 補 unknown member。
         -- 動的是【維度值】不是度量，且可完整反查回「這筆沒有版本標記」，是無損的，
-        -- 不牴觸 CLOUD_LAYER-TW §5.5.5 的 NULL 鐵律（同 §6.5 對鍵的論證）。
+        -- 不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律（同 §6.5 對鍵的論證）。
         -- 不補的話：NULL 在 grain 裡會讓 BI 顯示空白，且下游對帳測試的等值 join 會靜默漏掉。
         coalesce(dq_rule_version, '{{ var("unknown_member_key", "__UNKNOWN__") }}') as dq_rule_version,
 

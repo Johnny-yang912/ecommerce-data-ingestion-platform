@@ -32,7 +32,7 @@ STATES        = ["Taipei", "Kaohsiung", "Taichung", "Tainan", "Hsinchu"]
 # received_at——Gold 的 fct_* 按 order_date 分區、staging/stg_ 按 received_at 分區，
 # 兩個 60 天時鐘掛在不同軸上，只有兩軸對齊時「fct 與 int 內容一致」才成立。
 # 舊版寫死 date(2024, 1, 1)，與 received_at 相差平均 410 天 → 新灌的資料一進 Gold
-# 就被分區過期回收（見 CLOUD_LAYER-TW §1.7）。
+# 就被分區過期回收（見 docs/zh-TW/design/cloud-layer.md）。
 ORDER_DATE_LOOKBACK_DAYS = 45
 
 

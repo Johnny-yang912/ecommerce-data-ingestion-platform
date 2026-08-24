@@ -174,7 +174,7 @@ models:
       - name: is_returned
         description: >
           承自 fct_orders.returned。⚠️【可為 NULL】＝退貨狀態未知，不是「沒退貨」——
-          刻意不 coalesce 成 false，那是 CLOUD_LAYER-TW §5.5.5 鐵律禁止的有損單向 collapse。
+          刻意不 coalesce 成 false，那是 docs/zh-TW/design/cloud-layer.md 鐵律禁止的有損單向 collapse。
           故本欄【不】掛 not_null。BI 上要區分三態（true / false / 未知）。
       - name: orders
         description: >

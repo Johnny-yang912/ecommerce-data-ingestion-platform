@@ -2,7 +2,7 @@
 
 下游的回流路徑早就就緒——`int_orders` 每次 run 都會把「ODS 快照 ⊕ `quality_events`
 最新事件」合成成有效品質狀態。缺的一直是**產生事件的那一端**，本腳本就是它。
-（見 DQ_ARCHITECTURE-TW〈Proposal B：不重跑的重評估流程〉。）
+（見 docs/zh-TW/design/data-quality.md〈Proposal B：不重跑的重評估流程〉。）
 
     BQ int_ 層（誰值得重評估） ──► business_clean（新版規則）──► PG quality_events（只 append）
                                                                         │
@@ -18,7 +18,7 @@
   ② 這是分析型全掃，打在 ODS 上會與 `POST /orders` 的熱路徑搶資源——把它移走正是雲端層存在的理由。
 
 - **狀態判定（有沒有變）讀 PG 的 `quality_events`**：BQ 是**有保留期的鏡射**
-  （sandbox 強制 60 天，見 CLOUD_LAYER-TW §1.7）。若拿它判斷「狀態變了沒」，事件過期時
+  （sandbox 強制 60 天，見 docs/zh-TW/design/cloud-layer.md）。若拿它判斷「狀態變了沒」，事件過期時
   會誤判成「沒有事件」→ 對已 promote 的記錄再 append 一次 promotion →
   污染 `rpt_quality_events_daily.promotions`，而那正是〈歷史指標為何不會被追溯性改寫〉
   要保護的數字，且 append-only 刪不掉。**冪等的保證只能來自寫入目標本身，不能來自它的鏡射。**
@@ -75,7 +75,7 @@ logger = structlog.get_logger()
 PROJECT = settings.bq_project
 DBT_DATASET = settings.bq_dbt_dataset
 
-# --- 狀態機（值域與 DQ_ARCHITECTURE-TW〈狀態機〉一致）------------------------
+# --- 狀態機（值域與 docs/zh-TW/design/data-quality.md〈狀態機〉一致）------------------------
 STATE_QUARANTINED = "quarantined"
 STATE_PROMOTED = "promoted"
 STATE_RE_QUARANTINED = "re_quarantined"

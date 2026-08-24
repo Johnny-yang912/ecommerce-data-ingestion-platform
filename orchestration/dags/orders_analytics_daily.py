@@ -5,7 +5,7 @@
     extract_quality_events ─┘      (Hard Gate)
 
 取代的是過去手動跑的 `python extract_ods_to_bq.py` + `dbt build`。
-完整決策與理由見 ORCHESTRATION-TW.md；以下只記「讀這個檔時會想問的為什麼」。
+完整決策與理由見 docs/zh-TW/design/orchestration.md；以下只記「讀這個檔時會想問的為什麼」。
 
 ────────────────────────────────────────────────────────────────────────────
 ① 這個檔【不得】import 專案模組 ⭐
@@ -28,7 +28,7 @@
    但 dbt 對同一批分區並行 insert_overwrite 會互相覆寫。
 
 ④ 日批而非小時批
-   方案 A 的精度被 DAY 分區卡死，小時批每跑一次都重抽當天至今（CLOUD_LAYER §2.2
+   方案 A 的精度被 DAY 分區卡死，小時批每跑一次都重抽當天至今（docs/en/design/cloud-layer.md
    的判準表）。要上小時批得先換 HOUR 分區或方案 B——那是另一個獨立決策。
 
 ⑤ retry 刻意不對稱：extract=2、dbt=0
@@ -39,7 +39,7 @@
    暫時性而重試，就是在製造 poison-pill。**
 
 ⑥ 為什麼 extract 拆兩個 task
-   各表 watermark 獨立、失敗不推進，是 CLOUD_LAYER §3.2 自癒模型的來源。合成單一
+   各表 watermark 獨立、失敗不推進，是 docs/en/design/cloud-layer.md 自癒模型的來源。合成單一
    task 會讓重試連帶重跑已經成功的那張，也看不出是哪張壞了。跨表 gate 從
    「腳本內彙整後 raise」搬到這裡的依賴邊（dbt 的上游＝兩個 extract 都 success），語意相同。
 
@@ -53,7 +53,7 @@
    兩者職責不同——逐層的測試是 **gate**（擋住下游建置），結尾那次是 **completeness**。
 
 ⑧ freshness 不在這條 DAG 裡
-   CLOUD_LAYER §1.7.7 立了硬規則：不得當前置檢查。但「旁路 task」還不夠——一個
+   docs/en/design/cloud-layer.md 立了硬規則：不得當前置檢查。但「旁路 task」還不夠——一個
    預期會紅的 task 會讓主 DAG 恆為 failed，真正的失敗被噪音淹沒。故獨立成
    source_freshness_watch DAG（PR5）。
 
@@ -192,7 +192,7 @@ with DAG(
         retries=0,
     )
 
-    # gate：兩個 extract 都 success，dbt 才開跑（CLOUD_LAYER §3.2 的跨表一致性）。
+    # gate：兩個 extract 都 success，dbt 才開跑（docs/en/design/cloud-layer.md 的跨表一致性）。
     extracts >> dbt_tasks[0]
     for upstream, downstream in zip(dbt_tasks, dbt_tasks[1:]):
         upstream >> downstream

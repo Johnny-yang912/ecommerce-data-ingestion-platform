@@ -81,7 +81,7 @@ class TestGate:
     def test_partial_failure_still_attempts_every_table(self, calls, monkeypatch):
         """多表模式：第一張失敗【不得】中斷第二張。
 
-        各表 watermark 獨立、失敗不推進，是 CLOUD_LAYER-TW §3.2 自癒模型的前提；
+        各表 watermark 獨立、失敗不推進，是 docs/zh-TW/design/cloud-layer.md 自癒模型的前提；
         提早 return 會讓沒壞的那張也停在舊 watermark，把單表故障放大成整批延遲。
         """
         attempted = _fail_on(monkeypatch, ex.SPECS[0].table)

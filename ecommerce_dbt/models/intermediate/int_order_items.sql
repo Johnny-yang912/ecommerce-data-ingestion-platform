@@ -3,7 +3,7 @@
 -- 來源選 int_orders（已過濾）而非 stg_orders：item 層的錯誤（quantity_non_positive、
 --   unit_price_negative、discount_pct_out_of_range、non_finite_number）在攝入層就會讓
 --   【整張訂單】has_clean_error=TRUE 被隔離，所以從 int_orders 出發天然保證
---   「Gold 不含 has_clean_error=TRUE」（DQ_ARCHITECTURE-TW Q0）。
+--   「Gold 不含 has_clean_error=TRUE」（docs/zh-TW/design/data-quality.md）。
 --   若日後要做 item 層的髒資料 RCA，另建讀 int_orders_quarantine 的對應模型。
 --
 -- safe_cast 不可省：clean.py 明載「items 內的值未經 Pydantic 強轉，可能是字串」——
@@ -13,7 +13,7 @@
 -- 衍生金額採【嚴格 NULL 傳播】，不做 coalesce：
 --   NULL 帶資訊（「這筆沒有折扣資料」≠「折扣為 0」），COALESCE 是有損且單向的——
 --   一旦在 int_ 把 NULL 壓成 0，全下游再也分不出「沒收集」與「真的是 0」
---   （CLOUD_LAYER-TW §5.5.5）。填值屬業務/呈現決定，應留到 dim_/fct_/rpt_ 依問題各自處理。
+--   （docs/zh-TW/design/cloud-layer.md）。填值屬業務/呈現決定，應留到 dim_/fct_/rpt_ 依問題各自處理。
 --
 -- 物化＝table：上游 int_orders 已是 table 全量重建，本模型跟隨；不分區（理由同 int_orders）。
 

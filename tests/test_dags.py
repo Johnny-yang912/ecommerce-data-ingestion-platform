@@ -68,7 +68,7 @@ class TestOrdersAnalyticsDaily:
         assert dag.max_active_runs == 1
 
     def test_dbt_waits_for_every_extract(self, dag):
-        """跨表 gate：兩張表都上去了 dbt 才能開跑（CLOUD_LAYER §3.2）。
+        """跨表 gate：兩張表都上去了 dbt 才能開跑（docs/en/design/cloud-layer.md）。
         少接一條邊 = dbt 在半套資料上建模。"""
         extracts = {t.task_id for t in dag.tasks if t.task_id.startswith("extract_")}
         assert extracts == {"extract_orders", "extract_quality_events"}
@@ -109,7 +109,7 @@ class TestOrdersAnalyticsDaily:
             assert dag.get_task(task_id).retries == 0
 
     def test_freshness_is_not_in_this_dag(self, dag):
-        """CLOUD_LAYER §1.7.7：freshness 不得當前置檢查。更進一步，連旁路 task 都不行——
+        """docs/en/design/cloud-layer.md：freshness 不得當前置檢查。更進一步，連旁路 task 都不行——
         一個預期會紅的 task 會讓主 DAG 恆為 failed，真正的失敗就被噪音淹沒。
         它獨立成 source_freshness_watch DAG。"""
         for task in dag.tasks:

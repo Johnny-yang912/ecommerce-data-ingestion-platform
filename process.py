@@ -311,7 +311,7 @@ def scan_and_recover(limit: int = SCAN_BATCH_SIZE, after_id: int = 0) -> list[in
     的卻是「這筆資料**躺了**多久」——兩者在平時幾乎相等（進來就處理），在積壓時
     相差極大，而積壓正是這個判定最常被觸發的時候。
 
-    用 received_at 會炸的時間軸（實測可重現，見 QUEUE-TW.md §3.1／§5.4）：
+    用 received_at 會炸的時間軸（實測可重現，見 docs/zh-TW/design/queue.md）：
 
         T-30min  訂單攝入，received_at = T-30min，因 broker 停機留在 pending
         T+0      broker 復原，掃描派工；worker A 搶佔成功 → status = processing

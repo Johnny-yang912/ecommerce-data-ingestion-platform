@@ -83,7 +83,7 @@ models:
         description: >
           該訂單中 net_amount 為 NULL 的品項數。⭐ 加總可信度的顯性標記——
           BQ 的 SUM() 靜默忽略 NULL，此欄 > 0 代表 net_amount 少算了品項。
-          刻意不 COALESCE 金額（有損且單向，CLOUD_LAYER-TW §5.5.5），改讓下游自行判斷。
+          刻意不 COALESCE 金額（有損且單向，docs/zh-TW/design/cloud-layer.md），改讓下游自行判斷。
           ⚠️【名字有歷史包袱】：本欄【只】涵蓋 gross → net 這一條 NULL 傳播鏈
           （quantity / unit_price / discount_pct），不是「這張表的金額完整度」。
           cost 與 shipping 是獨立的鏈，各有自己的 counter，見下兩欄。

@@ -46,7 +46,7 @@ services:
       - "${DB_PUBLISH_PORT:-5433}:5432"
 
   # 攝入路徑的 Celery broker。刻意與 Airflow 分開（Airflow 目前是 LocalExecutor、
-  # 根本沒有 broker），兩者的故障域不該糾纏——見 ORCHESTRATION-TW〈範圍與職責邊界〉。
+  # 根本沒有 broker），兩者的故障域不該糾纏——見 docs/zh-TW/design/orchestration.md〈範圍與職責邊界〉。
   #
   # 不開 appendonly：Redis 預設只有 RDB 快照，crash 可能丟掉最後幾秒的訊息。這裡刻意
   # 不用 fsync 換那個保證，因為 process.scan_and_recover 已經是資料庫層的兜底——丟訊息

@@ -3,7 +3,7 @@
 ────────────────────────────────────────────────────────────────────────────
 為什麼它不在主 DAG 裡 ⭐
 
-CLOUD_LAYER-TW §1.7.7 已立了硬規則：**freshness 不得放在抽取／`dbt build` 之前
+docs/zh-TW/design/cloud-layer.md 已立了硬規則：**freshness 不得放在抽取／`dbt build` 之前
 當前置檢查**——同一個紅會立刻從「可接受的告警」變成「DAG 永久卡死」，而它反映的
 往往只是「這幾天沒手動灌資料」。
 
@@ -45,7 +45,7 @@ CLOUD_LAYER-TW §1.7.7 已立了硬規則：**freshness 不得放在抽取／`db
 
 **它量的範圍剛好是一跳，而且那是刻意的** ⭐
 `loaded_at_field` 指向 `received_at`＝**ODS 的落地時刻**（不是收單時刻，見
-CLOUD_LAYER-TW §1.2.2）。而本 DAG 檢查的是 extract，extract 搬的正是 ODS——
+docs/zh-TW/design/cloud-layer.md）。而本 DAG 檢查的是 extract，extract 搬的正是 ODS——
 **所以看 ODS 自己的時鐘是正確的時間軸，不是妥協。**
 
 由此得到一個必須寫清楚的範圍邊界：**它看不見已經恢復的攝入中斷。** 積壓被恢復

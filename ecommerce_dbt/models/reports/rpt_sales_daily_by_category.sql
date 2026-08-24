@@ -61,7 +61,7 @@ with items as (
 
         -- dim_product 的 unknown member 屬性一律 NULL（見該檔），故 category 可能為 NULL；
         -- 補 '__UNKNOWN__' 讓 BI 不顯示空白分類。動的是【維度值】不是度量，可完整反查，
-        -- 無損（同 README.zh-TW §6.5 對鍵的論證），不牴觸 CLOUD_LAYER-TW §5.5.5 的 NULL 鐵律。
+        -- 無損（同 README.zh-TW §6.5 對鍵的論證），不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律。
         coalesce(p.category, '{{ var("unknown_member_key", "__UNKNOWN__") }}') as category,
 
         -- ⚠️ ODS.returned 是 nullable（models.py:42）→ 本欄可能為 NULL，
@@ -113,7 +113,7 @@ select
     -- ── 可加度量 ✅ ──────────────────────────────────────────────────────────
     count(*)            as items,
     sum(quantity)       as total_quantity,
-    -- 全部承自上游的嚴格 NULL 傳播，刻意不 coalesce（CLOUD_LAYER-TW §5.5.5）。
+    -- 全部承自上游的嚴格 NULL 傳播，刻意不 coalesce（docs/zh-TW/design/cloud-layer.md）。
     sum(gross_amount)   as gross_amount,
     sum(net_amount)     as net_amount,
     sum(cost_amount)    as cost_amount,

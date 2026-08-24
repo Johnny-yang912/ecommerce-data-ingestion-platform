@@ -1,9 +1,9 @@
 {#
     DQ 錯誤碼工具。
 
-    clean_error_message 是 JSON 物件陣列 [{code, field, value, ...}]（CLOUD_LAYER-TW §6
+    clean_error_message 是 JSON 物件陣列 [{code, field, value, ...}]（docs/zh-TW/design/cloud-layer.md
     已實機驗證落地為 JSON_TYPE=array）。下游一律以【穩定的 code】比對，不比對人類可讀
-    措辭——措辭可調整、code 不變（見 clean.py 的 DQCode 與 DQ_ARCHITECTURE-TW 機制三）。
+    措辭——措辭可調整、code 不變（見 clean.py 的 DQCode 與 docs/zh-TW/design/data-quality.md 機制三）。
 #}
 
 {#

@@ -1,4 +1,4 @@
--- Gold 契約（DQ_ARCHITECTURE-TW Q0）：int_orders 不得含 has_clean_error=TRUE 的列，
+-- Gold 契約（docs/zh-TW/design/data-quality.md）：int_orders 不得含 has_clean_error=TRUE 的列，
 -- 【除非】它是被 Proposal B 重評估 promote 回來的。
 --
 -- 這條之所以不能直接寫成 `not_null` / `accepted_values` 之類的欄位測試，是因為它是

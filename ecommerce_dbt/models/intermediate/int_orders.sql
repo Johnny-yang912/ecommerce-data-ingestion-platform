@@ -1,6 +1,6 @@
 -- int_orders：Gold 入口——通過 Row Filter 的乾淨資料流
 --
--- 職責（DQ_ARCHITECTURE-TW Q1 機制二）：攔截發生在這一層。判定基準是「有效品質狀態」，
+-- 職責（docs/zh-TW/design/data-quality.md 機制二）：攔截發生在這一層。判定基準是「有效品質狀態」，
 --   【不是】ODS 的 has_clean_error 字面快照——ODS 是不可變錨點，被 Proposal B promote 的
 --   記錄在 ODS 裡永遠是 has_clean_error=TRUE；只讀快照它會永遠卡在 quarantine、流不回 Gold。
 --   有效品質狀態 = ODS 攝入快照 ⊕ quality_events 最新事件（合成於下方共用區塊）。
@@ -9,14 +9,14 @@
 --   Proposal B 的 promotion 事件 event_at=now()、落當天分區，但它救的那筆訂單 received_at
 --   在很久以前的舊分區。若本模型按 received_at 回看窗增量，該舊分區永遠不會被重算
 --   → 被 promote 的記錄永遠流不回 Gold，回流機制在此層被切斷。
---   （與 CLOUD_LAYER-TW §7.4 的 late-arriving 同構，但軸不同：那裡是「值」變、這裡是「狀態」變。）
+--   （與 docs/zh-TW/design/cloud-layer.md 的 late-arriving 同構，但軸不同：那裡是「值」變、這裡是「狀態」變。）
 --   table 走 CREATE OR REPLACE（DDL），不受 BQ sandbox 禁 DML 限制。
 -- TODO(成本)：資料量讓全量重建有感時改增量。重選集合必須是
 --   「回看窗分區 ∪ 近期有品質事件的 raw_id 所屬分區」，且【整分區】重選——
 --   只選那幾列會讓 insert_overwrite 把同分區的其他列一併洗掉。
 --
 -- 刻意不分區：int_ 只被 DAG 內部消費（非分析師 ad-hoc），分區收益 ≈ 0；
---   order_date 分區留給 dim_/fct_（CLOUD_LAYER-TW §1.2「每張表依自己的 access pattern 各自選」）。
+--   order_date 分區留給 dim_/fct_（docs/zh-TW/design/cloud-layer.md「每張表依自己的 access pattern 各自選」）。
 
 {{
     config(
@@ -63,7 +63,7 @@ resolved as (
         -- ⚠️ coalesce 不可省：has_clean_error=TRUE 且無事件時，
         --    FALSE OR NULL = NULL，`where not NULL` 也是 NULL
         --    → 該列會從「兩張」表同時消失（靜默漏資料）。
-        -- 事件缺席 → fall back 到 ODS 快照，即 CLOUD_LAYER-TW §3.2 要求的「保守合成」：
+        -- 事件缺席 → fall back 到 ODS 快照，即 docs/zh-TW/design/cloud-layer.md 要求的「保守合成」：
         --    orders 上了但 quality_events 沒上時，乾淨照流、髒的續留 quarantine，
         --    只造成延遲、不造成髒資料。
         coalesce(

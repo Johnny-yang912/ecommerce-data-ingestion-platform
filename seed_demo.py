@@ -52,7 +52,7 @@ order_date 在 payload 裡，本腳本可以自由灑；但 received_at / event_
     今天灌一萬筆，rpt_quality_events_daily 的時間軸上仍然只有【一個點】。
 
 品質趨勢圖需要跨日的資料，唯一的做法是【分幾天各跑一次】（或掛排程）。
-這同時也是 CLOUD_LAYER §1.7.7 說的「持續攝入」——一併把 source freshness
+這同時也是 docs/en/design/cloud-layer.md 說的「持續攝入」——一併把 source freshness
 從「預期紅」變成有意義的 gate。
 """
 
@@ -122,7 +122,7 @@ def make_order(rng: random.Random, order_id: str, lookback_days: int) -> dict:
     """產生一筆【乾淨】的訂單 payload。髒資料由 inject_dirty() 事後注入。
 
     order_date 貼近今天（預設回看 45 天）：Gold 的 fct_* 按 order_date 分區，
-    而 BQ sandbox 對每張分區表無條件套 60 天過期（見 CLOUD_LAYER §1.7.8）。
+    而 BQ sandbox 對每張分區表無條件套 60 天過期（見 docs/en/design/cloud-layer.md）。
     order_date 離今天太遠的訂單【一進 Gold 就被回收】，等於白灌。
     """
     order_dt = date.today() - timedelta(days=rng.randint(0, lookback_days))
@@ -244,7 +244,7 @@ def _dirty_age_out_of_range(p: dict, rng: random.Random) -> str:
     # 產出的資料永遠只落在規則的遠端，測不到閾值本身合不合理。
     # 而閾值正是最可能被調整的東西（見 DQ 文件〈Hard Gate 閾值為業務判斷〉），
     # 所以資料裡要有「調一下上限就會改變判定」的樣本——它同時讓 Proposal B 的
-    # 回溯重評估有真實可 promote 的對象（見 ORCHESTRATION-TW §3.3 的 demo 劇本）。
+    # 回溯重評估有真實可 promote 的對象（見 docs/zh-TW/runbooks/proposal-b-rollout.md 的 demo 劇本）。
     p["customer"]["age"] = rng.choice([-3, 125, 150, 999])
     return "age_out_of_range"
 
@@ -268,7 +268,7 @@ def _dirty_order_date_in_future(p: dict, rng: random.Random) -> str:
     """⚠️ 權重刻意壓到最低（見 DIRTY_WEIGHTS）。
 
     未來日期超出 BQ 分區合法區間時會靜默落進 __UNPARTITIONED__
-    （CLOUD_LAYER §1.7.3），在 BI 的日期軸上會變成一個突兀的空桶。
+    （docs/en/design/cloud-layer.md），在 BI 的日期軸上會變成一個突兀的空桶。
     保留極小比例是為了讓這條規則在 demo 裡「存在且可被查到」，
     而不是為了讓它在圖上被看見。
     """

@@ -15,7 +15,7 @@
 --     3. tests/assert_product_attributes_stable.sql（severity: warn）監控衝突數
 --   warn 而非 error，因為這是【上游契約訊號】而非本層的正確性缺陷：product_id 若真的
 --   無法唯一決定商品屬性，該修的是上游或 data contract，不是讓整條 DAG 停下來。
---   （同一個判斷邏輯見 DQ_ARCHITECTURE-TW：has_schema_drift 沒有攔截權限、只能告警。）
+--   （同一個判斷邏輯見 docs/zh-TW/design/data-quality.md：has_schema_drift 沒有攔截權限、只能告警。）
 --
 -- 不分區、cluster_by(product_id)：理由同 dim_customer（維度按鍵 join，非按日期掃）。
 

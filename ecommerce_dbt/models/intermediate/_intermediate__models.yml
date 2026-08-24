@@ -13,7 +13,7 @@ models:
       （ODS 攝入快照 ⊕ quality_events 最新事件），非 has_clean_error 的字面快照——
       被 Proposal B promote 的記錄在 ODS 仍是 has_clean_error=TRUE，靠事件才流得回 Gold。
       物化為 table 全量重建（非 received_at 增量），否則 promotion 落在當天分區、
-      受影響訂單卻在舊分區，回流機制會在此層被切斷。見模型檔頭與 DQ_ARCHITECTURE-TW 機制二。
+      受影響訂單卻在舊分區，回流機制會在此層被切斷。見模型檔頭與 docs/zh-TW/design/data-quality.md 機制二。
     columns:
       - name: raw_id
         description: 物理身分（ODS 1:1 血緣鍵）；劃分後應唯一。
@@ -55,7 +55,7 @@ models:
     description: >
       被 Row Filter 隔離的資料（有效品質狀態非乾淨）。這些記錄已在 ODS，只是不流入
       dim_/fct_；其問題是規則評估而非 pipeline 失敗，remediation 走 Proposal B 重評估，
-      不是 force=true（對 status=processed 回 400）。見 DQ_ARCHITECTURE-TW Q2。
+      不是 force=true（對 status=processed 回 400）。見 docs/zh-TW/design/data-quality.md。
     columns:
       - name: raw_id
         tests:
@@ -89,7 +89,7 @@ models:
       ODS.items（JSON 陣列）攤平到 item 粒度，供未來的 fct_order_items。
       來源為 int_orders（已過濾）——item 層錯誤在攝入層就會讓整張訂單被隔離，
       故從此出發天然保證 Gold 不含髒資料。數值一律 safe_cast（items 未經 Pydantic 強轉）；
-      衍生金額採嚴格 NULL 傳播、不 coalesce（填值決定留給 dim_/fct_，CLOUD_LAYER-TW §5.5.5）。
+      衍生金額採嚴格 NULL 傳播、不 coalesce（填值決定留給 dim_/fct_，docs/zh-TW/design/cloud-layer.md）。
     tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

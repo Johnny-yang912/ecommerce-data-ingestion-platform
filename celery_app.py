@@ -7,7 +7,7 @@ Celery 應用實例：攝入路徑的任務佇列（取代 FastAPI BackgroundTas
 
 與編排層的邊界：這個 broker 專屬攝入路徑（毫秒～秒級、單筆、由 HTTP 請求觸發），
 與 Airflow（分鐘～小時級批次、由時鐘觸發）是正交的兩件事，**刻意不共用 Redis 實例**，
-否則兩者的故障域會糾纏。詳見 ORCHESTRATION-TW.md〈範圍與職責邊界〉。
+否則兩者的故障域會糾纏。詳見 docs/zh-TW/design/orchestration.md〈範圍與職責邊界〉。
 """
 
 from celery import Celery

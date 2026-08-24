@@ -15,7 +15,7 @@
 -- 2. unknown member（決策 G）：customer_id 在 ODS 是 nullable。星狀模型不該讓事實表
 --    帶 NULL FK——INNER JOIN 會靜默掉列、LEFT JOIN 讓 BI 顯示空白，兩種都不好。
 --    故維度補一筆 '__UNKNOWN__'，事實表 coalesce 到它。
---    這【不】牴觸 CLOUD_LAYER-TW §5.5.5 的 NULL 鐵律：鐵律禁止的是在共享層對【度量】
+--    這【不】牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律：鐵律禁止的是在共享層對【度量】
 --    做有損 collapse（NULL→0 之後分不出「沒收集」與「真的是 0」）；這裡動的是【鍵】，
 --    且 '__UNKNOWN__' 可完整反查回「這筆沒有顧客識別」，是無損的。
 --

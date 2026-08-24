@@ -18,7 +18,7 @@
    **「以為有告警但其實沒有」比「明擺著沒有告警」危險得多。**
 
    所以預設是一個必然送得出去的通道（log），真實通道由環境變數啟用。
-   代價是預設狀態下沒有真正的告警——這一點寫進 ORCHESTRATION-TW.md §4 的口徑裡，
+   代價是預設狀態下沒有真正的告警——這一點寫進 docs/zh-TW/design/orchestration.md 的口徑裡，
    不在 README 上記一個名不副實的勾。
 
 ② 這【不是】告警，而是告警內容的來源
@@ -35,7 +35,7 @@
        （`sla` 參數還留在 BaseOperator 簽章裡，但別依賴它）。
      · **機器關機／斷網**——callback 與被監控系統住在同一台機器上。
      · **warn 等級**——`dbt source freshness` 的 warn 是 exit 0，task 是綠的。
-   這三個洞要靠雲端側的 absent 告警補，見 ORCHESTRATION-TW.md §4。
+   這三個洞要靠雲端側的 absent 告警補，見 docs/zh-TW/design/orchestration.md。
 
 ④ 通道是接縫，不是設定的終點
 

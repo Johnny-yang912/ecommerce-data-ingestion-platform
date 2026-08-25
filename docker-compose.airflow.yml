@@ -8,10 +8,11 @@
 #
 # 【必要前置】.env 需有 BQ_PROJECT、GCP_SA_KEY_PATH——後者是金鑰【檔案】的主機路徑，
 # 會被單檔唯讀掛到容器內的固定位置（見下方 volumes）。
-# 【必要前置】AIRFLOW_UID=$(id -u)。這條從「建議」升級成「必要」，因為金鑰檔已收斂成
-# 0600（只有擁有者讀得到）——uid 不一致時容器【讀不到金鑰】，dbt 與 extract 會在
-# runtime 拿到 permission denied。金鑰先前是 0755，任何 uid 都讀得到，那個寬鬆權限
-# 一直在掩蓋這個依賴的存在。
+# 【必要前置】AIRFLOW_UID＝`id -u` 的【數字值】（.env 不做命令替換，寫 $(id -u) 會
+# 原樣變成字串而讓容器起不來；同 .env.example 的說明）。這條從「建議」升級成「必要」，
+# 因為金鑰檔已收斂成 0600（只有擁有者讀得到）——uid 不一致時容器【讀不到金鑰】，
+# dbt 與 extract 會在 runtime 拿到 permission denied。金鑰先前是 0755，任何 uid 都
+# 讀得到，那個寬鬆權限一直在掩蓋這個依賴的存在。
 # 附帶（原本的理由）：uid 不對齊時容器以 50000 寫入 bind mount，主機端會清不掉
 # dbt 產生的 target/ 與 logs/。
 

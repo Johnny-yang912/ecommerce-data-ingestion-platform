@@ -234,6 +234,8 @@ async def create_order(request: Request, order: OrderIN,
         db.close()
 
 
+# ⚠️ 刻意不比對 source_client_id（連 force 的守衛也只看狀態、不看擁有者）：
+#    維運端點，持 key 者互為信任。決策與失效條件見 auth.py 檔頭〈信任模型〉。
 @app.post("/process_raw/{raw_id}")
 @limiter.limit("20/minute")
 async def process_raw(request: Request, raw_id: int, force: bool = False,
@@ -266,6 +268,8 @@ async def process_raw(request: Request, raw_id: int, force: bool = False,
     return {"raw_id": raw_id, "triggered": triggered, "force": force}
 
 
+# ⚠️ 刻意不比對 source_client_id：任何有效 key 都讀得到任何一筆 Raw，包含逐字
+#    保留的原始 payload。維運端點，持 key 者互為信任——見 auth.py 檔頭〈信任模型〉。
 @app.get("/raw/{raw_id}", response_model=RawOut)
 @limiter.limit("120/minute")
 async def get_raw(request: Request, raw_id: int, client_id: str = Depends(verify_api_key)):

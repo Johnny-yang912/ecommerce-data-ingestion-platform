@@ -82,7 +82,29 @@ x-airflow-common: &airflow-common
     # ⚠️ 專案原始碼在此是 bind mount，而 api/worker/beat 是【烤進映像】的。
     #    改 clean.py 之類的共用模組時，這一邊立刻生效、那一邊要 build——
     #    規則版本會因此無聲分歧，見 docs/zh-TW/runbooks/proposal-b-rollout.md 第 3 步。
-    - ./:/opt/project:rw
+    #
+    # ⭐ 專案根【唯讀】，只對真正要寫的路徑逐一開 rw。
+    #    這條之前是 `:rw`，而 ./orchestration/dags 是 ./ 的子目錄——同一批主機檔案
+    #    因此有兩條容器路徑、兩種權限，上面那行的 `:ro` 形同虛設（現場證據：
+    #    orchestration/dags/__pycache__/ 底下有一批 gid=0、cpython-312 的 .pyc，
+    #    是容器經由 /opt/project/... 那條路寫進去的）。重疊掛載 Docker 不會警告，
+    #    Python 寫不了 __pycache__ 也是靜默降級——失效時沒有任何訊號。
+    #    容器實際的寫入需求只有下面三個 dbt 產出目錄（都已 gitignore）。
+    - ./:/opt/project:ro
+    # ⚠️ 巢狀掛載：目標路徑較深者後掛，故這三條會正確覆蓋在上面的 :ro 之上。
+    #    ⭐ 來源目錄【必須先存在於主機】。不存在時 Docker 會替你以 root 建目錄，
+    #      主機端反而清不掉——比忘了掛還難處理。
+    - ./ecommerce_dbt/target:/opt/project/ecommerce_dbt/target:rw
+    - ./ecommerce_dbt/logs:/opt/project/ecommerce_dbt/logs:rw
+    - ./ecommerce_dbt/dbt_packages:/opt/project/ecommerce_dbt/dbt_packages:rw
+    # ⭐ 用空檔遮住主機的 .env。這把一條【只存在於註解裡的約定】變成結構保證：
+    #    raw_pending_watch / seed_demo_daily 都寫著「不 cd 進 /opt/project，否則
+    #    load_dotenv 會讀到主機的 .env，那裡的 DB_URL 在容器內是錯的」——那個故障
+    #    的樣子正是本檔 DB_URL 註解警告的「DAG 全綠、ODS 零增長、零錯誤訊息」。
+    #    遮掉之後，就算有人 cd 過去，config 的 env_file 也只會讀到空檔而純吃容器
+    #    環境變數（compose 已注入全部所需的鍵）。附帶把 API_KEYS 等祕密移出容器視野。
+    #    用 /dev/null 而不是 repo 裡的空檔：不必為了掛載而在版控中多一個檔案。
+    - /dev/null:/opt/project/.env:ro
     # 金鑰單檔唯讀掛到固定路徑。左側由 compose 在【主機】上替換，右側是【容器內】路徑。
     # ⭐ 來源檔不存在時，容器會在 create 階段就 exit 127——這是刻意選的失敗方式。
     # ⚠️ 用 GCP_SA_KEY_PATH 而非 GOOGLE_APPLICATION_CREDENTIALS 當來源是刻意的：
@@ -136,7 +158,13 @@ services:
     <<: *airflow-common
     command: api-server
     ports:
-      - "8080:8080"
+      # ⚠️ 綁在 loopback 而非 0.0.0.0：上面的 SIMPLE_AUTH_MANAGER_ALL_ADMINS=true
+      #    表示【任何連得到這個埠的人都是 Airflow admin】——admin 能觸發 DAG、讀
+      #    task log（裡面有連線字串）、看 Connections。免登入本身是刻意的本機選擇，
+      #    但它與「發布到所有介面」疊在一起才構成暴露面。同 otel-collector 只發布
+      #    health 埠的判準：只有需要連的人連得到。
+      #    WSL2 下從 Windows 瀏覽器連 localhost:8080 仍然通（走 loopback 轉發）。
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
       interval: 15s

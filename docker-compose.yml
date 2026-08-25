@@ -43,7 +43,9 @@ services:
       # ⚠️ 對外埠預設 5433 而非 5432：主機上若已有 postgres 佔著 5432，這個服務會
       #    直接起不來（bind: address already in use）。容器之間走 compose 網路的
       #    `db:5432`，完全不經過這個映射——它純粹是給主機端 psql 除錯用的。
-      - "${DB_PUBLISH_PORT:-5433}:5432"
+      # ⚠️ 綁 loopback：密碼是 POSTGRES_PASSWORD 的預設值 `app`，綁 0.0.0.0 等於
+      #    把業務資料庫（Proposal C「從 Raw 重建」的資料錨點）交給同網段的任何人。
+      - "127.0.0.1:${DB_PUBLISH_PORT:-5433}:5432"
 
   # 攝入路徑的 Celery broker。刻意與 Airflow 分開（Airflow 目前是 LocalExecutor、
   # 根本沒有 broker），兩者的故障域不該糾纏——見 docs/zh-TW/design/orchestration.md〈範圍與職責邊界〉。
@@ -60,7 +62,10 @@ services:
       timeout: 3s
       retries: 10
     ports:
-      - "${REDIS_PUBLISH_PORT:-6379}:6379"   # 本機除錯用，正式可移除
+      # ⚠️ 綁 loopback：這個 Redis 【沒有密碼】，而且它是攝入路徑的 broker——
+      #    綁 0.0.0.0 等於讓同網段的任何人讀寫佇列、塞任務給 worker。三個對外埠裡
+      #    這條的後果最直接。本機除錯用，正式可移除。
+      - "127.0.0.1:${REDIS_PUBLISH_PORT:-6379}:6379"
 
   # 遙測的唯一出口。設定與理由見 otel/collector-config.yaml。
   #
@@ -81,7 +86,10 @@ services:
     ports:
       # 只發布 health_check 端點給主機除錯用（curl http://localhost:13133/）。
       # OTLP 的 4317/4318 不發布：只有同網路的容器需要連，發布出去只是擴大暴露面。
-      - "${OTEL_HEALTH_PUBLISH_PORT:-13133}:13133"
+      # 同一個判準往下推一步：連 health 埠也只有主機需要連，故綁 loopback。
+      # （這條的實際風險最小——端點只回傳存活狀態；改它是為了讓五個對外埠的
+      #   規則一致，而不是因為它危險。）
+      - "127.0.0.1:${OTEL_HEALTH_PUBLISH_PORT:-13133}:13133"
     # ⚠️ 沒有 healthcheck 是刻意的，不是漏寫：這個映像裡沒有 shell 也沒有 curl/wget，
     #    容器內跑不了任何探測指令。存活要從主機端 curl 13133，或直接看 Grafana 有沒有
     #    資料——而後者本來就是雲端 absent 告警要回答的問題。
@@ -132,7 +140,10 @@ services:
       otel-collector:
         condition: service_started
     ports:
-      - "8000:8000"
+      # 綁 loopback：容器之間走 compose 網路的 `api:8000`（seed_demo 的 SEED_API_URL
+      # 就是走那條），這個映射純粹是給主機端 curl / Swagger UI 用的。
+      # API 有金鑰驗證，暴露面不像 Airflow UI 那麼直接，但同樣沒有對外的理由。
+      - "127.0.0.1:8000:8000"
     # ⭐ 排程化之後這不再只是「方便」：seed_demo_daily 每天在台北 10/13/17/21 觸發、
     #    orders_analytics_daily 在台北 22:30 觸發，那些時間
     #    點不會有人盯著終端機。一個【排程作業的依賴，不該比排程器本身短命】——

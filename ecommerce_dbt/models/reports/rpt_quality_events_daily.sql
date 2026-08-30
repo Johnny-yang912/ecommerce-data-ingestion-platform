@@ -56,13 +56,31 @@ with events as (
     select * from {{ ref('stg_quality_events') }}
 
     {% if is_incremental() %}
+    {%- set backfill_start = var('rpt_quality_events_backfill_start', none) %}
+    {%- set backfill_end = var('rpt_quality_events_backfill_end', none) %}
+    {% if backfill_start %}
+    -- 定點回填：分區範圍由呼叫者明確指定，不讀時鐘。
+    --   上游 stg_quality_events 補了舊分區時，這裡【必須】用同一組日期跟著補一次——
+    --   例行回看窗看不到舊分區，補了上游不補這裡，BI 會繼續顯示舊值且一路全綠。
+    --   2026-08-30 的 08-26 修復就卡在這一步：stg_ 已是 800，這張表仍是 250。
+    where event_at >= timestamp('{{ backfill_start }}')
+      and event_at < {% if backfill_end %}timestamp('{{ backfill_end }}')
+                     {%- else %}timestamp_add(timestamp('{{ backfill_start }}'), interval 1 day){% endif %}
+    {% else %}
     -- ⚠️ 本回看窗【必須 ≥ var('stg_quality_events_lookback_days')】。
     --    上游窗比下游窗大時，上游今天才補進來的舊事件會落在下游窗外 → 永遠撈不到，
     --    而且不報錯（分區存在、只是內容少算）。兩個 var 要一起調。
+    -- ⚠️ timestamp_trunc(..., day) 不可拿掉——本模型同樣是 insert_overwrite + DAY 分區，
+    --    左邊界落在日中時，邊界那天會拿【半天】原子覆寫【整天】。與 stg_orders /
+    --    stg_quality_events 是同一個缺陷的第三個實例（2026-08-30 一併修）。
+    --    這裡先前之所以沒炸，只是因為攝入批次都在 UTC 13:00 前、而例行跑批在 14:30——
+    --    邊界那天恰好篩出 0 列、分區因此沒被納入覆寫集合而倖存。
+    --    **「靠跑批時刻與攝入時刻的相對位置僥倖」不是正確性**，改攝入排程就會炸。
     where event_at >= timestamp_sub(
-        current_timestamp(),
+        timestamp_trunc(current_timestamp(), day),
         interval {{ var('rpt_quality_events_lookback_days', 3) }} day
     )
+    {% endif %}
     {% endif %}
     -- 全量路徑（首建 / --full-refresh）不加哨兵：stg_quality_events 本身不設
     -- require_partition_filter（保險絲被 stg_ 層擋掉了，見 ecommerce_dbt/README.zh-TW §4.6）。

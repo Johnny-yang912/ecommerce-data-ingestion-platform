@@ -1,15 +1,18 @@
-# Half a day overwrote a whole day: `stg_orders` silently lost 550 rows
+# Half a day overwrote a whole day: one defect hiding in three models
 
 **English** | [繁體中文](../../zh-TW/incidents/2026-08-30-stg-partition-truncation.md)
 
 | | |
 |---|---|
-| **Date** | Occurred 2026-08-29 20:38 · found 2026-08-30 10:20 · repaired same day |
-| **Impact** | `stg_orders`'s `2026-08-26` partition: 800 rows → **250 rows**; the gap propagated to Gold |
+| **Date** | Occurred 2026-08-29 20:38 · found 2026-08-30 10:20 · **repaired same day in two phases** (11:24 / 23:10) |
+| **Impact** | The `2026-08-26` partition of both `stg_orders` and `stg_quality_events`: 800 rows → **250 rows**; the gap propagated to Gold and to the quality reports |
 | **Alerting** | **None.** DAGs green, all 93 dbt tests green, upstream staging untouched |
-| **Detection lag** | ~14 hours, and it was **noticed by eye on a BI dashboard** |
-| **Root cause** | The incremental window's left boundary carried the run's wall-clock time; `insert_overwrite` overwrote a whole day with half a day |
-| **Status** | Closed. Root cause fixed, data restored, detection added |
+| **Detection lag** | Orders ~14 hours; **quality events ~26 hours — and only after phase one had been declared complete** |
+| **Root cause** | The incremental window's left boundary carried the run's wall-clock time; `insert_overwrite` overwrote a whole day with half a day. **The same defect existed in three models** |
+| **Status** | Closed. Root cause fixed in all three models, data restored, detection added (two reconciliation tests) |
+
+> ⚠️ **The phase-one repair recorded in this report was incomplete.** That morning only one of the three models was fixed, and the incident was declared closed on that basis.
+> The full account is in [Phase two: the repair was incomplete](#phase-two-the-repair-was-incomplete) — **that section is the part of this incident worth reading.**
 
 ---
 
@@ -161,6 +164,93 @@ dbt run -s stg_orders+ --exclude stg_orders
 
 > **The record of this backfill is this document.** That is the current mechanism: the record is written by a person, not produced by the system — [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md) records why, and what would change it.
 
+⚠️ **The table above was taken as proof of closure at the time. It covers one of the three affected models.**
+
+---
+
+## Phase two: the repair was incomplete
+
+The 11:24 repair drove `stg_orders`'s per-partition reconciliation to zero everywhere and left all 94 tests green. The judgement at the time was that the incident was closed.
+
+At 23:00 that evening, a routine re-check found Looker's quality panel still showing 250 rows for `2026-08-26` — **and not one signal in the warehouse was red.**
+
+Sweeping every table and every date column in both datasets for `2026-08-26`, exactly one came back as 250:
+
+| Table | `2026-08-26` | Expected |
+|---|---|---|
+| `stg_orders` (fixed that morning) | 800 | 800 ✅ |
+| **`stg_quality_events`** | **250** | 800 ❌ |
+| **`rpt_quality_events_daily`** (what Looker actually reads) | **250** | 800 ❌ |
+
+`stg_quality_events.sql` carried a **verbatim identical** unfixed boundary. Same 20:38 run, same cutoff, same 550 rows gone.
+
+### Why the events side was harder to see than the orders side
+
+The morning restored 550 orders, but their quality events did not come back with them. `int_orders` picks up `quality_state_at` through a **LEFT JOIN**, so those 550 rows returned to Gold **carrying a NULL quality state**:
+
+| | `quality_state_at` IS NULL on `2026-08-26` |
+|---|---|
+| `int_orders` | 499 / 733 |
+| `int_orders_quarantine` | 51 / 67 |
+
+`499 + 51 = 550` — **the very same rows** the morning had restored to Gold.
+
+⭐ The point: **the row count was complete** (all 800 present, none missing), so even the reconciliation test added that morning could not see it. **A LEFT JOIN translates "upstream lost rows" into "downstream has NULL columns"** — the same damage wearing a different disguise, and nothing in the project was watching for that disguise.
+
+### The third model: one that had not broken, merely gone uncovered
+
+After backfilling `stg_quality_events` and rebuilding downstream with `stg_quality_events+`, `rpt_quality_events_daily` reported `0 processed` — `stg_` was already 800 while the table Looker reads was still 250.
+
+It is the **third instance** of the same defect (`insert_overwrite` + DAY partition + an unaligned `current_timestamp() - N day`), but it presented differently:
+
+> **It had not been overwritten wrongly. It had simply never been covered by the window.** The old partition sits outside the lookback window, so backfilling upstream without backfilling it leaves BI showing the stale value — green all the way.
+
+The reason it had not yet blown up was **luck**: ingestion batches all land before 13:00 UTC and the scheduled run is at 14:30, so the boundary day happened to select zero rows and the partition was therefore never added to the overwrite set. **Change the ingestion schedule and it breaks.** Correctness that holds only because of where the run time sits relative to the ingest time is not correctness.
+
+### Phase-two response
+
+All three boundaries aligned to the day edge; `stg_quality_events` and `rpt_quality_events_daily` each given targeted-backfill vars; a second reconciliation test added.
+
+```bash
+dbt run -s stg_quality_events   --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events
+# ⚠️ Downstream incremental models cannot see the old partition — backfill it with the same dates
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+| | Before | After |
+|---|---|---|
+| `stg_quality_events`, 8/26 partition | 250 | **800** |
+| `rpt_quality_events_daily`, 8/26 | 250 | **800** |
+| `int_orders`, 8/26 `quality_state_at` NULL | 499 | **0** |
+| `int_orders_quarantine`, same | 51 | **0** |
+| New reconciliation test | FAIL | **PASS** |
+| Full dbt test suite | 94 / 94 | **95 / 95 PASS** |
+
+> The second reconciliation test also went **red then green**: against the pre-repair state it emitted `2026-08-26 / 800 / 250 / 550`, and passed after the backfill.
+
+**Idempotency, verified in practice**: a plain incremental run with no vars was executed at 23:15 Taipei — precisely the "manual run at an off-schedule hour" that caused the incident — and the `2026-08-26` and `2026-08-27` boundary partitions came through untouched. That is what this fix actually had to prove.
+
+---
+
+## Why phase one was incomplete
+
+This was not "we forgot the other two". The repair's **scope was drawn from the wrong thing**:
+
+> **Scope was drawn from "which table was observed to be wrong", not from "what does the defect look like".**
+
+And the observation itself was biased, so only half of it surfaced:
+
+| | Orders side | Events side |
+|---|---|---|
+| Any signal that morning? | Yes — the BI revenue line got shorter | No |
+| Any test that would go red? | Yes (the new reconciliation test) | No (the test names `stg_orders` only) |
+| Outcome | Fixed | Missed |
+
+The third model was more hidden still: it **had not broken at all**, so no search for "things that are broken" could have found it. It surfaced only during the backfill, as a `0 processed`.
+
+**The correct way to draw the scope is grep.** The defect lives at the level of *how the line is written*, so its extent equals "how many places copied that idiom" and has nothing to do with "how many places have failed yet". Phase two therefore began by sweeping the whole project for the `insert_overwrite` + time-window combination — three models, all handled — and confirming that the extraction path (`WRITE_APPEND`) and the other nine `table` models are structurally immune.
+
 ---
 
 ## Incidental finding: catch-up runs guarantee no ordering between DAGs
@@ -183,7 +273,11 @@ The next `>=` watermark pass picks them up automatically ([ADR-0023](../adr/0023
 
 > **A check written as "remember to run this" is not a check.** That SQL went into the runbook three months ago. Its content was entirely correct; its cost was needing someone to think of it on the right day.
 
-A fourth point, about why this was recoverable at all: **`staging` is append-only and had not been touched.** That is not something this incident fixed — it is the one thing that did not break, and **it is the sole reason all 550 rows could be restored exactly** ([ADR-0025](../adr/0025-staging-additive-only.md)). An immutable upstream is a cost right up until the day you need it.
+> **Fixing one model does not make another one better.** The defect lives at the level of the idiom, so it propagates to every model that copied the boundary. Repair scope must therefore be drawn by **grep**, not by symptom — "what is broken" is a *subset* of "what has this idiom", and a deceptive subset at that: the untouched ones are not safe, merely not yet reached. **By the same token every model needs its own reconciliation test; you cannot infer that this one is safe because that one is tested.**
+
+> **"The row is still there" is not enough either.** The reconciliation test added that morning asks whether rows still exist, one level stronger than a content test — but all 800 rows in `int_orders` were present and what was missing was a column value. **A LEFT JOIN translates upstream row loss into downstream NULLs**, so the loss disguised itself as absence-of-value and walked straight past the defence built for row loss. Defences are shaped around the shape of the damage, and damage changes shape.
+
+A fifth point, about why this was recoverable at all: **`staging` is append-only and had not been touched.** That is not something this incident fixed — it is the one thing that did not break, and **it is the sole reason all 550 rows could be restored exactly** ([ADR-0025](../adr/0025-staging-additive-only.md)). An immutable upstream is a cost right up until the day you need it.
 
 ---
 

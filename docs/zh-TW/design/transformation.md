@@ -44,8 +44,31 @@ timestamp_sub(timestamp_trunc(current_timestamp(), day), interval N day)
 在 20:38 與 22:30 跑會產出不同結果。[ADR-0055](../adr/0055-partition-aligned-incremental-window.md) ·
 [2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)
 
-**定點回填**：`stg_orders_backfill_start` / `_end` 讓修復路徑用日期指定分區，與跑批時刻無關。
-例行路徑仍走滾動窗。守門的是 `assert_stg_orders_matches_staging`（逐分區對帳）。
+⚠️ **這條規則適用於全部三支 `insert_overwrite` 模型**，不是只有 `stg_orders`：
+
+| 模型 | 分區欄 | 回看窗 var | 對帳測試 |
+|---|---|---|---|
+| `stg_orders` | `received_at` | `stg_orders_lookback_days` | `assert_stg_orders_matches_staging` |
+| `stg_quality_events` | `event_at` | `stg_quality_events_lookback_days` | `assert_stg_quality_events_matches_staging` |
+| `rpt_quality_events_daily` | `event_date` | `rpt_quality_events_lookback_days` | （上游兩支覆蓋） |
+
+2026-08-30 第一次套用這條規則時只改了 `stg_orders`，另外兩支照原樣留著、同一天稍晚才補完。
+**缺陷是「寫法」層級的**——新增任何 `incremental` + `insert_overwrite` 模型時，這條規則與
+它的對帳測試一併適用，而這件事目前靠 code review，沒有自動檢查（[ADR-0055](../adr/0055-partition-aligned-incremental-window.md) 代價五）。
+
+**定點回填**：`<model>_backfill_start` / `_end` 讓修復路徑用日期指定分區，與跑批時刻無關。
+例行路徑仍走滾動窗。守門的是逐分區對帳測試。
+
+⚠️ **回填舊分區時，下游的增量模型必須用同一組日期跟著補。** `table` 物化的下游會自動跟上，
+但下游的**增量**模型只重算自己回看窗內的分區——被補的舊分區落在窗外，於是它照舊維持舊值：
+
+```bash
+dbt run -s stg_quality_events   --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+失敗模式是最惡劣的那種：**上游正確、下游錯誤、所有測試全綠、BI 繼續顯示舊數字。**
 
 **`copy_partitions: true`**——sandbox 禁止 DML，而 `insert_overwrite` 預設用 `MERGE`。Copy job 是儲存層級、非 DML、免費的，而且它在**語意上**本來就更合適：去重產出的是一天的完整內容，所以整批替換才是正確的操作。[ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)
 

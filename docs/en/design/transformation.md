@@ -48,9 +48,37 @@ different output at 20:38 than at 22:30.
 [ADR-0055](../adr/0055-partition-aligned-incremental-window.md) ·
 [2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md)
 
-**Targeted backfill**: `stg_orders_backfill_start` / `_end` let the repair path name
+⚠️ **This rule applies to all three `insert_overwrite` models**, not just `stg_orders`:
+
+| Model | Partition column | Lookback var | Reconciliation test |
+|---|---|---|---|
+| `stg_orders` | `received_at` | `stg_orders_lookback_days` | `assert_stg_orders_matches_staging` |
+| `stg_quality_events` | `event_at` | `stg_quality_events_lookback_days` | `assert_stg_quality_events_matches_staging` |
+| `rpt_quality_events_daily` | `event_date` | `rpt_quality_events_lookback_days` | (covered by the two upstream tests) |
+
+When this rule was first applied on 2026-08-30 only `stg_orders` was changed; the other two
+kept the defective boundary and were finished later the same day. **The defect lives at the
+level of the idiom** — any new `incremental` + `insert_overwrite` model brings this rule and
+its reconciliation test with it, and that currently rests on code review with no automated
+check ([ADR-0055](../adr/0055-partition-aligned-incremental-window.md), Cost 5).
+
+**Targeted backfill**: `<model>_backfill_start` / `_end` let the repair path name
 partitions by date, independent of the clock. The routine path still uses the rolling
-window. `assert_stg_orders_matches_staging` (per-partition reconciliation) guards the contract.
+window. Per-partition reconciliation tests guard the contract.
+
+⚠️ **When backfilling an old partition, downstream incremental models must be backfilled with
+the same dates.** Table-materialised downstream follows automatically, but a downstream
+*incremental* model only recomputes partitions inside its own lookback window — the
+backfilled old partition falls outside it and keeps its stale value:
+
+```bash
+dbt run -s stg_quality_events   --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+The failure mode is the worst kind available: **upstream correct, downstream wrong, every
+test green, and BI still showing the old number.**
 
 **`copy_partitions: true`** — the sandbox forbids DML and `insert_overwrite` defaults to `MERGE`. Copy jobs are storage-level, non-DML and free, and are *semantically* the better fit anyway: dedup produces the full contents of a day, so a wholesale swap is the correct operation. [ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)
 

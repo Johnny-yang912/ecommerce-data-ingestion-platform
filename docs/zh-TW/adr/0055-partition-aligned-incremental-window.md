@@ -47,7 +47,35 @@ dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
 
 `_end` 刻意做成可省略：補單日卻把 `_end` 填成當天（而非隔天）會靜默選出空集合，而**回填是最不該留隱形陷阱的路徑**——出事時開指令的人往往不熟這條管線。
 
-**三、逐分區對帳測試**（`assert_stg_orders_matches_staging`）守住這條契約。窗必須 **>** 回看窗。
+**三、逐分區對帳測試**守住這條契約。窗必須 **>** 回看窗。**每支增量模型各要一支**——見決策四。
+
+**四、適用範圍＝所有 `insert_overwrite` + 時間窗的模型，不是只有 `stg_orders`。**
+
+這條是 2026-08-30 補上的，因為第一次套用時漏了三分之二。當時的範圍是照「觀測到哪張表壞掉」劃的，而缺陷是**寫法**層級的——它的範圍等於「有多少地方照抄了這個寫法」，與「有多少地方已經出事」無關。
+
+目前適用的三支，以及各自的守門測試：
+
+| 模型 | 分區欄 | 對帳測試 |
+|---|---|---|
+| `stg_orders` | `received_at` | `assert_stg_orders_matches_staging` |
+| `stg_quality_events` | `event_at` | `assert_stg_quality_events_matches_staging` |
+| `rpt_quality_events_daily` | `event_date` | （上游兩支覆蓋；本身是聚合，無 1:1 對帳對象） |
+
+⚠️ **對帳測試不可共用。** 每支測試只保護它自己指名的那一張表，**不能靠「另一支有測」推論這一支安全**——這正是 8/26 事件線掉列能在對帳測試已經存在的情況下活下來的原因。
+
+**新增任何 `incremental` + `insert_overwrite` 模型時，這條規則與它的對帳測試一併適用。** 目前這件事靠 code review，沒有自動檢查——見〈後果〉代價五。
+
+**五、上游回填舊分區後，下游增量模型必須用同一組日期跟著補。**
+
+```bash
+dbt run -s stg_quality_events   --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events      # table 物化的下游會自動跟上
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+第三行不是多餘的。`stg_quality_events+` 會重建下游，但**下游的增量模型只重算自己回看窗內的分區**——被補的舊分區落在窗外，於是它照舊維持舊值。
+
+> 失敗模式是最惡劣的那種：**上游正確、下游錯誤、所有測試全綠、BI 繼續顯示舊數字。** 2026-08-30 的修復就卡在這一步——`stg_quality_events` 已經是 800，Looker 讀的 `rpt_quality_events_daily` 仍然是 250。
 
 ## 這個右界為何不牴觸 ADR-0037
 
@@ -82,7 +110,17 @@ dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
 
 **代價四：修復沒有自動的稽核紀錄。** 定點回填是一次 shell 呼叫——它修好資料，但系統不會留下「`2026-08-26` 曾經被補過」這件事。要回答三個月後的「這天的數字為什麼跟上游對不起來」，只能靠事故報告、CHANGELOG 與 git 歷史，**而那三者都倚賴人記得去寫**。
 
-⚠️ 這個缺口的範圍比它聽起來窄：**紀錄靠人，偵測不靠人。** 下一次掉列會被 `assert_stg_orders_matches_staging` 自動抓到並指出是哪一天、少幾筆——沒有人需要記得去跑它。人工的部分只有「補完之後把它寫下來」。
+⚠️ 這個缺口的範圍比它聽起來窄：**紀錄靠人，偵測不靠人。** 下一次掉列會被對帳測試自動抓到並指出是哪一天、少幾筆——沒有人需要記得去跑它。人工的部分只有「補完之後把它寫下來」。
+
+> **修正（2026-08-30 當晚）**：本節原本寫的是「下一次掉列會被 `assert_stg_orders_matches_staging` 自動抓到」。
+> **那句話在寫下的當天就被推翻了。** 同一次跑批造成的 `stg_quality_events` 掉列，它一列都沒抓到——因為它只指名 `stg_orders`。
+> 正確的陳述是：**對帳測試保護的是它指名的那一張表，不是「掉列」這個類別。** 覆蓋率等於「有幾支模型各自有一支測試」。
+
+**代價五：「新模型必須套用這條規則」目前沒有自動檢查。** 決策四把適用範圍寫清楚了，但它仍然是一份需要作者去讀、去遵守的規則——**而這正是本 ADR 自己批評過的那種機制**（見事故報告〈教訓〉：一份寫成「要人記得」的檢查等於沒有這份檢查）。
+
+誠實的現況：**這條規則現在靠 code review，不靠系統。** 已知的收口方式是把邊界抽成共用 macro（讓三份手寫變成一份定義），再加一條 CI 檢查——凡 `insert_overwrite` 模型未呼叫該 macro 即 fail，並保留顯式 opt-out 標記以維持彈性（opt-out 會出現在 diff 裡，手寫邊界不會）。專案已有同形狀的先例：`tests/test_dags.py` 就在對 DAG 原始碼做這類結構斷言。
+
+**暫緩，不是否決。** 三支模型此刻全部一致且有測試守著，抽象化的收益要到第四支出現時才兌現；而把抽象化與資料修復綁在同一次改動裡，會讓「回填錯了」與「macro 寫錯了」無法分辨。條件記在 [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md)。
 
 緩解是把「記錄下來」寫成 [dbt-ops runbook](../runbooks/dbt-ops.md) 的一個**步驟**，而不是一句期望。由系統自動產生這份紀錄的做法暫緩，條件記在 [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md)。
 
@@ -107,7 +145,8 @@ dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
 ## 何時重新檢視
 
 - **啟用 BigQuery 帳單時**——改用 `merge` 並重估這條 ADR 是否還需要存在。
-- **`int_` 層改成增量時**——同一條邊界規則必須一起套用，且 ADR-0046 已記載它的重選集合更複雜（回看窗分區 ∪ 有品質事件的 `raw_id` 所屬分區）。
+- **`int_` 層改成增量時**——同一條邊界規則必須一起套用（它會是第四個實例），且 ADR-0046 已記載它的重選集合更複雜（回看窗分區 ∪ 有品質事件的 `raw_id` 所屬分區）。
+- **新增第四支 `insert_overwrite` 模型時**——代價五的抽象化（共用 macro + CI 檢查）在那個時點兌現收益，應重新評估。
 - **資料量讓「多含一天」有感時**。
 - **出現第二位操作者時**——代價四的人工紀錄從此不可靠，見 [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md)。
 

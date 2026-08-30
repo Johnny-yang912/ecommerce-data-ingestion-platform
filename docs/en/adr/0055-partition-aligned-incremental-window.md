@@ -47,7 +47,35 @@ dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
 
 `_end` is deliberately optional: backfilling a single day while passing the same date as `_end` (rather than the day after) would silently select the empty set, and **a repair path is the worst place to leave a hidden trap** — the person typing the command during an incident often does not know this pipeline well.
 
-**3. A per-partition reconciliation test** (`assert_stg_orders_matches_staging`) guards the contract. Its window must be **greater than** the lookback window.
+**3. A per-partition reconciliation test** guards the contract. Its window must be **greater than** the lookback window. **Every incremental model needs its own** — see decision 4.
+
+**4. Scope is every `insert_overwrite` + time-window model, not `stg_orders` alone.**
+
+This clause was added on 2026-08-30, because the first application of this ADR missed two thirds of its scope. The scope had been drawn from "which table was observed to be wrong", whereas the defect lives at the level of *how the line is written* — its extent equals "how many places copied that idiom" and has nothing to do with "how many places have failed yet".
+
+The three models it currently covers, and what guards each:
+
+| Model | Partition column | Reconciliation test |
+|---|---|---|
+| `stg_orders` | `received_at` | `assert_stg_orders_matches_staging` |
+| `stg_quality_events` | `event_at` | `assert_stg_quality_events_matches_staging` |
+| `rpt_quality_events_daily` | `event_date` | (covered by the two upstream tests; it is an aggregate with no 1:1 counterpart) |
+
+⚠️ **Reconciliation tests cannot be shared.** Each one protects only the table it names; **you cannot infer that this model is safe because that one is tested** — which is exactly how the 8/26 loss on the events side survived while a reconciliation test already existed.
+
+**Any new `incremental` + `insert_overwrite` model brings this rule and its reconciliation test with it.** That currently rests on code review, with no automated check — see Cost 5.
+
+**5. After backfilling an old partition upstream, downstream incremental models must be backfilled with the same dates.**
+
+```bash
+dbt run -s stg_quality_events   --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events      # table-materialised downstream follows automatically
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+The third line is not redundant. `stg_quality_events+` does rebuild downstream, but **a downstream incremental model only recomputes partitions inside its own lookback window** — the backfilled old partition falls outside it, so it keeps its stale value.
+
+> The failure mode is the worst kind available: **upstream correct, downstream wrong, every test green, and BI still showing the old number.** The 2026-08-30 repair stalled exactly here — `stg_quality_events` was already 800 while `rpt_quality_events_daily`, the table Looker reads, was still 250.
 
 ## Why this right boundary does not contradict ADR-0037
 
@@ -82,7 +110,17 @@ The decisive difference is **one-shot-ness**: the shape 0037 rejected ties "were
 
 **Cost 4: repairs leave no automatic audit record.** A targeted backfill is one shell invocation — it fixes the data, but the system retains nothing saying `2026-08-26` was ever rebuilt. Answering "why does this day disagree with upstream?" three months from now depends on incident reports, the CHANGELOG and git history — **all three of which rely on a person remembering to write them**.
 
-⚠️ This gap is narrower than it sounds: **the record is manual, the detection is not.** The next instance of row loss will be caught by `assert_stg_orders_matches_staging`, which names the day and the shortfall; nobody has to remember to run it. What is manual is only writing down that a repair happened.
+⚠️ This gap is narrower than it sounds: **the record is manual, the detection is not.** The next instance of row loss will be caught by a reconciliation test, which names the day and the shortfall; nobody has to remember to run it. What is manual is only writing down that a repair happened.
+
+> **Correction (evening of 2026-08-30)**: this paragraph originally read "the next instance of row loss will be caught by `assert_stg_orders_matches_staging`".
+> **That sentence was falsified the same day it was written.** The `stg_quality_events` row loss from the very same run was not caught at all — because that test names `stg_orders` and nothing else.
+> The accurate statement is: **a reconciliation test protects the table it names, not the category "row loss".** Coverage equals the number of models that each have one.
+
+**Cost 5: "new models must follow this rule" has no automated check.** Decision 4 states the scope clearly, but it remains a rule an author has to read and comply with — **which is precisely the kind of mechanism this ADR's own incident report criticises** (see its Lessons: a check written as "remember to run this" is not a check).
+
+The honest position: **this rule currently rests on code review, not on the system.** The known way to close it is to extract the boundary into a shared macro (turning three hand-written copies into one definition), plus a CI check that fails any `insert_overwrite` model which does not call it, with an explicit opt-out marker to preserve flexibility (an opt-out shows up in the diff; a hand-written boundary does not). The project already has the same shape: `tests/test_dags.py` makes structural assertions against DAG source.
+
+**Deferred, not rejected.** All three models are consistent right now and each is guarded by a test; the abstraction only pays off when a fourth appears, and binding it into the same change as a data repair would make "the backfill was wrong" and "the macro was wrong" indistinguishable. Conditions recorded in [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md).
 
 The mitigation is to make "record it" a **step** in the [dbt-ops runbook](../runbooks/dbt-ops.md) rather than an expectation. Having the system produce that record is deferred; conditions in [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md).
 
@@ -107,7 +145,8 @@ The deferral and its restart conditions are recorded in [PORTFOLIO_SCOPE #13](..
 ## Revisit when
 
 - **BigQuery billing is enabled** — switch to `merge` and reassess whether this ADR still needs to exist.
-- **The `int_` layer goes incremental** — the same boundary rule must be applied there, and ADR-0046 already records that its reselection set is more complex (lookback partitions ∪ partitions of `raw_id`s with recent quality events).
+- **The `int_` layer goes incremental** — the same boundary rule must be applied there (it would be the fourth instance), and ADR-0046 already records that its reselection set is more complex (lookback partitions ∪ partitions of `raw_id`s with recent quality events).
+- **A fourth `insert_overwrite` model is added** — that is the point at which Cost 5's abstraction (shared macro + CI check) starts paying for itself, and should be reassessed.
 - **Volume makes "up to one extra day" material.**
 - **A second operator appears** — Cost 4's hand-written record stops being reliable; see [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md).
 

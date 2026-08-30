@@ -84,3 +84,10 @@ vars:
   #   對帳也不再檢查它，損壞被永久固化且從此全綠。7 天＝3 天回看窗 + 一次週末的餘裕。
   #   這是偵測能力的下限，不是成本旋鈕；兩個 var 要一起調。
   stg_orders_recon_window_days: 7
+
+  # stg_quality_events 逐分區對帳的比對窗（見 tests/assert_stg_quality_events_matches_staging.sql）。
+  # ⚠️【必須 > stg_quality_events_lookback_days（預設 3）】，理由與上面那個 var 逐字相同。
+  #   刻意獨立成第二個 var 而非共用一個：兩支模型的回看窗本來就可以各自調
+  #   （事件量與訂單量不同），共用一個會讓「調了訂單的窗、卻悄悄改壞事件的偵測下限」
+  #   變成可能。四個 var（兩組回看窗＋對帳窗）成組維護。
+  stg_quality_events_recon_window_days: 7

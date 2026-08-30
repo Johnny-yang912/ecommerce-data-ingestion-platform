@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 單元 + 整合（mock DB） | 445 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
 | DAG 結構 | 52 | CI，`dags.yml` | Airflow，不需 DB、不需專案環境變數 |
-| dbt | 94 | 在 DAG 內 | BigQuery |
+| dbt | 95 | 在 DAG 內 | BigQuery |
 | 手動腳本 | 3 | 手動 | 真實 server + 真實 Postgres |
 
 單元測試覆蓋率為**受管的 12 個模組 100%**，跨 **Python 3.10 與 3.12** 矩陣。測試依賴釘在 `requirements-dev.txt`。
@@ -89,7 +89,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 
 ## 6. dbt 測試清單
 
-共 94 個測試。完整列出，因為「哪個測試守什麼」無法從 model 檔推導出來：
+共 95 個測試。完整列出，因為「哪個測試守什麼」無法從 model 檔推導出來：
 
 | 測試 | 目標 | 嚴重度 | 說明 |
 |---|---|---|---|
@@ -98,7 +98,8 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 | `unique` + `not_null` | `stg_` 的 `raw_id`／`id`／`order_id`；`int_` 的 `raw_id`／`order_id` | error | `stg_` 的 `unique(raw_id)` **就是**去重檢查 |
 | `not_null` | `received_at`／`has_clean_error`／`has_schema_drift` | error | REQUIRED 欄位 |
 | source freshness | `staging.orders`、`staging.quality_events` | warn 26h／error 50h | 帶 `filter` 以繞過保險絲 |
-| ⭐ `assert_stg_orders_matches_staging` | `staging.orders` 的 `distinct raw_id` vs `stg_orders` 的列數，**逐分區** | error | **對帳，不是內容。** `stg_` 對 staging 只做去重、不做過濾，所以兩個數字必須逐分區相等。這是清單裡唯一問「列還在不在」的測試——[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)裡活下來的每一列都完全正常，問題是少了 550 列，其餘所有測試對此結構性地盲。窗（7 天）**必須 > 回看窗**（3 天），否則損壞會在被看見前滑出兩個窗 |
+| ⭐ `assert_stg_orders_matches_staging` | `staging.orders` 的 `distinct raw_id` vs `stg_orders` 的列數，**逐分區** | error | **對帳，不是內容。** `stg_` 對 staging 只做去重、不做過濾，所以兩個數字必須逐分區相等。這是清單裡**兩支**問「列還在不在」的測試之一（另一支見下列）——[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)裡活下來的每一列都完全正常，問題是少了 550 列，其餘所有測試對此結構性地盲。窗（7 天）**必須 > 回看窗**（3 天），否則損壞會在被看見前滑出兩個窗 |
+| ⭐ `assert_stg_quality_events_matches_staging` | `staging.quality_events` 的 `distinct id` vs `stg_quality_events` 的列數，**逐分區** | error | 上一列的孿生測試。去重鍵是 `id`（事件 PK）而非 `raw_id`——一個 `raw_id` 合法地有多個事件，拿 `raw_id` 對帳會把正常的事件序列誤判成「多出來的列」。**兩支必須各自存在**：[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)第二階段裡，事件線同樣掉了 550 列，而上一列那支測試一列都沒抓到——它只指名 `stg_orders` |
 | ⭐ `assert_orders_split_is_partition` | `int_orders` ∪ `int_orders_quarantine` 對 `stg_orders` | error | **劃分不變式**——每個 `raw_id` 恰好出現一次。重複區塊之下唯一的自動化安全網，守住對齊清單第 1–4 項。**永不降級** |
 | `assert_int_orders_no_unpromoted_dirty` | `int_orders` | error | **Gold 契約**——不得有未被 promote 的 `has_clean_error=TRUE` 列。寫成 singular 而非欄位測試，因為它是**兩個欄位之間的條件關係**：`has_clean_error=TRUE` 在這裡是合法的 |
 | `accepted_values` | 兩張 `int_` 表的 `effective_quality_state` | error | 兩者的值域互斥（`clean`／`promoted` vs `quarantined`／`permanently_rejected`）——**從另一個角度交叉驗證那個劃分** |
@@ -129,7 +130,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 
 ### 對帳測試與內容測試
 
-上表除了 `assert_stg_orders_matches_staging`，其餘每一條問的都是**內容**：這個值合不合約、
+上表除了兩支 `*_matches_staging`，其餘每一條問的都是**內容**：這個值合不合約、
 這個關係成不成立、這個粒度對不對。它們共有一個前提——**要被檢查的列，得先在那裡**。
 
 掉列是一種正交的失效，而且它安靜得多：
@@ -144,6 +145,32 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 > 在資料被刪掉時是全綠的。
 
 對帳測試的成本是一次 `count(*)`，所以「有沒有必要」不是成本問題，是有沒有想到的問題。
+
+### 對帳測試保護的是「表」，不是「掉列」這個類別
+
+⚠️ **每支增量模型都需要自己的一支對帳測試。不能靠「另一支有測」推論這一支安全。**
+
+這條寫得像廢話，但它是實際踩過的：2026-08-30 上午加上 `assert_stg_orders_matches_staging`
+之後，ADR-0055 曾經寫下「下一次掉列會被自動抓到」。**同一天稍晚，`stg_quality_events`
+掉了 550 列，那支測試一列都沒抓到**——因為它只指名 `stg_orders`。
+
+覆蓋率不等於「有沒有這類測試」，而等於**有幾支模型各自有一支**。
+
+### 還有一層：掉列會偽裝成缺值
+
+對帳測試比內容測試強了一級（它問「列還在不在」），但它仍然有前提——**它只看得見它那張表**。
+
+同一次事故的第二階段裡，`int_orders` 的 `2026-08-26` 有完整的 800 列，一列不少，
+但其中 550 列的 `quality_state_at` 是 NULL：上游 `stg_quality_events` 掉的列，
+經過 **LEFT JOIN** 之後變成了下游的**空欄位**。
+
+| | 掉列 | 經 LEFT JOIN 後 |
+|---|---|---|
+| 症狀 | 少了一些列 | 列數完全正確，某個欄位變 NULL |
+| 誰抓得到 | 對帳測試 | **目前沒有任何一條測試** |
+
+> **防線是照損害的形狀設計的，而損害會換形狀。** 這個缺口目前是開著的——
+> 對它的補法（`quality_state_at` 的 `not_null`，或跨層的事件覆蓋率對帳）尚未實作。
 
 ---
 

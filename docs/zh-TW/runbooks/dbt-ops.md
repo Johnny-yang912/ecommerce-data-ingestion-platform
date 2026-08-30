@@ -57,7 +57,7 @@ dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
 # 補一段區間（end 為【不含】）
 dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26", stg_orders_backfill_end: "2026-08-29"}'
 
-# 下游跟上（int_/dim_/fct_/rpt_ 都是 table 物化）
+# 下游跟上（int_/dim_/fct_ 與 rpt_sales/rpt_quality_backlog 是 table 物化，會自動重算）
 dbt run -s stg_orders+ --exclude stg_orders
 ```
 
@@ -65,6 +65,32 @@ dbt run -s stg_orders+ --exclude stg_orders
 
 ⚠️ **第二步的 `--exclude stg_orders` 不可省。** 少了它，`stg_orders` 會用滾動窗
 再跑一次，把剛補好的舊分區重新推出窗外——修復被自己的下一步覆蓋掉。
+
+### 事件線的回填（`stg_quality_events`）
+
+⚠️ **不是只有 `stg_orders` 會壞。** 品質事件走另一條平行的管線，用它自己的 var：
+
+```bash
+dbt run -s stg_quality_events --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events
+```
+
+### ⚠️ 下游的**增量**模型不會自己跟上
+
+上面那個 `+` 只讓 **table 物化**的下游自動重算。下游若也是增量模型，它**只重算自己回看窗
+內的分區**——你剛補的舊分區落在窗外，於是它維持舊值不動。
+
+目前唯一這樣的下游是 **`rpt_quality_events_daily`**（Looker 的品質面板讀的就是它）：
+
+```bash
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+> 漏掉這一步的症狀：**上游正確、下游錯誤、所有測試全綠、BI 繼續顯示舊數字。**
+> 2026-08-30 的修復就卡在這裡——`stg_quality_events` 已經補成 800，Looker 仍顯示 250。
+
+**判準**：回填任何分區之後，檢查下游有沒有 `materialized='incremental'` 的模型；
+有的話，用同一組日期再補一次。
 
 **這條路徑與跑批時刻無關**，任何時間執行結果都一樣。這不是巧合，是
 [ADR-0055](../adr/0055-partition-aligned-incremental-window.md) 買到的東西。

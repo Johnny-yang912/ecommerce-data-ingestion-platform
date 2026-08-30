@@ -12,7 +12,7 @@ What is tested, where, and — most importantly — **where the tests are blind*
 |---|---|---|---|
 | Unit + integration (mock DB) | 445 | CI, `ci.yml` | nothing — seconds to run |
 | DAG structure | 52 | CI, `dags.yml` | Airflow, no DB, no project env |
-| dbt | 94 | in the DAG | BigQuery |
+| dbt | 95 | in the DAG | BigQuery |
 | Manual scripts | 3 | by hand | a real server + real Postgres |
 
 Unit coverage is **100% of the 12 gated modules**, across a **Python 3.10 and 3.12** matrix. Test dependencies are pinned in `requirements-dev.txt`.
@@ -89,7 +89,7 @@ All three hit a real server and a real PostgreSQL. Their results are recorded in
 
 ## 6. The dbt test inventory
 
-94 tests. The full list, because "which test guards what" is not derivable from the model files:
+95 tests. The full list, because "which test guards what" is not derivable from the model files:
 
 | Test | Target | Severity | Notes |
 |---|---|---|---|
@@ -98,7 +98,8 @@ All three hit a real server and a real PostgreSQL. Their results are recorded in
 | `unique` + `not_null` | `stg_`'s `raw_id`/`id`/`order_id`; `int_`'s `raw_id`/`order_id` | error | `stg_`'s `unique(raw_id)` **is** the dedup check |
 | `not_null` | `received_at` / `has_clean_error` / `has_schema_drift` | error | REQUIRED columns |
 | source freshness | `staging.orders`, `staging.quality_events` | warn 26h / error 50h | with `filter` to bypass the fuse |
-| ⭐ `assert_stg_orders_matches_staging` | `staging.orders`'s `distinct raw_id` vs `stg_orders`'s row count, **per partition** | error | **Reconciliation, not content.** `stg_` only dedups staging, it never filters, so the two counts must agree partition by partition. This is the only test in the list that asks whether rows are *still there* — in the [2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md) every surviving row was perfectly valid; 550 were simply gone, and every other test is structurally blind to that. Its window (7d) **must exceed the lookback window** (3d), or damage slides out of both before anyone sees it |
+| ⭐ `assert_stg_orders_matches_staging` | `staging.orders`'s `distinct raw_id` vs `stg_orders`'s row count, **per partition** | error | **Reconciliation, not content.** `stg_` only dedups staging, it never filters, so the two counts must agree partition by partition. This is one of the **two** tests in the list that ask whether rows are *still there* (the other is the row below) — in the [2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md) every surviving row was perfectly valid; 550 were simply gone, and every other test is structurally blind to that. Its window (7d) **must exceed the lookback window** (3d), or damage slides out of both before anyone sees it |
+| ⭐ `assert_stg_quality_events_matches_staging` | `staging.quality_events`'s `distinct id` vs `stg_quality_events`'s row count, **per partition** | error | The twin of the row above. The dedup key is `id` (the event PK), not `raw_id` — one `raw_id` legitimately has many events, so reconciling on `raw_id` would read a normal event sequence as "extra rows". **Both must exist separately**: in phase two of the [2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md) the events side lost 550 rows too, and the test above caught none of it — it names `stg_orders` and nothing else |
 | ⭐ `assert_orders_split_is_partition` | `int_orders` ∪ `int_orders_quarantine` vs `stg_orders` | error | **Partition invariant** — every `raw_id` appears exactly once. The only automated safety net under the duplicated block, guarding checklist items #1–#4. **Never downgrade** |
 | `assert_int_orders_no_unpromoted_dirty` | `int_orders` | error | **Gold contract** — no `has_clean_error=TRUE` row that hasn't been promoted. A singular test rather than a column test because it is a **conditional relation between two columns**: `has_clean_error=TRUE` is legal here |
 | `accepted_values` | `effective_quality_state` on both `int_` tables | error | The two domains are disjoint (`clean`/`promoted` vs `quarantined`/`permanently_rejected`) — **cross-checks the partition from another angle** |
@@ -129,7 +130,7 @@ Contrast `assert_rpt_sales_no_item_loss`, which *is* written now: it tests **row
 
 ### Reconciliation tests vs content tests
 
-Every test above except `assert_stg_orders_matches_staging` asks about **content**: is this
+Every test above except the two `*_matches_staging` tests asks about **content**: is this
 value within contract, does this relationship hold, is this grain right. They share one
 precondition — **the row being checked has to be there**.
 
@@ -146,6 +147,37 @@ Row loss is an orthogonal failure, and a much quieter one:
 
 A reconciliation test costs one `count(*)`, so whether to have one is not a cost question.
 It is a question of whether anyone thought of it.
+
+### A reconciliation test protects a *table*, not the category "row loss"
+
+⚠️ **Every incremental model needs its own reconciliation test. You cannot infer that this
+model is safe because that one is tested.**
+
+That reads like a truism, but it was learned the hard way: after
+`assert_stg_orders_matches_staging` was added on the morning of 2026-08-30, ADR-0055 stated
+that "the next instance of row loss will be caught automatically". **Later the same day
+`stg_quality_events` lost 550 rows and that test caught none of it** — because it names
+`stg_orders`.
+
+Coverage is not "do we have this kind of test". Coverage is **how many models each have one**.
+
+### And one level beyond: row loss disguises itself as absence of value
+
+A reconciliation test is one level stronger than a content test — it asks whether rows still
+exist. But it has a precondition of its own: **it only sees its own table.**
+
+In phase two of the same incident, `int_orders` held a complete 800 rows for `2026-08-26`,
+none missing — and 550 of them had a NULL `quality_state_at`. The rows lost upstream in
+`stg_quality_events` became **empty columns** downstream, through a **LEFT JOIN**.
+
+| | Row loss | After a LEFT JOIN |
+|---|---|---|
+| Symptom | Some rows are missing | Row count is exactly right, one column goes NULL |
+| What catches it | A reconciliation test | **Nothing currently in the suite** |
+
+> **Defences are shaped around the shape of the damage, and damage changes shape.** This gap
+> is open: the fix for it (a `not_null` on `quality_state_at`, or a cross-layer event-coverage
+> reconciliation) is not implemented.
 
 ---
 

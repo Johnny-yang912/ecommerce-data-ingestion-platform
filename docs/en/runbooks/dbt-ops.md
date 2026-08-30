@@ -58,7 +58,7 @@ dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
 # a range (end is EXCLUSIVE)
 dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26", stg_orders_backfill_end: "2026-08-29"}'
 
-# let downstream follow (int_/dim_/fct_/rpt_ are all table materialisations)
+# let downstream follow (int_/dim_/fct_ and rpt_sales/rpt_quality_backlog are table materialisations)
 dbt run -s stg_orders+ --exclude stg_orders
 ```
 
@@ -67,6 +67,36 @@ dbt run -s stg_orders+ --exclude stg_orders
 ⚠️ **`--exclude stg_orders` in the second step is not optional.** Without it,
 `stg_orders` runs again on the rolling window and pushes the partition you just
 repaired back outside it — the fix is overwritten by its own next step.
+
+### Backfilling the events side (`stg_quality_events`)
+
+⚠️ **`stg_orders` is not the only model that breaks.** Quality events run a parallel
+pipeline with their own vars:
+
+```bash
+dbt run -s stg_quality_events --vars '{stg_quality_events_backfill_start: "2026-08-26"}'
+dbt run -s stg_quality_events+ --exclude stg_quality_events
+```
+
+### ⚠️ Downstream *incremental* models do not follow on their own
+
+The `+` above only makes **table-materialised** downstream recompute. A downstream model
+that is itself incremental **only recomputes partitions inside its own lookback window** —
+the old partition you just backfilled falls outside it, so it keeps its stale value.
+
+Today the only such downstream is **`rpt_quality_events_daily`** (the table Looker's
+quality panel reads):
+
+```bash
+dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: "2026-08-26"}'
+```
+
+> Symptom of skipping this step: **upstream correct, downstream wrong, every test green,
+> and BI still showing the old number.** The 2026-08-30 repair stalled exactly here —
+> `stg_quality_events` was already back to 800 while Looker still showed 250.
+
+**Rule of thumb**: after backfilling any partition, check whether anything downstream is
+`materialized='incremental'`. If so, backfill it with the same dates.
 
 **This path does not depend on the time of day**; it produces the same result whenever
 you run it. That is not luck, it is what [ADR-0055](../adr/0055-partition-aligned-incremental-window.md)

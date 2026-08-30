@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 單元 + 整合（mock DB） | 445 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
 | DAG 結構 | 52 | CI，`dags.yml` | Airflow，不需 DB、不需專案環境變數 |
-| dbt | 95 | 在 DAG 內 | BigQuery |
+| dbt | 97 | 在 DAG 內 | BigQuery |
 | 手動腳本 | 3 | 手動 | 真實 server + 真實 Postgres |
 
 單元測試覆蓋率為**受管的 12 個模組 100%**，跨 **Python 3.10 與 3.12** 矩陣。測試依賴釘在 `requirements-dev.txt`。
@@ -89,7 +89,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 
 ## 6. dbt 測試清單
 
-共 95 個測試。完整列出，因為「哪個測試守什麼」無法從 model 檔推導出來：
+共 97 個測試。完整列出，因為「哪個測試守什麼」無法從 model 檔推導出來：
 
 | 測試 | 目標 | 嚴重度 | 說明 |
 |---|---|---|---|
@@ -106,6 +106,8 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 | `unique_combination_of_columns` + `relationships` | `int_order_items` 的 `(raw_id, item_index)`；`raw_id → int_orders` | error | item 粒度唯一性與血緣完整性 |
 | ⭐ `assert_fct_orders_rollup_matches_items` | `fct_orders` 的上捲 vs `fct_order_items` 的聚合 | error | **上捲一致性不變式。** 逐訂單以 `is distinct from` 比對——用 `=` 會讓「兩邊都是 NULL」的列被靜默濾掉 |
 | ⭐ `assert_fct_orders_complete_projection` | 窗口內的 `int_orders` vs `fct_orders` | error | **無損投影**——攔截已經在 `int_` 發生過，所以 Gold 不得掉任何一列。寫成對 `order_date` 窗口的 anti-join 而非 `count = count`，因為**兩張表的 60 天時鐘掛在不同軸上**，用計數比較會每天 flaky |
+| ⭐ `assert_int_orders_quality_state_resolved` | 兩張 `int_` 表的 `quality_state_at` 為 NULL **且** `received_at` 落在 2～50 天窗內 | **warn** | **缺值失效**——專案裡的第三種失效形狀。`int_orders` 以 LEFT JOIN 取品質狀態，上游掉列時本層**列數完全正確、只有欄位變 NULL**，逐分區對帳（只數自己那張表）結構性地看不見。[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)第二階段即如此：800 列一列不少，其中 550 列品質狀態是空的，94 條測試全綠。**測的是「不准一直是 NULL」而非「不准是 NULL」**——事件缺席的 fallback 是刻意設計，只允許造成延遲。下界**必須 > 一個 DAG 週期**；上界排除保留期過期競態（作品限制）。**warn 是最終決定**，理由見下文 |
+| `assert_initial_event_shares_order_timestamp` | `initial_evaluation` 的 `event_at` vs 該訂單的 `received_at` | **warn** | **假設的金絲雀**，不是正確性測試——它保護的是上一列那支測試的**推導基礎**：2 天下界能成立，全靠「訂單與初始事件同 transaction 寫入」。時戳相等是那個結構的可觀測代理；寫入若改成非同步，這裡會先看見。⚠️ **必須限定 `initial_evaluation`**：promotion 的 `event_at=now()` 與 `received_at` 無關，不限定的版本是錯的（目前 31 筆 promotion 碰巧同分區，那是巧合不是結構） |
 | `assert_product_attributes_stable` | `int_order_items` 上的 `product_id` → 屬性 | **warn** | 那是上游契約的訊號，不是這一層的缺陷——若 `product_id` 決定不了屬性，該修上游而非停下 DAG |
 | `unique` + `not_null` | 維度鍵；`fct_orders.order_id`；`fct_order_items.order_item_key` | error | 維度粒度與代理鍵唯一性 |
 | `relationships` | `customer_id`／`product_id` → `dim_*`；`fct_order_items.order_id` → `fct_orders` | error | 星型結構的 FK 完整性，搭配 `not_null`（unknown member 保證 FK 永不為 NULL） |
@@ -167,10 +169,71 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 | | 掉列 | 經 LEFT JOIN 後 |
 |---|---|---|
 | 症狀 | 少了一些列 | 列數完全正確，某個欄位變 NULL |
-| 誰抓得到 | 對帳測試 | **目前沒有任何一條測試** |
+| 誰抓得到 | 對帳測試 | `assert_int_orders_quality_state_resolved` |
 
-> **防線是照損害的形狀設計的，而損害會換形狀。** 這個缺口目前是開著的——
-> 對它的補法（`quality_state_at` 的 `not_null`，或跨層的事件覆蓋率對帳）尚未實作。
+> **防線是照損害的形狀設計的，而損害會換形狀。**
+
+**這支測的是「不准【一直】是 NULL」，不是「不准是 NULL」。** 這個區別是它的全部：
+
+`int_orders` 的 LEFT JOIN 有一個刻意的 fallback——事件缺席時 fall back 到 ODS 快照
+（乾淨照流、髒的續留 quarantine），[cloud-layer](./cloud-layer.md) 明定它**只造成延遲、
+不造成髒資料**。所以 NULL 本身合法，直接 `not_null` 會在每次跑批的最新分區固定閃黃，
+而 **routine 的黃燈等於沒有燈**（本專案已為同一件事付過代價：freshness 恆紅，
+最後被迫拆成獨立 DAG，[ADR-0039](../adr/0039-observation-signals-own-dag.md)）。
+
+這支斷言的是那個 fallback 的**時效上界**：延遲可以，永久缺席不行。檢查窗是
+**2 天 ～ 50 天**——下界必須 > 一個完整 DAG 週期（否則正常的自癒過程本身會讓它變紅），
+上界把保留期邊緣排除在外（見下）。
+
+合法暫態為什麼這麼窄，值得記下來——它是下界的推導依據：`process.py` 在**同一個
+transaction** 裡寫 ODS 與 quality_event，兩者時戳都是 `func.now()`。
+
+> ⚠️ 這條相等**只對 `initial_evaluation` 成立**。Proposal B 的 promotion 事件
+> `event_at = now()`，落在**較晚**的分區——所以「訂單與它的事件永遠同分區」是**錯的**。
+> 正確的敘述是：**訂單與它的 `initial_evaluation` 必在同一分區**（同 transaction、同時戳），
+> 而後續事件落在更晚的分區，因此只會**比訂單更晚過期**，不會讓訂單變成遺孤。
+> 過期對稱靠的是前半句。守門的是 `assert_initial_event_shares_order_timestamp`。
+
+唯一的縫隙是兩個並行 extract task 相隔數秒讀 ODS。這個縫隙**由建構證明是自癒的**：
+偏斜只可能丟掉**最前緣**的列，而最前緣正是 watermark 的來源（destination-derived
+`MAX(partition_id)`），所以 watermark 永遠不會越過被丟掉的那一列，下一輪 `>=` 必然重抓。
+
+### 為什麼是 warn，而且是最終決定
+
+**severity 編碼的是「正確的處置動作」，不是「我們有多確定」。** 判準沿用
+`assert_product_attributes_stable`：error ＝「我們自己的 SQL 對不對」，warn ＝ 其他來源的訊號。
+
+1. **它紅的時候 Gold 沒有錯。** fallback 保證「延遲、不髒」——漏掉的是一次可能的 promotion
+   （品質管線的偽陰性），不是 Gold 的污染。**阻斷權的用途是擋住錯的資料流向下游，
+   而這裡沒有錯的資料要擋。**
+2. **它不是重跑能清掉的**（需人工回填）。DAG 是逐層 `dbt build` + `retries=0`，設成 error
+   的實際後果是：從那天起每天的排程都失敗，直到有人處理——**為了一個三天前就已經缺了的
+   屬性，停掉今天新資料的正確流動。** 與 DAG 檔頭⑤「deterministic 的失敗不該重試」同一條推理。
+3. **該阻斷的情境上游已經擋了**：兩支 `*_matches_staging` 是 error，掉列若落在 7 天窗內
+   由它們先紅先擋。這支的價值只在那兩支漏掉的情況，依定義更舊、更不緊急。
+
+> ⚠️ 代價是**能見度**：warn → task success → `on_failure_callback` 不會響，只留在 dbt log。
+> 能見度的解法是**通知路徑**，不是**阻斷權**——[ADR-0039](../adr/0039-observation-signals-own-dag.md)
+> 已為同一問題立過決策：觀察訊號自成路徑，不靠阻斷主線換取能見度。
+>
+> 而本專案**沒有真實通知通道，這是全域決策，不是待辦**：[PORTFOLIO_SCOPE #7](../PORTFOLIO_SCOPE.md)
+> ——沒有值班對象。把 notifier 指向不存在的連線，行為會是「紅燈 → 回呼觸發 → 它自己拋錯
+> → 沒有人收到」，而**相信自己有告警、實際上沒有，遠比坦白地沒有告警危險**。
+> 所以這支的能見度上限就是 dbt log 與 `run_results.json`——**已知、刻意，且不因為多了這支測試而改變**。
+
+### 上界 50 天：作品限制
+
+兩張表的分區過期是**各自獨立的背景作業**，即使過期日相同也不保證同時生效。事件線若先一步
+過期，那批訂單會瞬間變成「有訂單、無事件」且年齡遠大於下界 → **誤報，但資料沒壞**。
+
+BQ sandbox（未啟用帳單）硬鎖分區過期 < 60 天，所以這條邊**每 60 天就會撞到一次**。
+啟用帳單、保留期 1825 天之後它在五年後，等同不存在。
+
+> 這是**作品限制**留下的痕跡，但上界本身是**通用解**：任何有分區過期的表都有這條邊，
+> 不是繞過限制的權宜。⚠️ 上界與保留期**成組維護**——保留期下修時上界必須跟著下修，
+> 否則檢查窗會變成空窗，而**空窗＝測試靜默失效、永遠綠**，比沒有這支測試更糟。
+
+不損失覆蓋率：一筆永久缺事件的列，在 2～50 天大的期間每天都會被檢查到。
 
 ---
 

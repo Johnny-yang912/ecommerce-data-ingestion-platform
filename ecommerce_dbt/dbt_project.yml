@@ -85,6 +85,23 @@ vars:
   #   這是偵測能力的下限，不是成本旋鈕；兩個 var 要一起調。
   stg_orders_recon_window_days: 7
 
+  # int_orders / int_orders_quarantine 的 quality_state_at 允許為 NULL 的時效上界
+  # （見 tests/assert_int_orders_quality_state_resolved.sql）。
+  # LEFT JOIN 的事件缺席 fallback 設計上只允許造成【延遲】，不允許【永久缺席】；
+  # 這個 var 就是「延遲」的定義。
+  # ⚠️【必須 > 一個完整 DAG 週期】（日批 ＝ 1 天），否則正常的自癒過程本身會讓測試變紅。
+  #   2 天 ＝ 1 天週期 + 開機補跑與週末的餘裕。與回看窗同類，是偵測能力的下限而非成本旋鈕。
+  int_orders_quality_state_max_lag_days: 2
+
+  # 同一支測試的年齡【上界】：把保留期邊緣排除在檢查窗外。
+  # ⚠️ 這是【作品限制】的後果。兩張表的分區過期是各自獨立的背景作業，即使過期日相同
+  #   也不保證同時生效；事件線若先一步過期，那批訂單會瞬間變成「有訂單、無事件」→ 假紅。
+  #   BQ sandbox 硬鎖過期 < 60 天（見上方 gold_partition_expiration_days），所以這條邊
+  #   每 60 天就會撞到一次。啟用帳單、保留期 1825 天之後這條邊在五年後，等同不存在。
+  # ⚠️【與保留期成組維護】：保留期下修時本值必須跟著下修，否則 [下界, 上界] 會變成空窗
+  #   ——空窗＝測試靜默失效、永遠綠，比沒有這支測試更糟。
+  int_orders_quality_state_max_age_days: 50
+
   # stg_quality_events 逐分區對帳的比對窗（見 tests/assert_stg_quality_events_matches_staging.sql）。
   # ⚠️【必須 > stg_quality_events_lookback_days（預設 3）】，理由與上面那個 var 逐字相同。
   #   刻意獨立成第二個 var 而非共用一個：兩支模型的回看窗本來就可以各自調

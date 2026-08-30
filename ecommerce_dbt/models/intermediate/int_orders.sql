@@ -17,6 +17,13 @@
 --
 -- 刻意不分區：int_ 只被 DAG 內部消費（非分析師 ad-hoc），分區收益 ≈ 0；
 --   order_date 分區留給 dim_/fct_（docs/zh-TW/design/cloud-layer.md「每張表依自己的 access pattern 各自選」）。
+--
+-- ⚠️ 下方的 LEFT JOIN 是【損害換形狀的地方】：上游 stg_quality_events 掉列時，本模型的
+--   列數完全正確、只有 quality_state_at 變 NULL——掉列偽裝成缺值，逐分區對帳測試看不見
+--   （2026-08-30 事故第二階段：800 列一列不少，其中 550 列的品質狀態是空的，94 條測試全綠）。
+--   守門的是 tests/assert_int_orders_quality_state_resolved.sql：它不禁止 NULL（事件缺席的
+--   fallback 是刻意設計），而是禁止 NULL【持續超過 2 天】——fallback 只該造成延遲，不該造成
+--   永久缺席。門檻的推導與升級條件寫在該測試的檔頭。
 
 {{
     config(

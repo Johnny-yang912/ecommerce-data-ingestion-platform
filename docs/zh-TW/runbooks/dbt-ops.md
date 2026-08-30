@@ -45,6 +45,49 @@ dbt build --select intermediate+
 
 ---
 
+## 重建特定分區
+
+已知哪幾天壞了就用這個，**不要**去放大回看窗——回看窗是「從今天往回數」，
+要涵蓋一個舊分區就得連同它之後的每一天一起重算。
+
+```bash
+# 補單一天
+dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
+
+# 補一段區間（end 為【不含】）
+dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26", stg_orders_backfill_end: "2026-08-29"}'
+
+# 下游跟上（int_/dim_/fct_/rpt_ 都是 table 物化）
+dbt run -s stg_orders+ --exclude stg_orders
+```
+
+`_end` 可省略，省略即 `start` 當天。
+
+⚠️ **第二步的 `--exclude stg_orders` 不可省。** 少了它，`stg_orders` 會用滾動窗
+再跑一次，把剛補好的舊分區重新推出窗外——修復被自己的下一步覆蓋掉。
+
+**這條路徑與跑批時刻無關**，任何時間執行結果都一樣。這不是巧合，是
+[ADR-0055](../adr/0055-partition-aligned-incremental-window.md) 買到的東西。
+
+### 記錄這次回填
+
+⚠️ **這一步沒有任何機制會提醒你，也沒有任何東西會因為漏掉它而變紅。**
+
+回填是一次 shell 呼叫——它修好資料，但系統不會留下「這個分區曾經被補過」的痕跡。
+三個月後的「這天的數字為什麼跟上游對不起來」，只能靠人寫下的東西回答。
+
+最小集合：**哪個分區 · 補之前幾列 · 補之後幾列 · 為什麼要補**。
+
+| 情境 | 記在哪 |
+|---|---|
+| 一次性的資料修復 | 一份事故報告（`docs/zh-TW/incidents/`）；若它改變了一個決策，另加 CHANGELOG 一行 |
+| 例行的定向刷新（如 Proposal C） | 該次操作原本就有的紀錄 |
+
+> 讓系統自動產生這份紀錄是可行的（由 Airflow 的 run 擁有分區），目前刻意不做——
+> 見 [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md)。
+
+---
+
 ## 調整回看窗
 
 | 變數 | 約束 |
@@ -52,6 +95,11 @@ dbt build --select intermediate+
 | `stg_orders_lookback_days` | 預設 3；必須 ≥ E/L 的 `>=` 重抽範圍 + 餘裕 |
 | `stg_quality_events_lookback_days` | 與上面一起放大 |
 | `rpt_quality_events_lookback_days` | **必須 ≥ `stg_quality_events_lookback_days`** |
+| `stg_orders_recon_window_days` | 預設 7；**必須 > `stg_orders_lookback_days`** |
+
+> ⚠️ 放大回看窗時**對帳窗要跟著放大**。對帳窗若不大於回看窗，壞掉的分區會在還沒被看見
+> 之前就同時滑出兩個窗：例行跑批不再重算它、對帳也不再檢查它——損壞被永久固化，
+> 且從此全綠。
 
 ```bash
 dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
@@ -65,12 +113,16 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 
 ## Proposal C 的定向刷新
 
-修正列落在回看窗**看不到的舊分區**。修復的最後一步是對受影響分區做定向刷新：
+修正列落在回看窗**看不到的舊分區**。修復的最後一步是對受影響分區做定向刷新——
+用上面的「重建特定分區」，傳入修正列所在的日期範圍：
 
 ```bash
-dbt run --select stg_orders --vars '{stg_orders_lookback_days: <涵蓋修正的 N>}'
-# 或 --full-refresh
+dbt run -s stg_orders --vars '{stg_orders_backfill_start: "<修正列的最早 received_at 日>", stg_orders_backfill_end: "<最晚日 + 1>"}'
 ```
+
+⚠️ 舊版本此處寫的是「放大 `stg_orders_lookback_days`」。那在
+[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)之前是唯一的工具，
+但它會連帶重算修正日之後的每一天，且回看窗的邊界曾經是浮動的。**改用日期，不要用天數。**
 
 ---
 

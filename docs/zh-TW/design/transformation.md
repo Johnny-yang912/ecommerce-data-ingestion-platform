@@ -27,6 +27,26 @@
 
 正確性倚賴一條不變式：**同一個 `raw_id` 的所有副本都落在同一個 `received_at` 分區**，所以整分區替換不會漏掉任何東西。
 
+⚠️ 那條不變式**必要但不充分**。它保證窗**內**的去重完整，對窗的**邊界**一句話都沒說——
+而 `insert_overwrite` 的原子單位是整個分區，dbt 只覆寫「查詢結果裡出現過的分區」。
+左邊界若落在某天中間，邊界那天就只有一部分的列進得了窗，於是**半天被原子覆寫成整天**，
+窗外的列被靜默刪除。
+
+所以左邊界**必須對齊日界**：
+
+```sql
+timestamp_sub(timestamp_trunc(current_timestamp(), day), interval N day)
+--            └─ 這一層是正確性，不是風格
+```
+
+對齊後，邊界那天只有「整天在窗內」或「整天在窗外」兩種狀態，「半天」不再存在，
+**跑批時刻也就不再是正確性的隱含前提**——那才是原本那個缺陷的本體：同一支模型
+在 20:38 與 22:30 跑會產出不同結果。[ADR-0055](../adr/0055-partition-aligned-incremental-window.md) ·
+[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)
+
+**定點回填**：`stg_orders_backfill_start` / `_end` 讓修復路徑用日期指定分區，與跑批時刻無關。
+例行路徑仍走滾動窗。守門的是 `assert_stg_orders_matches_staging`（逐分區對帳）。
+
 **`copy_partitions: true`**——sandbox 禁止 DML，而 `insert_overwrite` 預設用 `MERGE`。Copy job 是儲存層級、非 DML、免費的，而且它在**語意上**本來就更合適：去重產出的是一天的完整內容，所以整批替換才是正確的操作。[ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)
 
 **去重**：`row_number() over (partition by raw_id order by received_at desc, id desc) = 1`。

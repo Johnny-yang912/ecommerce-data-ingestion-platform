@@ -77,3 +77,10 @@ vars:
   #   上游今天才補進來的舊事件會落在下游窗外 → 永遠撈不到，且不報錯
   #   （分區存在、只是內容少算）。兩個 var 要一起調。
   rpt_quality_events_lookback_days: 3
+
+  # stg_orders 逐分區對帳的比對窗（見 tests/assert_stg_orders_matches_staging.sql）。
+  # ⚠️【必須 > stg_orders_lookback_days（預設 3）】——對帳窗若不大於回看窗，
+  #   壞掉的分區會在還沒被看見之前就同時滑出兩個窗：例行跑批不再重算它、
+  #   對帳也不再檢查它，損壞被永久固化且從此全綠。7 天＝3 天回看窗 + 一次週末的餘裕。
+  #   這是偵測能力的下限，不是成本旋鈕；兩個 var 要一起調。
+  stg_orders_recon_window_days: 7

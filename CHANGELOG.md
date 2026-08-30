@@ -34,6 +34,7 @@ How this system got here. Phases are the release unit; within each, entries are 
 - **NUL-byte poison pill.** A `\u0000` escape on the wire is six legal ASCII characters, so the ingress guard stripped nothing; `json.loads` decoded it into a real NUL, and the resulting `ValueError` was retried as if transient — forever. → [ADR-0006](./docs/en/adr/0006-nul-byte-fast-fail.md)
 - **No DB transaction may span the dispatch.** `db.refresh()` did; measured at 60 concurrent, 23 of 32 pool slots stuck `idle in transaction`.
 - **Money moved from `FLOAT64` to `NUMERIC`** after a rollup test went red on 39 rows differing by **1 ULP** — `SUM()` over floats is not associative. The fix was the type, not a tolerance. → [design/transformation](./docs/en/design/transformation.md)
+- **The `stg_` incremental window's left boundary was not aligned to the partition boundary.** `insert_overwrite`'s atomic unit is a whole partition, and the left boundary carried the run's wall-clock time — one manual run two hours ahead of schedule let **half a day atomically overwrite a whole day**, cutting the `2026-08-26` partition from **800 rows to 250**. The DAG was green, dbt tests were green, and upstream staging was untouched. Targeted backfill and a per-partition reconciliation test landed with the fix. → [ADR-0055](./docs/en/adr/0055-partition-aligned-incremental-window.md) · [incident](./docs/en/incidents/2026-08-30-stg-partition-truncation.md)
 
 ### Decided against
 

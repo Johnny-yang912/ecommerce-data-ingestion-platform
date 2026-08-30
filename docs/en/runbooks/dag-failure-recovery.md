@@ -47,16 +47,37 @@ docker compose exec airflow-scheduler bash -c \
 
 Alternatively, `--full-refresh` — correct, unconditional, and it costs a full-table rewrite.
 
+⚠️ **Widen `stg_orders_recon_window_days` too**, or the reconciliation test cannot see the
+days you are repairing (constraint: reconciliation window > lookback window).
+
+**This section is for "down for N consecutive days" — when you genuinely want the last N
+days rebuilt.** If instead a few *specific* dates are damaged, widening is the wrong tool:
+it drags every day after them into the rebuild. Use
+[dbt-ops § Rebuilding specific partitions](./dbt-ops.md#rebuilding-specific-partitions).
+
 ### 4. Verify nothing was lost
 
-```sql
--- staging vs stg_orders row counts over the affected range should agree
-select count(*) from `<project>.staging.orders`
- where received_at >= '<start>' and received_at < '<end>';
-
-select count(*) from `<project>.<dbt_dataset>.stg_orders`
- where received_at >= '<start>' and received_at < '<end>';
+```bash
+docker compose exec airflow-scheduler bash -c \
+  "cd /opt/project/ecommerce_dbt && /home/airflow/venvs/dbt/bin/dbt test \
+     -s assert_stg_orders_matches_staging \
+     --vars '{stg_orders_recon_window_days: N}'"
 ```
+
+The test compares staging's `distinct raw_id` against `stg_orders`'s row count per
+partition, and on failure names the day and the shortfall directly:
+
+```
+received_day               rows_expected   rows_actual   missing
+2026-08-26 00:00:00+00              800           250        550
+```
+
+⚠️ `N` must span the whole affected range; the default 7 days is usually not enough.
+
+> This step used to be a block of SQL somebody had to remember to paste. It is now a test
+> that runs every night — and when the
+> [2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md) happened, this
+> check was already written in this runbook. Nobody thought to run it that day.
 
 ### 5. Return to the default window
 

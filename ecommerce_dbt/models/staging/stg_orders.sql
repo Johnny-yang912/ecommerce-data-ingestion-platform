@@ -21,6 +21,26 @@
 --   偵測不到、不會自己 ALTER——只在刻意改清單（進 git、被 review）時才觸發，不吃 drift。
 --   刻意不用 sync_all_columns：它會 DROP 欄，牴觸「staging 只做加法、刪欄留 legacy」（§5.2/§5.3）。
 --   改型別/改分區/歷史回填仍走 --full-refresh / targeted refresh（見 README §4.7、§6）。
+--
+-- ⚠️ 增量過濾的左邊界【必須對齊日界】（timestamp_trunc(..., day)）——這是正確性、不是風格：
+--   insert_overwrite 的原子單位是【整個分區】，而 dbt 只覆寫「查詢結果裡出現過的分區」。
+--   左邊界若落在某天的【中間】（例如 current_timestamp() 直接減 N 天），邊界那天就只有
+--   一部分的列進得了窗，insert_overwrite 便會拿【半天】原子覆寫【整天】——窗外的列被
+--   靜默刪除，不報錯、dbt test 不紅、上游 staging 完好無損所以事後也查不出是誰刪的。
+--   實例：2026-08-29 20:38 的一次手動跑批（早於例行的 22:30）把 2026-08-26 分區從
+--   800 列砍成 250 列，cutoff 落在 2026-08-26 20:38，當天只剩最後一批（21:00）在窗內。
+--   對齊日界後，邊界那天只有「整天在窗內」或「整天在窗外」兩種狀態，「半天」不再存在，
+--   **跑批時刻也就不再是正確性的隱含前提**——這正是原本那個 bug 的本體：
+--   同一支模型在 20:38 與 22:30 跑會產出不同結果，也就是它不是冪等的。
+--   守門的是 tests/assert_stg_orders_matches_staging.sql（逐分區與 staging 對帳）。
+--
+-- 定點回填（stg_orders_backfill_start / _end）：把「補哪幾天」從時鐘手上拿回來。
+--   例行跑批走滾動窗；要修特定分區時改傳日期，與跑批時刻完全無關：
+--     dbt run -s stg_orders --vars '{stg_orders_backfill_start: "2026-08-26"}'
+--   只給 start ＝ 補那一天；另給 end ＝ 補 [start, end) 這一段（end 為【不含】）。
+--   刻意讓 end 可省略：補單日卻把 end 填成當天（而非隔天）會靜默補出空集合，
+--   而回填正是最不該留隱形陷阱的路徑——出事時開指令的人往往不熟這條管線。
+--   下游是 table 物化會自動跟上，跑完接：dbt run -s stg_orders+ --exclude stg_orders
 
 {{
     config(
@@ -41,9 +61,22 @@ with source as (
 
     select * from {{ source('ecommerce_staging', 'orders') }}
     {% if is_incremental() %}
+    {%- set backfill_start = var('stg_orders_backfill_start', none) %}
+    {%- set backfill_end = var('stg_orders_backfill_end', none) %}
+    {% if backfill_start %}
+    -- 定點回填：分區範圍由呼叫者明確指定，不讀時鐘（見檔頭）。
+    where received_at >= timestamp('{{ backfill_start }}')
+      and received_at < {% if backfill_end %}timestamp('{{ backfill_end }}')
+                        {%- else %}timestamp_add(timestamp('{{ backfill_start }}'), interval 1 day){% endif %}
+    {% else %}
     -- 增量：只讀回看窗。窗需 ≥ `>=` watermark 的重抽範圍 + 安全邊際（預設 3 天）。
     -- 同時滿足 staging 的 require_partition_filter（range 過濾即可裁切分區）。
-    where received_at >= timestamp_sub(current_timestamp(), interval {{ var('stg_orders_lookback_days', 3) }} day)
+    -- ⚠️ timestamp_trunc(..., day) 不可拿掉——它讓左邊界落在分區邊界上。見檔頭。
+    where received_at >= timestamp_sub(
+        timestamp_trunc(current_timestamp(), day),
+        interval {{ var('stg_orders_lookback_days', 3) }} day
+    )
+    {% endif %}
     {% else %}
     -- 全量（首建 / --full-refresh）：哨兵過濾滿足保險絲、實際全表掃。
     where received_at >= timestamp('1970-01-01')

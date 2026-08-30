@@ -34,6 +34,7 @@
 - **NUL byte 毒藥丸。** 線上的一個 `\u0000` escape 是六個合法 ASCII 字元，所以入口防護什麼都沒剝掉；`json.loads` 把它解碼成真正的 NUL，而產生的 `ValueError` 被當成暫時性錯誤重試——永遠。→ [ADR-0006](./docs/zh-TW/adr/0006-nul-byte-fast-fail.md)
 - **不得有 DB 交易跨越派工。** `db.refresh()` 曾經如此；60 併發下實測，32 個池槽位中有 23 個卡在 `idle in transaction`。
 - **金額從 `FLOAT64` 移到 `NUMERIC`**，在一個上捲測試對 39 列差 **1 ULP** 變紅之後——浮點數的 `SUM()` 不具結合律。**修的是型別，不是容差。** → [design/transformation](./docs/zh-TW/design/transformation.md)
+- **`stg_` 增量窗口的左邊界沒有對齊分區邊界。** `insert_overwrite` 的原子單位是整個分區，而左界帶著跑批當下的時刻——一次比排程早兩小時的手動跑批，讓**半天的資料原子覆寫了整天**，`2026-08-26` 分區從 **800 列被砍成 250 列**。DAG 綠、dbt test 綠、上游 staging 完好無損。同時加上定點回填與逐分區對帳測試。→ [ADR-0055](./docs/zh-TW/adr/0055-partition-aligned-incremental-window.md) · [事故](./docs/zh-TW/incidents/2026-08-30-stg-partition-truncation.md)
 
 ### 決定不做
 

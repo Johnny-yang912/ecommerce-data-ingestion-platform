@@ -96,6 +96,7 @@
 | 0047 | [度量上捲到表頭，由不變式測試把關](./0047-measures-roll-up-to-header.md) | Accepted |
 | 0048 | [只建兩個維度、採 SCD1；事實表帶當時的快照](./0048-two-dimensions-scd1.md) | Accepted |
 | 0049 | [業務報表永遠讀 Gold；品質報告拆成兩張表](./0049-business-reports-read-gold.md) | Accepted |
+| 0055 | [增量窗口的邊界必須是分區邊界；回填傳日期，不傳天數](./0055-partition-aligned-incremental-window.md) | Accepted |
 
 ## 可觀測性
 

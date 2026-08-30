@@ -96,6 +96,7 @@ Start with [ADR-0000](./0000-template.md) for the format.
 | 0047 | [Measures roll up into the header, guarded by an invariant test](./0047-measures-roll-up-to-header.md) | Accepted |
 | 0048 | [Build only two dimensions, SCD1; the fact table carries the at-the-time snapshot](./0048-two-dimensions-scd1.md) | Accepted |
 | 0049 | [Business reports always read Gold; quality reporting splits into two tables](./0049-business-reports-read-gold.md) | Accepted |
+| 0055 | [An incremental window's boundary must be a partition boundary; backfills take dates, not day counts](./0055-partition-aligned-incremental-window.md) | Accepted |
 
 ## Observability
 

@@ -12,12 +12,12 @@ What is tested, where, and — most importantly — **where the tests are blind*
 |---|---|---|---|
 | Unit + integration (mock DB) | 445 | CI, `ci.yml` | nothing — seconds to run |
 | DAG structure | 52 | CI, `dags.yml` | Airflow, no DB, no project env |
-| dbt | 93 | in the DAG | BigQuery |
+| dbt | 94 | in the DAG | BigQuery |
 | Manual scripts | 3 | by hand | a real server + real Postgres |
 
 Unit coverage is **100% of the 12 gated modules**, across a **Python 3.10 and 3.12** matrix. Test dependencies are pinned in `requirements-dev.txt`.
 
-> **These counts go stale. Regenerate them rather than trusting them** — the numbers above were last verified 2026-08-24:
+> **These counts go stale. Regenerate them rather than trusting them** — the numbers above were last verified 2026-08-30:
 >
 > ```bash
 > pytest --collect-only -q | tail -1            # unit + integration
@@ -89,7 +89,7 @@ All three hit a real server and a real PostgreSQL. Their results are recorded in
 
 ## 6. The dbt test inventory
 
-93 tests. The full list, because "which test guards what" is not derivable from the model files:
+94 tests. The full list, because "which test guards what" is not derivable from the model files:
 
 | Test | Target | Severity | Notes |
 |---|---|---|---|
@@ -98,6 +98,7 @@ All three hit a real server and a real PostgreSQL. Their results are recorded in
 | `unique` + `not_null` | `stg_`'s `raw_id`/`id`/`order_id`; `int_`'s `raw_id`/`order_id` | error | `stg_`'s `unique(raw_id)` **is** the dedup check |
 | `not_null` | `received_at` / `has_clean_error` / `has_schema_drift` | error | REQUIRED columns |
 | source freshness | `staging.orders`, `staging.quality_events` | warn 26h / error 50h | with `filter` to bypass the fuse |
+| ⭐ `assert_stg_orders_matches_staging` | `staging.orders`'s `distinct raw_id` vs `stg_orders`'s row count, **per partition** | error | **Reconciliation, not content.** `stg_` only dedups staging, it never filters, so the two counts must agree partition by partition. This is the only test in the list that asks whether rows are *still there* — in the [2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md) every surviving row was perfectly valid; 550 were simply gone, and every other test is structurally blind to that. Its window (7d) **must exceed the lookback window** (3d), or damage slides out of both before anyone sees it |
 | ⭐ `assert_orders_split_is_partition` | `int_orders` ∪ `int_orders_quarantine` vs `stg_orders` | error | **Partition invariant** — every `raw_id` appears exactly once. The only automated safety net under the duplicated block, guarding checklist items #1–#4. **Never downgrade** |
 | `assert_int_orders_no_unpromoted_dirty` | `int_orders` | error | **Gold contract** — no `has_clean_error=TRUE` row that hasn't been promoted. A singular test rather than a column test because it is a **conditional relation between two columns**: `has_clean_error=TRUE` is legal here |
 | `accepted_values` | `effective_quality_state` on both `int_` tables | error | The two domains are disjoint (`clean`/`promoted` vs `quarantined`/`permanently_rejected`) — **cross-checks the partition from another angle** |
@@ -125,6 +126,26 @@ Its value only materialises the day the model goes incremental, where it would c
 > **"Make `rpt_sales` incremental" and "add cell-by-cell reconciliation" are two halves of one change. Doing only the first is not allowed.**
 
 Contrast `assert_rpt_sales_no_item_loss`, which *is* written now: it tests **row counts across two joins**, which is independent of materialisation strategy and a genuinely possible failure today.
+
+### Reconciliation tests vs content tests
+
+Every test above except `assert_stg_orders_matches_staging` asks about **content**: is this
+value within contract, does this relationship hold, is this grain right. They share one
+precondition — **the row being checked has to be there**.
+
+Row loss is an orthogonal failure, and a much quieter one:
+
+| | Content failure | Row-loss failure |
+|---|---|---|
+| Symptom | Some value is wrong | Every value is right, there are just fewer of them |
+| Who notices | A test | Someone's eyes on the BI dashboard, if anyone happens to look |
+| Upstream evidence | Usually still there | **Upstream is untouched** — so you cannot work out afterwards what deleted them |
+
+> **Content tests only catch what still exists.** A suite made entirely of content tests
+> is green while data is being deleted.
+
+A reconciliation test costs one `count(*)`, so whether to have one is not a cost question.
+It is a question of whether anyone thought of it.
 
 ---
 

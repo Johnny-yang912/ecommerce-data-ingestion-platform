@@ -27,6 +27,31 @@ Models: `stg_orders`, `stg_quality_events`, `int_orders`, `int_orders_quarantine
 
 Correctness rests on one invariant: **all copies of a given `raw_id` land in the same `received_at` partition**, so whole-partition replacement misses nothing.
 
+⚠️ That invariant is **necessary but not sufficient**. It guarantees dedup is complete
+*within* the window and says nothing at all about where the window's *boundary* falls —
+while `insert_overwrite`'s atomic unit is a whole partition, and dbt overwrites exactly
+the partitions that appear in the query result. A left boundary landing mid-day lets only
+part of that day's rows into the window, so **half a day atomically overwrites a whole
+day** and everything outside the window is silently deleted.
+
+So the left boundary **must align to the day boundary**:
+
+```sql
+timestamp_sub(timestamp_trunc(current_timestamp(), day), interval N day)
+--            └─ this layer is correctness, not style
+```
+
+Aligned, the edge day is either wholly inside the window or wholly outside it. "Half a
+day" ceases to exist, and **the time of day a run happens stops being an implicit
+precondition for correctness** — which was the real defect: the same model produced
+different output at 20:38 than at 22:30.
+[ADR-0055](../adr/0055-partition-aligned-incremental-window.md) ·
+[2026-08-30 incident](../incidents/2026-08-30-stg-partition-truncation.md)
+
+**Targeted backfill**: `stg_orders_backfill_start` / `_end` let the repair path name
+partitions by date, independent of the clock. The routine path still uses the rolling
+window. `assert_stg_orders_matches_staging` (per-partition reconciliation) guards the contract.
+
 **`copy_partitions: true`** — the sandbox forbids DML and `insert_overwrite` defaults to `MERGE`. Copy jobs are storage-level, non-DML and free, and are *semantically* the better fit anyway: dedup produces the full contents of a day, so a wholesale swap is the correct operation. [ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)
 
 **Dedup**: `row_number() over (partition by raw_id order by received_at desc, id desc) = 1`.

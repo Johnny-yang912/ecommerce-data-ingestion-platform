@@ -12,12 +12,12 @@
 |---|---|---|---|
 | 單元 + 整合（mock DB） | 445 | CI，`ci.yml` | 什麼都不需要——幾秒跑完 |
 | DAG 結構 | 52 | CI，`dags.yml` | Airflow，不需 DB、不需專案環境變數 |
-| dbt | 93 | 在 DAG 內 | BigQuery |
+| dbt | 94 | 在 DAG 內 | BigQuery |
 | 手動腳本 | 3 | 手動 | 真實 server + 真實 Postgres |
 
 單元測試覆蓋率為**受管的 12 個模組 100%**，跨 **Python 3.10 與 3.12** 矩陣。測試依賴釘在 `requirements-dev.txt`。
 
-> **這些數字會過期。重新取得它，而不是相信它**——上表最後一次核對是 2026-08-24：
+> **這些數字會過期。重新取得它，而不是相信它**——上表最後一次核對是 2026-08-30：
 >
 > ```bash
 > pytest --collect-only -q | tail -1            # 單元 + 整合
@@ -89,7 +89,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 
 ## 6. dbt 測試清單
 
-共 93 個測試。完整列出，因為「哪個測試守什麼」無法從 model 檔推導出來：
+共 94 個測試。完整列出，因為「哪個測試守什麼」無法從 model 檔推導出來：
 
 | 測試 | 目標 | 嚴重度 | 說明 |
 |---|---|---|---|
@@ -98,6 +98,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 | `unique` + `not_null` | `stg_` 的 `raw_id`／`id`／`order_id`；`int_` 的 `raw_id`／`order_id` | error | `stg_` 的 `unique(raw_id)` **就是**去重檢查 |
 | `not_null` | `received_at`／`has_clean_error`／`has_schema_drift` | error | REQUIRED 欄位 |
 | source freshness | `staging.orders`、`staging.quality_events` | warn 26h／error 50h | 帶 `filter` 以繞過保險絲 |
+| ⭐ `assert_stg_orders_matches_staging` | `staging.orders` 的 `distinct raw_id` vs `stg_orders` 的列數，**逐分區** | error | **對帳，不是內容。** `stg_` 對 staging 只做去重、不做過濾，所以兩個數字必須逐分區相等。這是清單裡唯一問「列還在不在」的測試——[2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)裡活下來的每一列都完全正常，問題是少了 550 列，其餘所有測試對此結構性地盲。窗（7 天）**必須 > 回看窗**（3 天），否則損壞會在被看見前滑出兩個窗 |
 | ⭐ `assert_orders_split_is_partition` | `int_orders` ∪ `int_orders_quarantine` 對 `stg_orders` | error | **劃分不變式**——每個 `raw_id` 恰好出現一次。重複區塊之下唯一的自動化安全網，守住對齊清單第 1–4 項。**永不降級** |
 | `assert_int_orders_no_unpromoted_dirty` | `int_orders` | error | **Gold 契約**——不得有未被 promote 的 `has_clean_error=TRUE` 列。寫成 singular 而非欄位測試，因為它是**兩個欄位之間的條件關係**：`has_clean_error=TRUE` 在這裡是合法的 |
 | `accepted_values` | 兩張 `int_` 表的 `effective_quality_state` | error | 兩者的值域互斥（`clean`／`promoted` vs `quarantined`／`permanently_rejected`）——**從另一個角度交叉驗證那個劃分** |
@@ -125,6 +126,24 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 > **「把 `rpt_sales` 改成增量」與「加上逐格對帳」是同一次變更的兩半。只做前者是不被允許的。**
 
 對照 `assert_rpt_sales_no_item_loss`——它**現在就寫了**：它測的是**跨兩個 join 的列數**，與物化策略無關，而且今天就是一個真實可能發生的失效。
+
+### 對帳測試與內容測試
+
+上表除了 `assert_stg_orders_matches_staging`，其餘每一條問的都是**內容**：這個值合不合約、
+這個關係成不成立、這個粒度對不對。它們共有一個前提——**要被檢查的列，得先在那裡**。
+
+掉列是一種正交的失效，而且它安靜得多：
+
+| | 內容失效 | 掉列失效 |
+|---|---|---|
+| 症狀 | 某個值錯了 | 每個值都對，只是少了一些 |
+| 誰會發現 | 測試 | 肉眼看 BI，如果剛好有人在看 |
+| 上游證據 | 通常還在 | **上游完好無損**——所以事後也查不出是誰刪的 |
+
+> **能被內容測試抓到的前提，是那一列還在。** 一個只做內容測試的測試套件，
+> 在資料被刪掉時是全綠的。
+
+對帳測試的成本是一次 `count(*)`，所以「有沒有必要」不是成本問題，是有沒有想到的問題。
 
 ---
 

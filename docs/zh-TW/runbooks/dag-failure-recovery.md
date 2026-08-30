@@ -47,16 +47,35 @@ docker compose exec airflow-scheduler bash -c \
 
 或者用 `--full-refresh`——正確、無條件，代價是一次全表重寫。
 
+⚠️ **放大回看窗時 `stg_orders_recon_window_days` 也要一起放大**，否則對帳測試會看不到
+你正在修的那些天（約束：對帳窗 > 回看窗）。
+
+**這一節適用於「連續掛了 N 天」——你真的想要最近 N 天全部重算。**
+如果壞的是某幾個特定日期（而不是「最近都壞」），放大窗口是錯的工具：它會連帶重算
+那些天之後的每一天。改用 [dbt-ops §重建特定分區](./dbt-ops.md#重建特定分區)。
+
 ### 4. 驗證沒有東西遺失
 
-```sql
--- 受影響範圍內，staging 與 stg_orders 的列數應該相符
-select count(*) from `<project>.staging.orders`
- where received_at >= '<start>' and received_at < '<end>';
-
-select count(*) from `<project>.<dbt_dataset>.stg_orders`
- where received_at >= '<start>' and received_at < '<end>';
+```bash
+docker compose exec airflow-scheduler bash -c \
+  "cd /opt/project/ecommerce_dbt && /home/airflow/venvs/dbt/bin/dbt test \
+     -s assert_stg_orders_matches_staging \
+     --vars '{stg_orders_recon_window_days: N}'"
 ```
+
+這條測試逐分區比對 staging 的 `distinct raw_id` 與 `stg_orders` 的列數，失敗時直接吐出
+是哪一天、少幾筆：
+
+```
+received_day               rows_expected   rows_actual   missing
+2026-08-26 00:00:00+00              800           250        550
+```
+
+⚠️ `N` 要涵蓋整個受影響範圍，預設的 7 天通常不夠。
+
+> 這一步曾經是一段要人記得手動貼上去的 SQL。它現在是每晚跑的測試——
+> 而 [2026-08-30 事故](../incidents/2026-08-30-stg-partition-truncation.md)發生時，
+> 這條檢查已經寫在這份 runbook 裡了，只是沒有人在那天想到要跑它。
 
 ### 5. 回到預設窗口
 

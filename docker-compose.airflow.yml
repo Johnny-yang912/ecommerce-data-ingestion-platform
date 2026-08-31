@@ -16,10 +16,18 @@
 # 附帶（原本的理由）：uid 不對齊時容器以 50000 寫入 bind mount，主機端會清不掉
 # dbt 產生的 target/ 與 logs/。
 
+# 同 docker-compose.yml 的 x-logging（YAML anchor 不跨檔，兩份各定義一次）。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: orchestration/Dockerfile
+  logging: *default-logging
   # ⭐ 排程器必須活得比它排的工作久——這是整個排程化的前提，不是便利設定。
   #    主機重開之後 api/worker/beat 會自己回來（docker-compose.yml 也設了同樣的
   #    policy），排程器若沒回來，結果是「服務都在、但什麼都不會跑」——**而且沒有
@@ -135,6 +143,7 @@ services:
   # 備份／還原裡。多一個容器換故障域與備份語意的清爽。
   airflow-db:
     image: postgres:16
+    logging: *default-logging
     # 它不套 x-airflow-common（不同映像），restart policy 因此要自己寫一次。
     # 少了這行，重開機後三個 Airflow 服務會起來卻連不到 metadata DB。
     restart: unless-stopped

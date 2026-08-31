@@ -24,9 +24,19 @@ x-otel-env: &otel-env
   # 匯出間隔。縮短會等比增加資料點數與成本，而這些指標沒有一個需要秒級解析度。
   OTEL_METRIC_EXPORT_INTERVAL: "60000"
 
+# 容器 log 的輪替設定。json-file 驅動預設【沒有大小上限】，長跑的服務會一路把磁碟
+# 寫滿——這是任何環境都該顯式設定的一項，不是特定平台的補丁。
+# 抽成 anchor 的理由同 x-otel-env：漏設某個服務不會有任何錯誤訊息。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
@@ -55,6 +65,7 @@ services:
   # 的後果只是「該筆延遲到下一輪掃描才處理」，而不是遺失。
   redis:
     image: redis:7-alpine
+    logging: *default-logging
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -75,6 +86,7 @@ services:
   #    把日誌刷滿，而遙測仍然是靜默丟失的。
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.158.0
+    logging: *default-logging
     command: ["--config=/etc/otelcol/config.yaml"]
     environment:
       # ${...:?} 守衛：缺值時 compose 在解析階段就報錯，不會起一個必然 401 的
@@ -98,6 +110,7 @@ services:
   # 一次性 migration 服務：跑完即退出，api 等它成功才起
   migrate:
     build: .
+    logging: *default-logging
     command: alembic upgrade head
     environment:
       DB_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-orders}
@@ -108,6 +121,7 @@ services:
 
   api:
     build: .
+    logging: *default-logging
     # Dockerfile 的 CMD 是 exec form，${VAR} 不會展開 → worker 數在此覆寫。
     # 多行程之所以可行，是因為恢復掃描已搬到 Beat、API 行程不再持有背景狀態。
     command: >
@@ -161,6 +175,7 @@ services:
   # 只換啟動指令——依賴與程式碼完全一致，不會出現「API 有這個 module、worker 沒有」。
   worker:
     build: .
+    logging: *default-logging
     command: celery -A celery_app worker --loglevel=INFO --concurrency=4
     environment:
       <<: *otel-env
@@ -201,6 +216,7 @@ services:
   # ⚠️ 也不要改用 `celery worker -B` 的內嵌 beat：官方明示非生產用法。
   beat:
     build: .
+    logging: *default-logging
     # schedule 檔寫到 /tmp 而非 /app：容器內的排程狀態是暫時的（間隔排程重啟後
     # 重新計時即可），沒必要污染程式碼目錄，也免去唯讀根檔案系統時的麻煩。
     command: celery -A celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule

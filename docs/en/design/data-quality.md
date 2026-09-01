@@ -173,7 +173,7 @@ An event exists only if an ODS row exists. The three "not written" rows are the 
 |---|---|---|
 | **A** | `POST /process_raw/{id}?force=true` | a record stuck in `error`/`duplicate` — replay from Raw |
 | **B** | Re-evaluation under new rules | records quarantined by rules that have since loosened |
-| **C** | Batch correction from Raw | **value-production defects** — designed, not built |
+| **C** | Batch correction from Raw | **value-production defects** — designed, not built ([runbook](../runbooks/proposal-c-correction.md)) |
 
 ### Proposal B: event-driven re-evaluation
 
@@ -200,11 +200,35 @@ A cleaning **bug** that corrupted values in already-`processed` records — for 
 
 B cannot help: **its input is the corrupted values**. Bounded writeback forbids it from writing values even if it could tell. A returns 400 on `processed`.
 
-Two shapes were considered — a **migration** (new row, same `raw_id`, competing through the existing dedup) and a **patch** (a second table of corrections). The migration shape reuses machinery that already exists; the patch shape needs a hand-maintained second declaration and carries a re-extract landmine.
-
 **If this path did not exist by design, the promise that "Raw kept verbatim enables rebuilding" would be unbacked.**
 
-#### Cautions both shapes must face
+> **This section defines the shape of the repair path in advance without choosing between the options in advance.** When it actually happens, the choice is made on the spot from the scale of the damage, how many columns are affected, what downstream has already consumed, the appetite for operating on the main table, and the time and hands available. The two are not mutually exclusive — a team can pick differently for different incidents, or patch first to stop the bleeding and converge with a migration later.
+>
+> Whichever shape is chosen, Proposal C runs as an **offline, runbook-driven batch operation** — deliberately **not** an HTTP endpoint, so that `force=true` remains the only runtime repair surface and the semantic boundary is not diluted.
+>
+> **For the order of operations see [runbooks/proposal-c-correction](../runbooks/proposal-c-correction.md). This section answers "which path"; that one answers "how to walk it".**
+
+#### C-1 the two shapes
+
+The **re-derivation end is identical** in both (rebuild values from Raw with the fixed logic). They diverge only on where the corrected values land and how they take effect:
+
+| | Migration: scoped rebuild | Patch: correction overlay |
+|---|---|---|
+| Core semantics | blast-window rows are **replaced in place** in the main ODS (one transaction: retire the old row, write the new one with a `rebuild_batch_id`) | the main ODS is **untouched**; corrections go into a separate `ods_corrections` |
+| Truth afterwards | the main table is the single truth again; old values kept in `ods_retired_<batch>` for audit | truth splits across two tables; the correct value = main ⊕ overlay |
+| The ODS immutability contract | needs reinterpretation: what is forbidden is the *single-row, unversioned, downstream-unaware* rewrite; batched, versioned, retired-copy-keeping, downstream-forcing is a legitimate escape hatch | honoured to the letter; zero reinterpretation |
+| Landing in BQ | corrections append into the **same staging table** (original `received_at` partition); `stg_` dedup tie-breaks on `rebuild_batch_id` | corrections become a second BQ table; `stg_` overlays them by JOIN / `COALESCE` |
+| `stg_` complexity | existing dedup plus one tie-break key; no new JOIN seam | a **permanent** new JOIN seam; everyone reading `stg_` must know the overlay exists |
+| Cloud cost | ≈ 0 (reuses the existing channel) | equally negligible in money (BQ bills by bytes scanned; a small-table JOIN rounds to nothing) — **the cost concern is a red herring; the real price is semantic** |
+| Repeated incidents | one more append batch and one more batch id; read logic unchanged | one more correction batch each time, with precedence to manage; read complexity grows with every incident |
+| A future full re-extract | safe — the main table is already correct | the main table's wrong values are re-extracted verbatim; **corrections must be re-pushed** (P3) |
+| Other PG consumers | get the correct values automatically | get the wrong values unless they implement the overlay themselves |
+| Rollback | run another batch in reverse (restore from the retired table); the mechanism supports itself | void the correction batch; the main table was never touched |
+| Point of no return | the PG commit (preceded by a dry-run diff and a human gate) | **none** — low risk by construction |
+| Cost structure | heavier to operate, but **paid once**; afterwards the architecture is back to normal | very light and fast-acting, but the complexity is **permanent**, living in the read path and in future operations |
+| Leans toward | large, systemic damage (many rows, many columns), an expected future full re-extract, a preference for long-term single truth, an available operational window | small and localised damage, no appetite for touching the main table, a need to stop the bleeding fast, or no hands or window for a migration |
+
+#### C-2 cautions both shapes must face
 
 | # | Caution | Content |
 |---|---|---|
@@ -213,7 +237,7 @@ Two shapes were considered — a **migration** (new row, same `raw_id`, competin
 | 3 | Re-derivation path | Reuse only the pure functions `from_nested → clean_order`. **Never go through `process_raw_event`** — its first-write-wins pre-check would see the very row being replaced and mark the whole batch `duplicate` |
 | 4 | Active push | Corrected rows carry old `received_at` values, so the forward-only watermark will never see them. Pushing to the cloud is an **explicit runbook step** |
 | 5 | Batch version axis | `DQ_RULE_VERSION` versions evaluation semantics only — a `format_clean` value bug can change values **without** changing `has_clean_error`, escaping the bump criterion entirely. Value production needs its own batch id, which doubles as the tie-breaker for `stg_` dedup — **not merely an audit column** |
-| 6 | quality_events | Re-run `business_clean` on the corrected values and append an event carrying the batch id, or the Row Filter's effective-state composition stops reconciling |
+| 6 | quality_events | The `clean_order` call that re-derives the values already returns the new verdict — **append only when the state actually changed** (the ingestion layer's own rule), reusing `promotion` / `re_quarantination` and recording the batch id in `reason`. A value defect is not a rule change: most rows do not change state, and writing nothing for them is correct. The per-row trace is carried by `rebuild_batch_id` |
 | 7 | Late-arriving | Corrected values land in old partitions; a `received_at`-incremental `stg_` run will not see them. The runbook's final step must be a targeted refresh |
 | 8 | Divergence window | Between the PG commit and the BQ refresh, PG holds new values while Gold still holds old ones — isomorphic to Proposal B's flow-back delay. Acceptable under T+1, but push + refresh must be **bound runbook steps, never left half-done** |
 
@@ -251,6 +275,17 @@ Two shapes were considered — a **migration** (new row, same `raw_id`, competin
 | C-6.4 | The batch INSERT takes `FOR KEY SHARE` locks on raw — **no conflict** with the normal pipeline (`try_claim_raw` changes non-key columns, taking `FOR NO KEY UPDATE`, which is compatible); blast-window rows are all terminal, so real contention ≈ 0 | understand and document, in the spirit of M3 |
 
 > **An adjacent precondition the FK formalises**: Raw must outlive its ODS row. If a Raw purge or TTL is ever introduced it must respect that ordering — the `NO ACTION` FK actively blocks deleting a raw row still referenced by ODS. Correct behaviour, but it changes purge semantics.
+
+#### C-5 what to weigh when choosing
+
+At minimum, walk through these before picking a shape:
+
+- **Scale and shape of the damage**: how many rows? how many columns? concentrated in one window or scattered?
+- **Downstream consumption**: which reports and models have already consumed the wrong values? how urgent is the repair?
+- **Risk appetite**: is a batch operation on the main table acceptable? is there a window and a person to review the dry-run?
+- **Long-term maintenance**: who maintains the overlay seam? will the team remember it exists a year from now?
+- **Recurrence**: is this incident class one-off or likely to repeat? (likely → price in the compounding cost of a permanent seam)
+- **Hybrid**: the two are not exclusive — patch to stop the bleeding, then converge with a migration when there is a window (a patch batch is valid input to a migration; the mechanisms are compatible)
 
 ---
 

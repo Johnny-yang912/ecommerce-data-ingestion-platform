@@ -107,7 +107,7 @@ dbt run -s rpt_quality_events_daily --vars '{rpt_quality_events_backfill_start: 
 | 情境 | 記在哪 |
 |---|---|
 | 一次性的資料修復 | 一份事故報告（`docs/zh-TW/incidents/`）；若它改變了一個決策，另加 CHANGELOG 一行 |
-| 例行的定向刷新（如 Proposal C） | 該次操作原本就有的紀錄 |
+| 例行的定向刷新（如 [Proposal C](./proposal-c-correction.md)） | 該次操作原本就有的紀錄（該 runbook 的第 6 步） |
 
 > 讓系統自動產生這份紀錄是可行的（由 Airflow 的 run 擁有分區），目前刻意不做——
 > 見 [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md)。
@@ -139,7 +139,7 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: 7}'
 
 ## Proposal C 的定向刷新
 
-修正列落在回看窗**看不到的舊分區**。修復的最後一步是對受影響分區做定向刷新——
+這是 [proposal-c-correction](./proposal-c-correction.md) 的第 5 步。修正列落在回看窗**看不到的舊分區**。修復的最後一步是對受影響分區做定向刷新——
 用上面的「重建特定分區」，傳入修正列所在的日期範圍：
 
 ```bash

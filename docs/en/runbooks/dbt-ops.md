@@ -115,7 +115,7 @@ The minimum: **which partition · row count before · row count after · why**.
 | Situation | Where it goes |
 |---|---|
 | One-off data repair | An incident report (`docs/en/incidents/`); plus a CHANGELOG line if it changed a decision |
-| Routine targeted refresh (e.g. Proposal C) | Whatever record that operation already has |
+| Routine targeted refresh (e.g. [Proposal C](./proposal-c-correction.md)) | Whatever record that operation already has (step 6 of that runbook) |
 
 > Having the system produce this record automatically is feasible (let Airflow runs own
 > their partitions); it is deliberately deferred — see [PORTFOLIO_SCOPE #13](../PORTFOLIO_SCOPE.md).
@@ -148,7 +148,7 @@ For recovery after consecutive failures, see [dag-failure-recovery](./dag-failur
 
 ## Proposal C targeted refresh
 
-Correction rows land in **old** partitions that the lookback window cannot see. The last
+This is step 5 of [proposal-c-correction](./proposal-c-correction.md). Correction rows land in **old** partitions that the lookback window cannot see. The last
 step of a repair is a targeted refresh of the affected partitions — use "Rebuilding
 specific partitions" above and pass the dates the corrections fall on:
 

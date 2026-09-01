@@ -54,7 +54,7 @@ Fork on **whether the history is "nonexistent" or "under-extracted"**:
 | Option | Applies when | How |
 |---|---|---|
 | **A. Accept the NULL** (default) | the value genuinely starts being collected now | don't fill; downstream slices by time or `WHERE col IS NOT NULL` |
-| **B. Proposal C backfill** | the value was always in Raw, ODS just never mapped it | re-produce from Raw → push corrected rows → targeted refresh |
+| **B. [Proposal C](./proposal-c-correction.md) backfill** | the value was always in Raw, ODS just never mapped it | re-produce from Raw → push corrected rows → targeted refresh |
 | **C. Downstream imputation** | analysis needs non-NULL | `COALESCE` in `int_`/`dim_`, semantics recorded in the model description |
 | **D. Default at ingestion** | the value must always exist | set default / NOT NULL in the migration; historical rows filled at migration time |
 

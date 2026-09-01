@@ -15,6 +15,7 @@ Operational procedures. **What to do**, not why — the why lives in the [ADRs](
 | The analytics DAG has failed for several days in a row | [dag-failure-recovery](./dag-failure-recovery.md) |
 | A quality rule is being loosened and quarantined rows should come back | [proposal-b-rollout](./proposal-b-rollout.md) |
 | A record must be written off permanently | [quarantine-writeoff](./quarantine-writeoff.md) |
+| A cleaning bug corrupted values in already-`processed` records | [proposal-c-correction](./proposal-c-correction.md) |
 | Records stuck in `pending` or `processing`; the broker is down | [queue-ops](./queue-ops.md) |
 | A dbt model needs rebuilding, or `int_` was changed | [dbt-ops](./dbt-ops.md) |
 | A column is being added to or removed from ODS | [schema-change](./schema-change.md) |
@@ -28,6 +29,7 @@ Operational procedures. **What to do**, not why — the why lives in the [ADRs](
 1. **Do not edit `raw.status` by hand.** The state machine has recovery paths for every stuck state; editing it directly bypasses the invariants those paths rely on. [queue-ops](./queue-ops.md) explains what to do instead.
 
 2. **Do not modify ODS.** ODS is the immutable anchor. Any correction goes through `quality_events` ([ADR-0032](../adr/0032-bounded-writeback.md)).
+   The one exception is the migration shape in [proposal-c-correction](./proposal-c-correction.md) — **batched, versioned, keeping a retired copy, forcing downstream through**. What this rule forbids is the single-row, unversioned, downstream-unaware rewrite.
 
 ---
 

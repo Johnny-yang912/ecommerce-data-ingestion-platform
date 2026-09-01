@@ -56,7 +56,7 @@ dbt run --select stg_orders --vars '{stg_orders_lookback_days: <涵蓋缺口的 
 | 選項 | 適用於 | 做法 |
 |---|---|---|
 | **A. 接受 NULL**（預設） | 這個值確實是從現在才開始被收集 | 不填；下游按時間切片或 `WHERE col IS NOT NULL` |
-| **B. Proposal C 回填** | 值一直在 Raw 裡，只是 ODS 從未對映它 | 用新對映從 Raw 重新產生 → 推送修正列 → 定向刷新 |
+| **B. [Proposal C](./proposal-c-correction.md) 回填** | 值一直在 Raw 裡，只是 ODS 從未對映它 | 用新對映從 Raw 重新產生 → 推送修正列 → 定向刷新 |
 | **C. 下游補值** | 分析需要非 NULL | 在 `int_`／`dim_` 用 `COALESCE`，語意記在 model description |
 | **D. 攝入時給預設** | 這個值必須永遠存在 | 在 migration 裡設 default／NOT NULL；歷史列在 migration 當下被填 |
 

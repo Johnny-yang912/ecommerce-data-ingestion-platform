@@ -187,7 +187,7 @@ WHERE table_name = @table
 3. **補丁形**：第二張表與另一份手工維護的宣告，外加一個重抽的地雷。
 4. **Late-arriving**：對受影響分區做定向刷新。
 
-Proposal C 是什麼、為何存在，見 [data-quality](./data-quality.md)。
+Proposal C 是什麼、為何存在，見 [data-quality](./data-quality.md)；上面 1 與 4 的執行順序見 [runbooks/proposal-c-correction](../runbooks/proposal-c-correction.md) 的第 4～5 步。
 
 ---
 

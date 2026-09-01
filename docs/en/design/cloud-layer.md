@@ -187,7 +187,7 @@ Directional design; not built. Four things the cloud side would have to handle:
 3. **Patch shape**: a second table and another hand-maintained declaration, plus a re-extract landmine.
 4. **Late-arriving**: targeted refresh of the affected partitions.
 
-See [data-quality](./data-quality.md) for what Proposal C is and why it exists.
+See [data-quality](./data-quality.md) for what Proposal C is and why it exists; points 1 and 4 above are steps 4–5 of [runbooks/proposal-c-correction](../runbooks/proposal-c-correction.md).
 
 ---
 

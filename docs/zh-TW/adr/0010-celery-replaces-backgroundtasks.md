@@ -51,7 +51,40 @@ ODS 最終計數 800，什麼都沒丟。
 
 **保留 `BackgroundTasks`，靠掃描兜底。** 掃描確實最終能恢復一切，但「最終」是一個掃描間隔，而且 API 永遠是單行程。
 
-**用 RabbitMQ 而非 Redis。** 有真正的 ack 而非模擬的 visibility timeout，代價是多一個要維運的服務。Redis 本來就在技術棧裡（限流計數器用它），而 visibility timeout 的語意是清楚且有上界的。
+### 三個常見選項
+
+| | Kafka | RabbitMQ | Redis + Celery（採用） |
+|---|---|---|---|
+| 本質上是什麼 | 有保留期的分散式 commit log | 訊息 broker——真 ack／nack／死信 | 資料結構伺服器；佇列語意由 Celery 在上層模擬 |
+| 投遞保證 | at-least-once（exactly-once 需交易 API） | at-least-once，**真 ack** | at-least-once，**ack 靠 visibility timeout 模擬** |
+| 失聯後何時重投遞 | consumer group rebalance | 連線中斷即時 requeue | 等 visibility timeout 到期（此處 600s） |
+| 可重播歷史 | ✅ 保留期內任意 offset | ❌ 消費即消失 | ❌ |
+| 死信 | 自行實作 | ✅ 原生 DLX | 無（重試在 Celery 層） |
+| 新增的維運表面 | broker + 分區規劃 + 磁碟容量 | 一個服務 + vhost／queue 宣告 | **零**——Redis 已在棧內（限流計數器，db1） |
+| 這個系統實際會用到的 | 派工 | 派工 | 派工 |
+
+最後一列是整張表的重點：**三者在這裡都只會被用來做同一件事。** 差別因此不在能力，而在「多買到的能力值不值得它的成本」。
+
+**為什麼不是 Kafka。** Kafka 最貴、也最有價值的能力是「保留的事件流可以被重播，並被多個獨立消費者群各自取用」。這兩件事在這裡都是重複的——一則訊息只有一個消費者，沒有第二個消費者群；而**重播的職責根本不在佇列，在 Raw 表**：payload 逐字保留於 Raw（[ADR-0053](./0053-raw-text-ods-jsonb.md)），重放的入口是 `force=true` 與 Proposal C，兩者都從 Raw 出發。
+
+> 若佇列也保留一份可重播的歷史，系統就有了**兩個「到達了什麼」的真相**——而那正是 single-ingress 不變式禁止的事。**Raw 已經是這個系統的 commit log 了。**
+
+於是分區規劃、磁碟容量與一個額外的協調服務，買到的是一個這裡已經有、而且刻意只留一份的東西。
+
+**為什麼不是 RabbitMQ。** 三者裡它技術上最貼合「派工」這個形狀：真 ack、原生死信、失聯即時 requeue，而且沒有 `visibility_timeout` 這種**可以設錯**的參數。不選它的理由不是它比較差，而是**它的優勢在這個系統裡已經被別的東西買走了**。
+
+`acks_late` 的弱點是「同一則訊息可能被處理兩次」。真 ack 能縮小那個窗口，但縮不到零——任何 at-least-once 系統都一樣。而這裡的重複投遞**本來就是無操作**：CAS 認領（[ADR-0004](./0004-cas-claim-rowcount.md)）與 `UNIQUE(ods.order_id)`（[ADR-0005](./0005-first-write-wins-idempotency.md)）都建立在佇列之前，重投遞抵達時 CAS 失敗、立刻返回。**要用 RabbitMQ 買的那個保證，冪等性已經先付過一次錢了。** 剩下的差額是一個要維運的新服務，而 Redis 本來就在棧裡。
+
+**選 Redis 的代價，寫清楚。** 它換來的不是「沒有代價」，是「一個有上界、且已被量測過的代價」：
+
+| 代價 | 為何可接受 |
+|---|---|
+| `visibility_timeout` 是可以設錯的參數——設得比最長任務短，任務還在跑就被重投遞，形成重複執行風暴 | 取 600s，而 `process_raw_event` 最壞情況是三層指數退避（秒級）。**這是一個需要被知道、而非需要被信任的數字** |
+| Redis 的持久化（AOF／RDB）弱於另外兩者，崩潰時可能丟掉最後幾則訊息 | 丟掉的訊息對應的 raw 列仍停在 `pending`，恢復掃描會撿回來——**佇列可以丟訊息，資料庫不會丟列** |
+
+第二列正是本文開頭那個結論的另一面：佇列與掃描是互補的，所以佇列的耐久性不必是絕對的。
+
+**而且這個決定是可逆的。** Celery 對其中兩者（Redis／RabbitMQ）都只是換 `broker_url`，`acks_late`、`prefetch`、序列化那些設定一律不動。**真正不可逆的是把冪等性建在佇列之外——而那件事已經做完了**，所以換 broker 永遠只是一次維運決定，不會變成一次重寫。
 
 ## 相關
 

@@ -158,11 +158,19 @@ First-write-wins，執行兩層：預檢以避免白做工，`IntegrityError` �
 - `UNIQUE(ods.raw_id)`——**一次攝入事件最多產生一列 ODS。** 一條血緣邊。
 - `UNIQUE(ods.order_id)`——**一筆真實訂單只存在一次。** 一條業務不變式。
 
+而那條血緣邊是**一路帶到底的**。`raw_id` 從 Raw 的主鍵出發，經 ODS、staging、`stg_`、`int_`，到 `fct_orders` 都還在（在 Gold 已不是鍵，只作血緣欄位）；`quality_events` 也以它為軸記錄每一次狀態轉移。**這筆資料從出生到終局的每一段，都掛在同一個識別碼上——任一層的任一列，都能靠它走回自己那份逐字的 payload。**
+
+因此它撐著的不只是一條 join：`force=true` 重放靠它知道要重放哪一次攝入；[Proposal C](../runbooks/proposal-c-correction.md) 的前提「從 Raw 重產值」沒有它就不成立；[ADR-0053](../adr/0053-raw-text-ods-jsonb.md) 那句「Raw 逐字保留使重建成為可能」也是靠它兌現——**payload 留著卻走不回去，等於沒留。** `FK → raw.id`（`NO ACTION`）把「我們假設 raw 還在」變成「資料庫保證 raw 還在」，並順帶要求 **Raw 必須活得比它的 ODS 列久**。
+
+> `raw.order_id` 可以是 NULL——沒解析成功的 payload 根本沒有業務身分，但它仍然有 `raw.id`，仍然要被搶佔、被處理、被計數。**業務身分是資料的屬性；物理身分是事件的屬性——而攝入層記的是事件。**
+
 **物理去重要用物理身分**，那正是 `stg_orders` 的 window function 以 `raw_id` 而非 `order_id` 分組的原因（[ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)）。
 
 > ⚠️ **`raw_id` 的唯一性只在單一落地實例之內成立。** 兩個 ODS 實例的序列都從 1 開始，把兩者抽進同一張 staging 表，`stg_` 的去重就會把毫無關係的訂單摺疊成彼此的「副本」——而且是靜默的。見 [verification/2026-08-raw-id-collision-two-ods](../verification/2026-08-raw-id-collision-two-ods.md)。
 
-### 血緣
+### 來源血緣：`source_client_id`
+
+上面那條邊回答「這一列來自哪一次攝入」；這一條回答「那一次攝入來自誰」。
 
 由 API key 解析出的 `client_id` 以 `source_client_id` 落在 Raw 與 ODS 上。因為它來自已驗證的 key 而非 payload，上游無法假冒他人。
 

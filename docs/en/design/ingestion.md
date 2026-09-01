@@ -158,11 +158,19 @@ The two `UNIQUE` constraints on ODS are therefore not redundant. They say differ
 - `UNIQUE(ods.raw_id)` — **one ingestion event produces at most one ODS row.** A lineage edge.
 - `UNIQUE(ods.order_id)` — **one real order exists once.** A business invariant.
 
+And that lineage edge is **carried the whole way down**. `raw_id` starts as Raw's primary key and is still there through ODS, staging, `stg_`, `int_`, all the way to `fct_orders` (where it is no longer a key, only a lineage column); `quality_events` records every state transition against it too. **Every stage of this record's life, from birth to end, hangs off the same identifier — any row at any layer can walk back to its own verbatim payload.**
+
+So what it holds up is more than a join: `force=true` replay needs it to know which ingestion event to replay; [Proposal C](../runbooks/proposal-c-correction.md)'s premise of "re-derive values from Raw" does not stand without it; and [ADR-0053](../adr/0053-raw-text-ods-jsonb.md)'s promise that "Raw kept verbatim enables rebuilding" is redeemed through it — **a payload you cannot walk back to is a payload you did not keep.** The `FK → raw.id` (`NO ACTION`) turns *"we assume raw is there"* into *"the database guarantees raw is there"*, and with it requires that **Raw outlive its ODS row**.
+
+> `raw.order_id` can be NULL — a payload that never parsed has no business identity at all, yet it still has `raw.id`, and it still has to be claimed, processed, and counted. **Business identity is a property of the data; physical identity is a property of the event — and the ingestion layer records events.**
+
 Physical dedup uses physical identity, which is why `stg_orders` partitions its window function on `raw_id` and not on `order_id` ([ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)).
 
 > ⚠️ **`raw_id`'s uniqueness holds only within a single landing instance.** Two ODS instances both start their sequences at 1, and extracting both into one staging table makes `stg_`'s dedup collapse unrelated orders into "copies" of each other — silently. See [verification/2026-08-raw-id-collision-two-ods](../verification/2026-08-raw-id-collision-two-ods.md).
 
-### Lineage
+### Source lineage: `source_client_id`
+
+The edge above answers *which ingestion event this row came from*; this one answers *who that ingestion came from*.
 
 The `client_id` resolved from the API key lands as `source_client_id` on both Raw and ODS. Because it comes from the verified key rather than the payload, an upstream cannot claim to be someone else.
 

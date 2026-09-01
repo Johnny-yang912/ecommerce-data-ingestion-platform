@@ -51,7 +51,40 @@ Final ODS count 800, nothing lost.
 
 **Keep `BackgroundTasks` and rely on the scan.** The scan alone recovers everything eventually, but "eventually" is one scan interval, and the API stays single-process forever.
 
-**RabbitMQ instead of Redis.** Real acks rather than a simulated visibility timeout, at the cost of another service to operate. Redis was already in the stack for rate-limit counters; the visibility-timeout semantics are well understood and bounded above.
+### The three usual options
+
+| | Kafka | RabbitMQ | Redis + Celery (chosen) |
+|---|---|---|---|
+| What it fundamentally is | a distributed commit log with a retention period | a message broker — real ack / nack / dead-letter | a data-structure server; queue semantics simulated on top by Celery |
+| Delivery guarantee | at-least-once (exactly-once needs the transactional API) | at-least-once, **real ack** | at-least-once, **ack simulated by a visibility timeout** |
+| When redelivery fires after loss | consumer group rebalance | immediate requeue on connection loss | when the visibility timeout expires (600s here) |
+| Replayable history | ✅ any offset within retention | ❌ consumed is gone | ❌ |
+| Dead-letter | build it yourself | ✅ native DLX | none (retries live in Celery) |
+| Operational surface added | broker + partition planning + disk capacity | one service + vhost / queue declarations | **none** — Redis is already in the stack (rate-limit counters, db1) |
+| What this system would actually use | dispatch | dispatch | dispatch |
+
+The last row is the point of the table: **all three would be used here for exactly one thing.** The difference is therefore not capability but whether the extra capability is worth its cost.
+
+**Why not Kafka.** Kafka's most expensive and most valuable property is that a retained event stream can be replayed and consumed independently by several consumer groups. Both are redundant here — a message has exactly one consumer and there is no second group; and **replay is not the queue's job, it is Raw's**: the payload is kept verbatim in Raw ([ADR-0053](./0053-raw-text-ods-jsonb.md)), and the entry points for replay are `force=true` and Proposal C, both of which start from Raw.
+
+> If the queue also held a replayable history, the system would have **two sources of truth for what arrived** — exactly what the single-ingress invariant forbids. **Raw already is this system's commit log.**
+
+Partition planning, disk capacity and an extra coordination service would therefore buy something this system already has and deliberately keeps only one copy of.
+
+**Why not RabbitMQ.** Of the three it fits the shape of *dispatch* best: real acks, native dead-lettering, immediate requeue on loss, and no `visibility_timeout` — no parameter that **can be set wrong**. The reason for not choosing it is not that it is worse, but that **its advantage has already been bought here by something else**.
+
+The weakness of `acks_late` is that a message may be processed twice. A real ack narrows that window but does not close it — no at-least-once system does. And redelivery here is **already a no-op**: the CAS claim ([ADR-0004](./0004-cas-claim-rowcount.md)) and `UNIQUE(ods.order_id)` ([ADR-0005](./0005-first-write-wins-idempotency.md)) were both built before the queue, so a redelivered message fails the CAS check and returns immediately. **The guarantee RabbitMQ would be bought for has already been paid for once, by idempotency.** What remains is one more service to operate, against a Redis that was in the stack anyway.
+
+**The price of choosing Redis, stated.** What it buys is not the absence of a cost but a cost that is bounded and has been measured:
+
+| Cost | Why it is acceptable |
+|---|---|
+| `visibility_timeout` is a parameter that can be set wrong — set it below the longest task and a still-running task gets redelivered, and the system stampedes | it is 600s, and `process_raw_event`'s worst case is three layers of exponential backoff (seconds). **This is a number to be known, not a number to be trusted** |
+| Redis persistence (AOF / RDB) is weaker than the other two; a crash can lose the last few messages | the raw rows behind those messages are still sitting in `pending`, and the recovery scan picks them up — **the queue may lose messages; the database does not lose rows** |
+
+The second row is the other face of this ADR's own conclusion: the queue and the scan are complements, so the queue's durability does not have to be absolute.
+
+**And the decision is reversible.** For two of the three (Redis / RabbitMQ) Celery only needs a different `broker_url`; `acks_late`, prefetch and serialisation all stay as they are. **What is irreversible is having built idempotency outside the queue — and that is already done**, which is what keeps a broker change an operational decision rather than a rewrite.
 
 ## Related
 

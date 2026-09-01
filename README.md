@@ -1,6 +1,6 @@
-# ecommerce-data-ingestion-platform
+# Order Data Pipeline System
 
-### E-Commerce Order Pipeline — Data Lifecycle Management in Practice
+### An ingestion-to-analytics data pipeline, built in the e-commerce order domain
 
 **English** | [繁體中文](./README-TW.md)
 
@@ -10,13 +10,19 @@
 
 ## What this is
 
-An e-commerce order ingestion and analytics pipeline, organised around **data lifecycle management**. Untrusted inbound data is progressively turned into trustworthy analytical data through per-layer quality contracts, and **the evolution of every quality judgement stays auditable**.
+A **data pipeline system**: untrusted inbound data is progressively turned into trustworthy analytical data through per-layer quality contracts — and **the evolution of every quality judgement stays auditable**.
 
-Data engineering first, backend engineering second:
+It is a backend service and a data pipeline at once. **Correctness at ingestion is a backend problem; trustworthiness downstream is a data problem**, and this project lives at the seam between them — where data stops being a request and becomes a fact.
 
-- The ingestion layer's fault tolerance ensures **data gets in** — multi-point retry, CAS claim, crash recovery, a circuit-broken dispatch.
-- Layered quality contracts ensure **data flows correctly** — Raw → ODS → `stg_` → `int_` → `dim_`/`fct_` → `rpt_`, blocking exactly once.
-- Rule versioning and an append-only event log ensure **a judgement can be revised without rewriting history**.
+E-commerce orders are the chosen **domain**, not the subject. It was chosen because three problems hold there at the same time, and each one forced a different part of the system into existence:
+
+| What the domain brings | What it forced |
+|---|---|
+| **Concurrent order submission** | Fault tolerance at ingestion — multi-point retry, CAS claim, crash recovery, a circuit-broken dispatch. So that **data gets in** |
+| **Duplicate submission** | Two identities, first-write-wins idempotency, `duplicate` as a terminal status rather than an error. So that **an order exists exactly once, while the duplication itself stays readable as a signal** |
+| **Dirty upstream data** | Layered quality contracts (Raw → ODS → `stg_` → `int_` → `dim_`/`fct_` → `rpt_`, blocking exactly once), rule versioning, an append-only event log. So that **a judgement can be revised without rewriting history** |
+
+None of those three is unique to e-commerce — clickstream, IoT telemetry and logistics events all face them, some at greater volume and at no lower cost. E-commerce orders were chosen because the three hold there at once, and because the domain's data model is complete enough to carry the pipeline all the way: an order naturally brings a customer, products, money and time with it, so it reaches a star schema and a reporting layer — **giving this pipeline a real destination rather than stopping at a cleaned table.**
 
 ## What this is not
 

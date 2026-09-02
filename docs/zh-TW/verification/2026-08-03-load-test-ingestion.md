@@ -57,9 +57,15 @@ CAS 與冪等性在真實爭用下都成立。測試 4 與測試 6 的競賽是 
 
 ## 這推翻了什麼
 
-當時沒有。**同一套測試裡的測試 5（SIGKILL）後來被推翻了**——見 [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md)。
+當時沒有。**但這套測試自己後來被推翻了兩次：**
+
+- **測試 2（併發 500 的 5 筆失敗）已於 2026-09-02 失效**——見 [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md)。以相同參數複跑，1000 筆全過、連線池峰值 12。⚠️ **上面「485 個要排隊等連線」那段推論在今天的程式碼上不成立**：當時的壓力來自 `BackgroundTasks` 把同步的 `process_raw_event` 丟進 40 條 anyio threadpool、共用 API 那 15 條連線池；`8485f64` 把派工改成 Celery 之後，API 行程只剩一次 INSERT，且連線在派工前就歸還。
+- **測試 5（SIGKILL）已於 2026-08-10 失效**——見 [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md)。
+
+測試 1、3、4、6 仍然成立：那幾項驗的是 CAS 與冪等性，而那段程式碼沒有變。
 
 ## 相關
 
+- [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — 推翻本文測試 2
 - [ADR-0004](../adr/0004-cas-claim-rowcount.md) · [ADR-0005](../adr/0005-first-write-wins-idempotency.md)
 - [design/testing](../design/testing.md) — 為何這些是手動而不在 CI 裡

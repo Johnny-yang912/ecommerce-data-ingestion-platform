@@ -57,9 +57,15 @@ CAS and idempotency both hold under real contention. Test 4 and Test 6's race ar
 
 ## What this overturned
 
-Nothing at the time. **Test 5 (SIGKILL) from the same suite was later overturned** — see [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md).
+Nothing at the time. **But this suite has itself since been overturned twice:**
+
+- **Test 2 (the 5 failures at concurrency 500) became invalid on 2026-09-02** — see [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md). Re-run with identical parameters, all 1000 requests succeeded with a peak of 12 connections. ⚠️ **The reasoning above about "485 queueing for a connection" does not hold against today's code**: the pressure then came from `BackgroundTasks` dispatching the synchronous `process_raw_event` into a 40-thread anyio pool sharing the API's 15-connection pool. Since `8485f64` moved dispatch to Celery, the API process does one INSERT and returns its connection before dispatching.
+- **Test 5 (SIGKILL) became invalid on 2026-08-10** — see [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md).
+
+Tests 1, 3, 4 and 6 still hold: they verify CAS and idempotency, and that code has not changed.
 
 ## Related
 
+- [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — overturns Test 2 above
 - [ADR-0004](../adr/0004-cas-claim-rowcount.md) · [ADR-0005](../adr/0005-first-write-wins-idempotency.md)
 - [design/testing](../design/testing.md) — why these are manual and not in CI

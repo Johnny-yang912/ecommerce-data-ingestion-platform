@@ -25,13 +25,14 @@ These are not unit tests. A unit test asks *"is this code correct?"*; a verifica
 | 2026-08 | [Sandbox partition expiry](./2026-08-partition-expiry-measurement.md) | out-of-range dates **do not fail the build** | ⭐ **yes** |
 | 2026-08 | [Partition savings](./2026-08-partition-savings.md) | clustering alone prunes **82%**; partitioning adds 9 | ⭐ **yes** |
 | 2026-08-12 | [Proposal B v2→v3→v4](./2026-08-12-proposal-b-v2-to-v4.md) | 16 + 15 promoted, all idempotent | — |
+| 2026-09-02 | [Ingestion capacity and bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) | DB is **0.79ms** of 8.05ms; worker drains **270/s** | ⭐ **yes** |
 | — | [`raw_id` collides across ODS instances](./2026-08-raw-id-collision-two-ods.md) | two unrelated orders deduped into one | — |
 
 ---
 
 ## The "overturned something" column
 
-Six records changed a conclusion that had already been written down. That column exists because **a verification that can only confirm is not worth much** — the value is in the ones that came back with a different answer:
+Seven records changed a conclusion that had already been written down. That column exists because **a verification that can only confirm is not worth much** — the value is in the ones that came back with a different answer:
 
 | Overturned | Was | Is |
 |---|---|---|
@@ -41,6 +42,7 @@ Six records changed a conclusion that had already been written down. That column
 | Bounded scan | batch publishing was assumed to be the win | it is 1.1× — pagination is the win |
 | Partition expiry | "out-of-range dates fail the build" | they land silently in `__UNPARTITIONED__` |
 | `--expect-rule-version` | assumed to catch version divergence | only compares within its own process |
+| Ingestion load test (concurrency 500) | "pool exhaustion caused 5 HTTP 500s" | does not reproduce after the refactor; the pool was never exhausted |
 
 ---
 

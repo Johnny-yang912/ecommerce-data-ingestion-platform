@@ -35,6 +35,8 @@ Code change: three endpoints switched to `def`, new async dependency `get_raw_bo
    ⭐ `/health` touches no database, has no auth, and no rate limit — **the only resource it needs is the event loop**. Its latency is therefore a direct measurement of how long the loop is held, and it is this document's central evidence.
 3. **Throughput**: `load_test.py`, 1200 requests each at concurrency 50, **three alternating rounds** (before→after→before→after…).
 4. Tests 1/2/3 re-run with the original document's method, unchanged.
+5. **Fault injection** (Test G): `docker pause api-db-1` freezes the database process for 8 seconds. The load must span the stall window, otherwise the measurement captures only silence — with no requests in flight during the stall, there is nothing to observe.
+6. **Sustained load** (Test H): `redis-cli -n 0 flushdb` clears the celery queue before the run. Leftover messages make the previous round's `order_id`s arrive again and take the `duplicate` short path, which is far cheaper than a full ODS write and inflates the measured drain rate.
 5. Between runs: `DELETE FROM ods` then `DELETE FROM raw` (FK order).
 
 ## Observed
@@ -137,13 +139,60 @@ Doubling client processes gains only 5% (507→535), so **510–535 RPS at worke
 
 (Peaks include roughly 4–8 connections from the worker container and baseline.)
 
+### Test G — Database stall injection ⭐
+
+**This closes the one property this document had flagged as inferred rather than measured.**
+
+Method: workers=1, pool=3+5; 6,000 requests sent to `/orders` at concurrency 20 while `/health` is polled every 200ms. Eight seconds into the load, `docker pause api-db-1` for 8 seconds, then unpause.
+
+| | **before** (`async def`) | **after** (`def`) |
+|---|---:|---:|
+| `/health` p50 | 57.9 ms | 17.2 ms |
+| `/health` p95 | 91.1 ms | 32.2 ms |
+| **`/health` max** | **8,169.5 ms** | **40.4 ms** |
+| requests over 1 second | **1 (8.2s)** | **0** |
+| `/orders` | 6,000, all 200 | 6,000, all 200 |
+
+**One `/health` request took 8.2 seconds under the old code — almost exactly the 8-second database stall.** An endpoint that touches no database was held for the entire duration of a database outage.
+
+⭐ **The freeze lasts as long as the database is stuck.** This is the mechanism behind conclusion 1's "frozen for up to `statement_timeout` (30s)" — 8 seconds is simply a scaled-down version; lengthen the stall and the freeze lengthens with it.
+
+⚠️ Neither version lost an order (6,000 requests all returned 200). The difference is **not data correctness but whether other requests can still be served**.
+
+### Test H — Sustained load and backpressure, re-run
+
+Same method as [ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) Test 5: 4 client processes, `order_id` offsets, 15,000 requests each, 60,000 total.
+
+| Metric | before | **after** |
+|---|---:|---:|
+| Injection rate | 313 /s | **487.8 /s** |
+| **Peak backlog** | 5,453 | **36,526 (6.7×)** |
+| **Worker drain (during injection)** | 270 /s | **186 /s** |
+| Worker drain (after injection) | — | **299 /s** |
+| Full drain after injection stopped | 0 s | **119 s** |
+| ODS rows landed | 60,000 / 60,000 | **60,000 / 60,000** |
+| Errors | 0 | **0** |
+
+Backlog curve (after):
+
+```
+t=20s   backlog  7,372   processed  3,673
+t=60s   backlog 22,556   processed 11,195
+t=101s  backlog 36,526   processed 18,735   <- peak
+t=121s  backlog 35,556   processed 23,892   <- injection ends (t=123s), recovery begins
+t=181s  backlog 18,213   processed 41,787
+t=241s  backlog    132   processed 59,868
+```
+
+⭐ **The worker's drain rate is not a constant**: 186/s while injection is running, back to 299/s the moment it stops.
+
 ## Conclusion
 
 ### 1. The defect is real, and it is failure amplification rather than a performance issue
 
 Test A is the direct evidence: an endpoint that **touches no database at all** had its p99 dragged to 167ms under load. That time was spent with the event loop parked inside another request's `db.commit()`.
 
-Taken to its limit: `statement_timeout` is 30 seconds, so under the old shape a single stuck query **freezes an entire uvicorn process for 30 seconds** — not just that request, but every request on that process, `/health` included. With four workers that is 25% of serving capacity gone.
+Taken to its limit: **Test G measured** an 8-second database stall holding one `/health` request for 8.2 seconds — **the freeze lasts as long as the database is stuck**. And `statement_timeout` is 30 seconds, so under a real lock wait a single stuck query can freeze an entire uvicorn process for up to 30 seconds — not just that request, but every request on that process, `/health` included. With four workers that is 25% of serving capacity gone.
 
 ⭐ **This property is completely invisible in normal operation and appears only during an incident — which is exactly when it is most needed alive.**
 
@@ -195,9 +244,35 @@ The model was wrong: it counted only the DB spans visible in the trace (0.79ms o
 
 Separately: 8 unit tests that call the handler functions directly needed updating (drop `await`, pass `raw_body=`, `patch("asyncio.sleep")`→`patch("main.time.sleep")`). **They were affected because they bypass FastAPI's dependency resolution and call the function directly** — tests going through TestClient were entirely unaffected.
 
+### 8. ⚠️ Burst backlog grows nearly 7× larger, and the worker slows down during bursts
+
+This is the one consequence of the change that moves in the wrong direction, and it has to be recorded.
+
+```
+before: 313 in − 270 out = 43 /s gap   -> peak backlog  5,453
+after : 488 in − 186 out = 302 /s gap  -> peak backlog 36,526
+```
+
+Both ends worsened at once: **the API accepts faster (+56%) while the worker drains slower during the burst (270 → 186).**
+
+The worker did not change — `process.py` was not touched. **The API simply takes more CPU during a burst now**, and in this test the API, worker, PostgreSQL, Redis and 4 load-generator processes all share one 16-core machine. The evidence: the moment injection stops, the worker returns to 299/s.
+
+**Backpressure behaviour remains entirely correct**: zero errors, zero 503s, zero lost orders, 60,000 rows all landed in ODS, fully recovered 119 seconds after load stopped. A larger backlog is not a failure — it is the queue absorbing a larger gap.
+
+Three things that follow:
+
+1. **How to read `raw_pending_watch`.** It measures how long the oldest row has waited, not how many rows there are, so it will not false-positive; but **the backlog figures you see will be an order of magnitude larger than the 5,453 in the earlier record** — do not read 36,526 as an anomaly.
+2. **This strengthens rather than overturns [ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) conclusion 4** (the ceiling is the worker, not the API) — the gap widened, so the conclusion holds more strongly. But **the 313 / 270 figures in its conclusions 4 and 6 are superseded by this document.**
+3. **This worsening is an artefact of sharing one machine.** Deploy or scale the worker separately and the contention disappears — and `try_claim_raw`'s CAS guarantees workers scale horizontally without coordination.
+
+**Updated citable capacity statement (must be quoted together with its environment):**
+
+> Measured on a single development machine (16 cores; DB / Redis / worker / load generator co-located; rate limiting disabled): the ingestion API accepts ~488 orders/second. The Celery worker's drain rate depends on how hard the API is working — roughly 186/second during a burst, roughly 299/second when the API is idle. Beyond drain capacity the surplus is absorbed by the queue: a 60,000-request burst peaked at a backlog of 36,526 with zero errors and was fully consumed 119 seconds after load stopped, with every row landing in ODS.
+
 ### ⚠️ What this document does not represent
 
-- **Not the behaviour under failure.** DB / Redis / worker were healthy throughout; no fault injection was performed. The "30-second freeze" in conclusion 1 is **inferred from `statement_timeout` and was not verified by injecting a slow query**.
+- **Only one kind of fault was injected.** Test G stalled PostgreSQL for 8 seconds with `docker pause`, directly verifying conclusion 1's freeze mechanism. But **broker outage, worker crash and dropped connections remain outside this document** — those are covered by [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md) and [2026-08-10-circuit-breaker-before-after](./2026-08-10-circuit-breaker-before-after.md).
+- **`docker pause` is not a slow query.** It freezes the whole database process, so the server-side `statement_timeout` never fires (the server is stopped too). Under a real lock wait or slow query, `statement_timeout` intervenes at 30 seconds and aborts the statement — **so the freeze is bounded at 30 seconds rather than unbounded**. That bound was not measured here.
 - **Not production figures.** Single machine, load generator sharing 16 cores with the services, data volume around 17k rows.
 - **Not a case for setting pool to 2.** Test D's flat region was measured at workers=1; per-process concurrency differs at other worker counts, and a degraded database raises the connections needed — **headroom exists for the abnormal case.**
 - **Rate limiting was disabled throughout.** Production is `60/minute`.

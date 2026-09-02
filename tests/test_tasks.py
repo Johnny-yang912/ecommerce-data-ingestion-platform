@@ -477,7 +477,7 @@ class TestEnqueueCircuitBreaker:
 
 class TestCreateOrderEnqueueContract:
 
-    async def test_still_returns_pending_when_broker_is_down(self, mock_request, sample_order):
+    async def test_still_returns_pending_when_broker_is_down(self, mock_request, sample_order, raw_body):
         """
         broker 掛掉不得讓 POST /orders 回 500：Raw 已經 commit 落地了。
         回 500 會讓上游重送、灌出一批同 order_id 的 Raw 全變 duplicate 雜訊，
@@ -490,14 +490,14 @@ class TestCreateOrderEnqueueContract:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main.process_raw_event_task") as mock_task, \
              patch("main._key_func", return_value="test-ip"), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+             patch("main.time.sleep"):
             mock_task.delay.side_effect = ConnectionError("redis is down")
-            result = await create_order(mock_request, sample_order, client_id="test-client")
+            result = create_order(mock_request, sample_order, raw_body=raw_body, client_id="test-client")
 
         assert result == {"raw_id": 555, "status": "pending"}
         assert mock_db.commit.call_count == 1
 
-    async def test_enqueue_happens_after_commit(self, mock_request, sample_order):
+    async def test_enqueue_happens_after_commit(self, mock_request, sample_order, raw_body):
         """
         派工必須在 commit 之後：worker 走另一條 DB 連線，先派工可能讓它
         讀不到還沒 commit 的 Raw，claim 直接落空。
@@ -510,13 +510,13 @@ class TestCreateOrderEnqueueContract:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main.process_raw_event_task") as mock_task, \
              patch("main._key_func", return_value="test-ip"), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+             patch("main.time.sleep"):
             mock_task.delay.side_effect = lambda _: call_order.append("enqueue")
-            await create_order(mock_request, sample_order, client_id="test-client")
+            create_order(mock_request, sample_order, raw_body=raw_body, client_id="test-client")
 
         assert call_order == ["commit", "enqueue"]
 
-    async def test_session_closed_before_enqueue(self, mock_request, sample_order):
+    async def test_session_closed_before_enqueue(self, mock_request, sample_order, raw_body):
         """
         DB session 必須在派工**之前**收掉。db.refresh() 會開一個新交易，若讓它跨越
         派工阻塞，broker 故障期間連線會整段掛在 `idle in transaction`（實測 60 併發
@@ -531,8 +531,8 @@ class TestCreateOrderEnqueueContract:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main.process_raw_event_task") as mock_task, \
              patch("main._key_func", return_value="test-ip"), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+             patch("main.time.sleep"):
             mock_task.delay.side_effect = lambda _: call_order.append("enqueue")
-            await create_order(mock_request, sample_order, client_id="test-client")
+            create_order(mock_request, sample_order, raw_body=raw_body, client_id="test-client")
 
         assert call_order.index("close") < call_order.index("enqueue")

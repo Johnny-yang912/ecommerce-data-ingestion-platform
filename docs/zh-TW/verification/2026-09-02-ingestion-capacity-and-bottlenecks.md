@@ -223,13 +223,21 @@ t=280s  積壓     1   已處理 58,138
 
 直覺上最可疑的 pydantic 巢狀驗證只有 1.1%。**優化方向若從「資料庫」或「序列化」下手，都會落空。**
 
-### 二、連線池不是可調參數
+### 二、連線池不是可調參數　⚠️ 已被推翻
+
+> **⚠️ 本節已於同日被 [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) 推翻。**
+> 原文保留於下，因為它記錄了「在那個當下量到什麼」；但**下面那個可執行建議不可照做**——
+> 三個端點改成 `def` 之後，32 條在負載下實測峰值 29–34（幾乎用滿），砍到 8 會造成 `pool_timeout` 逾時與 503。
 
 `async def` 內的同步 DB 呼叫使每行程同時只持有 1 條連線；pool 從 1 到 100，對吞吐與實際連線數皆無可觀測影響（連線峰值恆為 10–12）。
 
 可執行結論：**API 的連線預算可由 32 條（`4 × (3+5)`）縮減至 8 條**。`max_connections` 只有 100，回收的額度是 Airflow 與人工連線的空間。
 
-### 三、擴展的唯一旋鈕是 uvicorn worker 數
+### 三、擴展的唯一旋鈕是 uvicorn worker 數　⚠️ 已被推翻
+
+> **⚠️ 本節已於同日被 [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) 推翻。**
+> 原文保留於下。端點改 `def` 之後曲線不再於 8 反轉（207 → 485 RPS），
+> `UVICORN_WORKERS=4` 因此從「曲線最高點」變成「保守的選擇」。
 
 1→4 接近線性（130.8 → 298.1 RPS），8 反轉。現行 `UVICORN_WORKERS=4` 位於曲線最高點。這是第二點的直接推論：既然每行程只能有一條 DB 作業在飛，增加吞吐就只能增加行程。
 
@@ -325,6 +333,9 @@ t=280s  積壓     1   已處理 58,138
 
 ## 這推翻了什麼
 
+⚠️ **先說本文自己**：結論二與三已於同日被 [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) 推翻——
+那份記錄的是「把本文指出的 `async def` + 阻塞 DB 這個缺陷修掉之後」的量測。結論一、四、五、六仍然成立。
+
 **[2026-08-03](./2026-08-03-load-test-ingestion.md) 的測試 2 已被推翻。** 該次記錄 C=500 時有 5 筆 HTTP 500，歸因於連線池耗盡；本次以相同參數複跑，1000 筆全過、連線池峰值 12。
 
 **推翻它的不是量測誤差，是一次架構重構。** 當時 `POST /orders` 使用 FastAPI `BackgroundTasks`，而 `process_raw_event` 是同步函式——Starlette 會將其投入預設 40 條的 anyio threadpool。也就是最多 40 個「完整的 Raw→ODS 清洗與寫入」同時執行，**且共用 API 那個僅 15 條的連線池**；`db.close()` 亦在 `finally`，`refresh` 開啟的交易全程掛著。
@@ -335,6 +346,7 @@ t=280s  積壓     1   已處理 58,138
 
 ## 相關
 
+- [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — 推翻本文結論二與三
 - [2026-08-03-load-test-ingestion](./2026-08-03-load-test-ingestion.md) — 本文推翻其測試 2
 - [design/queue](../design/queue.md) — CAS claim 與重新投遞的交互作用
 - [ADR-0004](../adr/0004-cas-claim-rowcount.md) · [ADR-0005](../adr/0005-first-write-wins-idempotency.md)

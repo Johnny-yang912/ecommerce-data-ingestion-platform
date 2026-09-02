@@ -7,7 +7,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from schema import OrderIN, RawOut
-import asyncio
+import time
 import structlog
 from structlog.contextvars import clear_contextvars, bind_contextvars
 from database import SessionLocal
@@ -172,21 +172,49 @@ async def health():
     return {"status": "ok"}
 
 
+# 取原始 request body 的依賴。
+#
+# 之所以是一個「非同步依賴」而不是 handler 內的一行：create_order 是 `def`（見下方），
+# 同步端點裡不能 `await request.body()`。FastAPI 允許同步端點掛非同步依賴——依賴在
+# event loop 上解析、端點在執行緒池執行，各自用對的方式取得自己需要的東西。
+async def get_raw_body(request: Request) -> str:
+    return (await request.body()).decode("utf-8")
+
+
 @app.post("/orders")
 @limiter.limit("60/minute")
-async def create_order(request: Request, order: OrderIN,
-                       client_id: str = Depends(verify_api_key)):
+# ⭐ 這裡是 `def` 而不是 `async def`，那是刻意的，量測依據見
+#    docs/zh-TW/verification/2026-09-02-ingestion-capacity-and-bottlenecks.md。
+#
+#    handler 裡的 DB 呼叫（db.commit / db.refresh / db.close）是同步阻塞的 psycopg2
+#    呼叫，而 commit() 到 close() 之間【沒有任何 await】。掛在 `async def` 上時它們
+#    直接跑在 event loop 上，那段期間整個 uvicorn 行程無法處理任何其他請求，
+#    連 /health 都回不了。
+#
+#    後果不是「慢一點」，是【故障放大】：statement_timeout 是 30 秒，所以單一個卡住的
+#    查詢會凍結整個行程 30 秒——不只那一筆請求，是那個 worker 上的全部請求。
+#    四個 worker 就是 25% 的服務容量消失 30 秒。這個性質在正常運作時完全看不見，
+#    只在出事時出現，而那正是最需要它還活著的時刻。
+#
+#    `def` 讓 Starlette 把整個 handler 丟進 anyio 執行緒池（預設 40 條），阻塞只發生在
+#    一條工作執行緒上，event loop 保持自由。這也是 FastAPI 對同步 ORM 的第一級做法，
+#    而非權宜之計——本專案的 process.py 同樣是同步的，兩邊風格因此一致。
+#
+# ⚠️ `request: Request` 必須留在簽名裡：slowapi 的裝飾器會檢查簽名，找不到
+#    `request` / `websocket` 參數會在 import 時直接 raise。
+def create_order(request: Request, order: OrderIN,
+                 raw_body: str = Depends(get_raw_body),
+                 client_id: str = Depends(verify_api_key)):
     bind_contextvars(client_id=client_id)
     logger.info("收到訂單請求", order_id=order.order_id)
     db = SessionLocal()
     try:
         # landing 層語意：請求已通過 OrderIN 結構驗證（壞資料在邊界以 422 擋掉），
-        # 此處逐字保留原始 request body，不做序列化/欄位過濾，避免上游 schema drift
-        # 時靜默丟失未知欄位。order_id 另外抽出作為關鍵追溯欄位。
+        # 此處逐字保留原始 request body（由 get_raw_body 依賴取得），不做序列化/欄位
+        # 過濾，避免上游 schema drift 時靜默丟失未知欄位。order_id 另外抽出作為關鍵追溯欄位。
         # PostgreSQL 的 TEXT/VARCHAR 無法儲存 NUL byte（\x00），含 NUL 的 payload 直接寫入
         # 會在 commit 拋非 OperationalError 例外、不被下方 retry 攔截 → 500、訂單連 Raw 都進不來。
         # 此處先移除 NUL 讓資料得以落地，並記一筆 warning 作為上游異常訊號。
-        raw_body = (await request.body()).decode("utf-8")
         payload_text = raw_body.replace("\x00", "")
         if len(payload_text) != len(raw_body):
             logger.warning("payload 含 NUL byte，已移除後落地", order_id=order.order_id)
@@ -207,7 +235,10 @@ async def create_order(request: Request, order: OrderIN,
                 if attempt < MAX_RAW_WRITE_RETRIES - 1:
                     logger.warning("raw 寫入失敗", attempt=attempt + 1, order_id=order.order_id, error=str(e))
                     RETRIES.add(1, {"stage": "raw_write"})
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    # time.sleep 而非 asyncio.sleep：本 handler 跑在執行緒池的工作
+                    # 執行緒上，那條執行緒沒有 running loop，asyncio.sleep 會直接
+                    # RuntimeError。這裡阻塞的是該條工作執行緒，不是 event loop。
+                    time.sleep(0.5 * (2 ** attempt))
                     db.add(raw)
                 else:
                     logger.error("raw 寫入失敗，已達最大重試次數", order_id=order.order_id, exc_info=True)
@@ -222,8 +253,12 @@ async def create_order(request: Request, order: OrderIN,
 
         # 派工必須在 db.commit() 之後：worker 走的是另一條 DB 連線，
         # 先派工可能讓它讀不到還沒 commit 的 Raw（claim 直接落空）。
-        # to_thread：broker 不可用時 _enqueue 會阻塞，不能卡在 event loop 上。
-        queued = await asyncio.to_thread(_enqueue, raw_id)
+        #
+        # 直接呼叫，不再包 asyncio.to_thread：整個 handler 已經在執行緒池裡了，
+        # 工作執行緒沒有 running loop，to_thread 會 RuntimeError。broker 不可用時
+        # 阻塞的是這條工作執行緒、event loop 不受影響——那正是原本用 to_thread 想
+        # 達成的效果，改成 `def` 之後由框架免費提供。
+        queued = _enqueue(raw_id)
         logger.info("raw 已建立", raw_id=raw_id, queued=queued)
         # 回應不受派工結果影響：資料已落地，未入列者由 recovery scan 接手（見 _enqueue）。
         return {"raw_id": raw_id, "status": "pending"}
@@ -238,8 +273,13 @@ async def create_order(request: Request, order: OrderIN,
 #    維運端點，持 key 者互為信任。決策與失效條件見 auth.py 檔頭〈信任模型〉。
 @app.post("/process_raw/{raw_id}")
 @limiter.limit("20/minute")
-async def process_raw(request: Request, raw_id: int, force: bool = False,
-                      client_id: str = Depends(verify_api_key)):
+# `def` 而非 `async def`，理由與 create_order 相同（見該處的長註解）。
+# ⚠️ 三個端點裡這個其實最容易踩到：force=True 會對 raw 下 UPDATE，而 worker 的
+#    CAS claim（try_claim_raw）同時也在 UPDATE 同一列——鎖等待最長可達
+#    statement_timeout（30 秒）。在舊的 `async def` 寫法下，那 30 秒凍結的是整個
+#    uvicorn 行程，不只這一筆 replay。低流量不代表低風險。
+def process_raw(request: Request, raw_id: int, force: bool = False,
+                client_id: str = Depends(verify_api_key)):
     logger.info("觸發 replay", raw_id=raw_id, force=force)
     db = SessionLocal()
     try:
@@ -264,7 +304,8 @@ async def process_raw(request: Request, raw_id: int, force: bool = False,
     # 與 /orders 的不對稱是刻意的：replay 是人工維運動作，操作者需要知道「到底派出去了沒」，
     # 所以 triggered 如實回報派工結果；/orders 面對的是自動化上游，回報派工失敗只會誘發
     # 無謂的重送（見 _enqueue）。
-    triggered = await asyncio.to_thread(_enqueue, raw_id)
+    # 直接呼叫，不再包 to_thread：本 handler 已經在執行緒池裡（見 create_order 的說明）。
+    triggered = _enqueue(raw_id)
     return {"raw_id": raw_id, "triggered": triggered, "force": force}
 
 
@@ -272,7 +313,8 @@ async def process_raw(request: Request, raw_id: int, force: bool = False,
 #    保留的原始 payload。維運端點，持 key 者互為信任——見 auth.py 檔頭〈信任模型〉。
 @app.get("/raw/{raw_id}", response_model=RawOut)
 @limiter.limit("120/minute")
-async def get_raw(request: Request, raw_id: int, client_id: str = Depends(verify_api_key)):
+# `def` 而非 `async def`，理由與 create_order 相同（見該處的長註解）。
+def get_raw(request: Request, raw_id: int, client_id: str = Depends(verify_api_key)):
     db = SessionLocal()
     try:
         raw = db.execute(select(Raw).where(Raw.id == raw_id)).scalar_one_or_none()

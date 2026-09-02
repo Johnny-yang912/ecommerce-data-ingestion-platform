@@ -36,6 +36,8 @@
 - **金額從 `FLOAT64` 移到 `NUMERIC`**，在一個上捲測試對 39 列差 **1 ULP** 變紅之後——浮點數的 `SUM()` 不具結合律。**修的是型別，不是容差。** → [design/transformation](./docs/zh-TW/design/transformation.md)
 - **增量窗口的左邊界沒有對齊分區邊界——同一個缺陷存在於三支模型。** `insert_overwrite` 的原子單位是整個分區，而左界帶著跑批當下的時刻——一次比排程早兩小時的手動跑批，讓**半天的資料原子覆寫了整天**，`stg_orders` 與 `stg_quality_events` 的 `2026-08-26` 分區各從 **800 列被砍成 250 列**。DAG 綠、dbt test 綠、上游 staging 完好無損。三支模型（另含 `rpt_quality_events_daily`）全部對齊日界，各補定點回填 var，並加上兩支逐分區對帳測試。**修復分兩階段**：第一階段只涵蓋 `stg_orders` 便宣告結案，當晚才由 BI 落差發現另外兩支——範圍是照「哪張表壞了」劃的，而缺陷是「寫法」層級的。→ [ADR-0055](./docs/zh-TW/adr/0055-partition-aligned-incremental-window.md) · [事故](./docs/zh-TW/incidents/2026-08-30-stg-partition-truncation.md)
 
+- **端點從 `async def` 改為 `def`：同步 DB 呼叫不再佔住 event loop。** 三個端點（`/orders`、`/process_raw`、`/raw`）的 handler 內是阻塞的 psycopg2 呼叫，而連線持有窗口內沒有任何 `await`——`statement_timeout` 是 30 秒，所以**單一個卡住的查詢會凍結整個 uvicorn 行程 30 秒**，不只那一筆請求。實測：負載中一個**完全不碰資料庫**的 `/health`，p99 **167ms → 34ms**；吞吐 +42%，且 worker 數不再於 8 反轉（207 → 485 RPS）。**修的是故障放大，效能是副作用。** → [實測](./docs/zh-TW/verification/2026-09-02-sync-handlers-before-after.md)
+
 ### 決定不做
 
 - **Tier 1 的業務／DQ 指標**——模擬上游的髒資料率在一天內恆定，所以分鐘級錯誤率說不出倉庫沒說過的事。→ [PORTFOLIO_SCOPE](./docs/zh-TW/PORTFOLIO_SCOPE.md)

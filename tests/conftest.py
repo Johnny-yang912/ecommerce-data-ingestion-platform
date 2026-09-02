@@ -38,6 +38,19 @@ def mock_request() -> MagicMock:
     return r
 
 
+@pytest.fixture
+def raw_body() -> str:
+    """create_order 的 `raw_body` 參數。
+
+    正常路徑上這個值由 `get_raw_body` 依賴注入。直接呼叫 handler 的單元測試
+    【繞過 FastAPI 的依賴解析】，所以必須自己傳——沒傳的話拿到的會是 `Depends(...)`
+    物件本身，然後在第一個字串操作上炸掉。
+
+    內容刻意與 `mock_request.body()` 一致，兩者語意可互換。
+    """
+    return '{"order_id": "TEST-001"}'
+
+
 @pytest.fixture(autouse=True)
 def reset_enqueue_breaker():
     """

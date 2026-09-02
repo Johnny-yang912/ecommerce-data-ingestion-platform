@@ -23,16 +23,16 @@ SAMPLE_ORDER = make_sample_order(order_id="TEST-503-001")
 
 class TestPoolExhaustion:
 
-    async def test_pool_exhausted_returns_503_without_retry(self, mock_request):
+    async def test_pool_exhausted_returns_503_without_retry(self, mock_request, raw_body):
         """SATimeoutError → 503 Service Unavailable，commit 只被呼叫 1 次（不走 retry loop）。"""
         mock_db = MagicMock()
         mock_db.commit.side_effect = SATimeoutError("pool timeout")
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"), \
-             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch("main.time.sleep"), \
              pytest.raises(HTTPException) as exc_info:
-            await create_order(mock_request, SAMPLE_ORDER, client_id="test-client")
+            create_order(mock_request, SAMPLE_ORDER, raw_body=raw_body, client_id="test-client")
 
         assert exc_info.value.status_code == 503
         # pool 耗盡不應 retry
@@ -52,7 +52,7 @@ class TestProcessRawEndpoint:
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            result = await process_raw(mock_request, raw_id=42, force=False)
+            result = process_raw(mock_request, raw_id=42, force=False)
 
         # 只有 1 次 SELECT，0 次 commit
         assert mock_db.execute.call_count == 1
@@ -73,7 +73,7 @@ class TestProcessRawEndpoint:
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            result = await process_raw(mock_request, raw_id=99, force=True)
+            result = process_raw(mock_request, raw_id=99, force=True)
 
         # SELECT + UPDATE = 2 次 execute，1 次 commit
         assert mock_db.execute.call_count == 2
@@ -93,7 +93,7 @@ class TestProcessRawEndpoint:
         with patch("process.process_raw_event") as mock_fn, \
              patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            await process_raw(mock_request, raw_id=1, force=False)
+            process_raw(mock_request, raw_id=1, force=False)
 
         mock_fn.assert_not_called()
         mock_enqueue.assert_called_once_with(1)
@@ -106,7 +106,7 @@ class TestProcessRawEndpoint:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"), \
              pytest.raises(HTTPException) as exc_info:
-            await process_raw(mock_request, raw_id=99999, force=False)
+            process_raw(mock_request, raw_id=99999, force=False)
 
         assert exc_info.value.status_code == 404
         mock_enqueue.assert_not_called()
@@ -127,7 +127,7 @@ class TestProcessRawEndpoint:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"), \
              pytest.raises(HTTPException) as exc_info:
-            await process_raw(mock_request, raw_id=1, force=True)
+            process_raw(mock_request, raw_id=1, force=True)
 
         assert exc_info.value.status_code == 400
         mock_enqueue.assert_not_called()
@@ -152,7 +152,7 @@ class TestGetRawEndpoint:
 
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"):
-            result = await get_raw(mock_request, raw_id=1)
+            result = get_raw(mock_request, raw_id=1)
 
         assert result is mock_raw
         assert mock_db.close.call_count == 1
@@ -165,7 +165,7 @@ class TestGetRawEndpoint:
         with patch("main.SessionLocal", return_value=mock_db), \
              patch("main._key_func", return_value="test-ip"), \
              pytest.raises(HTTPException) as exc_info:
-            await get_raw(mock_request, raw_id=99999)
+            get_raw(mock_request, raw_id=99999)
 
         assert exc_info.value.status_code == 404
         assert mock_db.close.call_count == 1

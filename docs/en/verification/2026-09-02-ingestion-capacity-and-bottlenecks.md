@@ -223,13 +223,24 @@ Of 8.05 ms per request, the database (INSERT + refresh SELECT + connection check
 
 The intuitively suspicious nested pydantic validation is 1.1%. **Optimising "the database" or "serialisation" would have missed entirely.**
 
-### 2. The connection pool is not a tunable
+### 2. The connection pool is not a tunable　⚠️ OVERTURNED
+
+> **⚠️ This section was overturned later the same day by [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md).**
+> The original text is kept below because it records what was measured at that moment; but
+> **the actionable recommendation must not be followed** — once the three endpoints became `def`,
+> the 32-connection budget peaks at 29–34 under load (essentially full), and cutting it to 8
+> would cause `pool_timeout` expiries and 503s.
 
 Synchronous DB calls inside an `async def` mean each process holds at most one connection; from pool 1 to pool 100 there is no observable effect on throughput or on actual connection count (peak stays 10–12).
 
 Actionable: **the API's connection budget can be cut from 32 (`4 × (3+5)`) to 8.** `max_connections` is only 100, and the reclaimed headroom is what Airflow and human connections compete for.
 
-### 3. uvicorn worker count is the only effective knob
+### 3. uvicorn worker count is the only effective knob　⚠️ OVERTURNED
+
+> **⚠️ This section was overturned later the same day by [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md).**
+> The original text is kept below. After the endpoints became `def` the curve no longer
+> inverts at 8 (207 → 485 RPS), so `UVICORN_WORKERS=4` went from "the peak of the curve"
+> to "a conservative choice".
 
 1→4 is close to linear (130.8 → 298.1 RPS); 8 regresses. The current `UVICORN_WORKERS=4` sits at the peak. This follows directly from point 2: if each process can only have one DB operation in flight, more throughput means more processes.
 
@@ -325,6 +336,8 @@ Three axes can be reasoned about separately:
 
 ## What this overturned
 
+⚠️ **First, about this document itself**: conclusions 2 and 3 were overturned later the same day by [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — that record measures the system after the `async def` + blocking-DB defect identified here was fixed. Conclusions 1, 4, 5 and 6 still hold.
+
 **[2026-08-03](./2026-08-03-load-test-ingestion.md) Test 2 is overturned.** That record documented 5 HTTP 500s at C=500, attributed to pool exhaustion; re-run here with identical parameters, all 1000 requests succeeded with a peak of 12 connections.
 
 **What overturned it is not measurement error but an architectural refactor.** At the time, `POST /orders` used FastAPI `BackgroundTasks`, and `process_raw_event` was synchronous — Starlette dispatches such functions into an anyio threadpool of 40 by default. That meant up to 40 full "Raw→ODS clean and write" operations running concurrently, **all sharing the API's 15-connection pool**; `db.close()` was in `finally`, so the transaction opened by `refresh` stayed held throughout.
@@ -335,6 +348,7 @@ After `8485f64` (2026-08-10, dispatch moved to Celery), the API process does one
 
 ## Related
 
+- [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — overturns conclusions 2 and 3 of this document
 - [2026-08-03-load-test-ingestion](./2026-08-03-load-test-ingestion.md) — this document overturns its Test 2
 - [design/queue](../design/queue.md) — how CAS claim and redelivery interact
 - [ADR-0004](../adr/0004-cas-claim-rowcount.md) · [ADR-0005](../adr/0005-first-write-wins-idempotency.md)

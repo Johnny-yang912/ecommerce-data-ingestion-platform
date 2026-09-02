@@ -27,13 +27,14 @@ These are not unit tests. A unit test asks *"is this code correct?"*; a verifica
 | 2026-08-12 | [Proposal B v2→v3→v4](./2026-08-12-proposal-b-v2-to-v4.md) | 16 + 15 promoted, all idempotent | — |
 | 2026-09-02 | [Ingestion capacity and bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) | DB is **0.79ms** of 8.05ms; worker drains **270/s** | ⭐ **yes** |
 | 2026-09-02 | [Sync handlers, before and after](./2026-09-02-sync-handlers-before-after.md) | `/health`, which touches no DB, p99 **167ms → 34ms** | ⭐ **yes** |
+| 2026-09-02 | [Worker scale-out](./2026-09-02-worker-scale-out.md) | children 4→16, drain **304→789/s** (2.60×); CAS contention **15,000/15,000** | ⭐ **yes** |
 | — | [`raw_id` collides across ODS instances](./2026-08-raw-id-collision-two-ods.md) | two unrelated orders deduped into one | — |
 
 ---
 
 ## The "overturned something" column
 
-Eight records changed a conclusion that had already been written down. That column exists because **a verification that can only confirm is not worth much** — the value is in the ones that came back with a different answer:
+Nine records changed a conclusion that had already been written down. That column exists because **a verification that can only confirm is not worth much** — the value is in the ones that came back with a different answer:
 
 | Overturned | Was | Is |
 |---|---|---|
@@ -45,6 +46,7 @@ Eight records changed a conclusion that had already been written down. That colu
 | `--expect-rule-version` | assumed to catch version divergence | only compares within its own process |
 | Ingestion load test (concurrency 500) | "pool exhaustion caused 5 HTTP 500s" | does not reproduce after the refactor; the pool was never exhausted |
 | Pool and worker curves | "pool 1→100 makes no difference, budget can be cut to 8; 8 workers regresses" | after `def` endpoints: pool 1→2 is an 18% gap, the budget is essentially full, the curve no longer inverts |
+| CAS and horizontal scaling | "CAS lets workers scale horizontally with no coordination", and peak backlog 36,526 | on the normal path contention never happens (credit to point-to-point dispatch); when it does, CAS blocks it deterministically; the backlog figure is the 4-child value |
 
 ---
 

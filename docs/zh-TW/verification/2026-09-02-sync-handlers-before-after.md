@@ -262,10 +262,15 @@ worker 變慢的原因不是它自己改了什麼——`process.py` 一個字都
 需要跟著更新的三件事：
 
 1. **`raw_pending_watch` 的判讀基準。** 它量的是「最舊那筆躺多久」而非筆數，所以不會誤報；但**之後看到的積壓數字會比舊文件裡那個 5,453 大一個數量級**，別把 36,526 當成異常。
+   ⭐ **後續補充**：36,526 是 **1 容器 × concurrency 4** 下的值。[worker-scale-out](./2026-09-02-worker-scale-out.md) 以同一份負載實測，8 子行程下的積壓峰值是 7,902、注入結束後 0 秒——**這個數字必須連同 worker 組態一起引用。**
 2. **這強化而非推翻了 [ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) 的結論四**（天花板在 worker 不在 API）——落差擴大了，結論更成立。但**該文結論四與六裡的 313 / 270 這兩個數字已被本文取代**。
+   ⭐ **後續補充**：[worker-scale-out](./2026-09-02-worker-scale-out.md) 為那個天花板補上了倍率——4× 子行程換到 2.60×（每次加倍 1.69×、1.53×），次線性但曲線在 16 子行程仍未平，瓶頸在單機 CPU 而非資料庫併發。**天花板在 worker，而那個天花板是可以買的。**
 3. **這個惡化是單機共用 CPU 的產物。** worker 若獨立部署或水平擴展，這個互搶就不存在——而 `try_claim_raw` 的 CAS 保證 worker 可以無協調地水平擴展。
+   ⭐ **後續補充（本點寫下時是設計論證，現已實測）**：[worker-scale-out](./2026-09-02-worker-scale-out.md) 驗證了三件事——(a) 互搶確實只是同機產物：零 API 負載下 4／8／16 子行程消化 304／515／789 筆/秒；(b)「API 搶走 worker 的 CPU」由相關性升級為操作同一變因：worker 加倍會讓 API 收單掉約 30%；(c) **水平擴展安全這件事成立，但歸屬要修正**——正常路徑上爭用根本不會發生（功勞在每筆一則指名 `raw_id` 的點對點派工），CAS 是爭用真的發生時的確定性保證（測試 F：15,000／15,000）。
 
 **更新後的可陳述容量描述（必須連同環境一起引用）：**
+
+（⚠️ 以下 186／299／36,526／119 秒皆為 **1 容器 × concurrency 4** 下的值；多 worker 組態的數字見 [worker-scale-out](./2026-09-02-worker-scale-out.md)。）
 
 > 於單機開發環境（16 核，DB / Redis / worker / 壓測客戶端同機，限流關閉）實測：攝入 API 收單約每秒 488 筆；Celery worker 的消化速率取決於 API 的負載——突發進行中約每秒 186 筆，API 閒置時約每秒 299 筆。超過消化能力時超額由佇列吸收，60,000 筆突發下積壓峰值 36,526、零錯誤，負載停止後 119 秒完全消化，全數落地 ODS。
 
@@ -278,6 +283,8 @@ worker 變慢的原因不是它自己改了什麼——`process.py` 一個字都
 - **限流全程關閉。** 線上是 `60/minute`。
 
 ## 這推翻了什麼
+
+⚠️ **先說本文自己**：本文沒有任何結論被推翻，但結論八有兩處被稍晚的 [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) 補上——積壓數字補上了 worker 組態這個缺失的前提，CAS 水平擴展的主張補上了量測與一處歸屬修正（主張成立，但正常路徑的功勞在點對點派工）。**那是補上而非推翻。**
 
 ⭐ **推翻同一天稍早的 [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) 的結論二與三。**
 
@@ -293,5 +300,6 @@ worker 變慢的原因不是它自己改了什麼——`process.py` 一個字都
 ## 相關
 
 - [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — 本文推翻其結論二與三
+- [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) — 補上本文結論八缺的 worker 組態前提，並把其 CAS 水平擴展主張由設計論證變成實測
 - [2026-08-03-load-test-ingestion](./2026-08-03-load-test-ingestion.md) — 其測試 2 的成因（`BackgroundTasks` 把同步處理丟進 40 條 threadpool）與本文是同一個機制的鏡像：那次是**執行緒太多、連線池太小**，這次是**執行緒太少、連線池用不到**
 - [design/queue](../design/queue.md) · [ADR-0004](../adr/0004-cas-claim-rowcount.md)

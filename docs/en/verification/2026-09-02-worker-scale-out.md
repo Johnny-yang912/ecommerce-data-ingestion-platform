@@ -211,21 +211,30 @@ C8 (1 container × concurrency 8) and W2 (2 containers × 4) land in the same no
 - **No fault injection.** Recovery when one of several workers is SIGKILLed mid-flight is untested — [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md) only ever ran a single worker.
 - **Rate limiting was off throughout.** Production is `60/minute`.
 
-## What this overturns
+## What this fills in
 
-⭐ **Replaces the backlog figures in conclusion 8 of [sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md), and corrects the attribution in one of its sentences.**
+⭐ **This record overturns nothing.** It closes three kinds of gap, each corresponding to a different way an earlier claim was not yet solid:
 
-| Replaced / corrected | Was | Is |
-|---|---|---|
-| Conclusion 8's backlog figures | "peak backlog 36,526, fully drained 119 s after injection" | **Those are the 4-child values.** With 8 children they are **7,902 and 0 s** — a backlog figure is meaningless without the worker configuration attached |
-| Conclusion 8.3 | "the CAS in `try_claim_raw` lets workers scale horizontally with no coordination" (design argument) | Two separate facts: **on the normal path contention never happens** (credit to point-to-point dispatch); **when it does happen, CAS blocks it deterministically** (test F, 15,000/15,000) |
-| Conclusion 4 of [ingestion-capacity](./2026-09-02-ingestion-capacity-and-bottlenecks.md) | "the ceiling is the worker, not the API" (an observation) | Still true, and **the ratio is now known**: 4× children → 2.60×, sub-linear, bounded by single-host CPU |
+- **Design argument → measurement**: the claim was written in an ADR, but no measurement had ever run more than one worker.
+- **Correlation → manipulating the same variable**: what was an observation ("the rate recovers the moment injection stops") is now a reverse manipulation of the worker count, with a symmetric result.
+- **An unqualified number → its missing premise**: the figure was not wrong; what was wrong was quoting it without the worker configuration.
+
+Exactly one item counts as a correction, and it corrects **the reason, not the conclusion**: horizontal scaling is still safe, but the credit belongs elsewhere.
+
+| Subject | What it was | What this record adds | Does the claim still hold |
+|---|---|---|---|
+| [sync-handlers](./2026-09-02-sync-handlers-before-after.md) conclusion 8.3<br>"the CAS in `try_claim_raw` lets workers scale horizontally with no coordination" | A design argument ([ADR-0004](../adr/0004-cas-claim-rowcount.md)); **no measurement had ever run more than one worker** | Tests A–E: up to 4 containers × 16 children, 660,000 records, zero duplicates and zero loss. Test F: 4× duplicate dispatch injected on purpose — 15,000 claim failures, 5,000 processed | ✅ Holds. ⭐ **But the reason changes**: on the normal path CAS almost certainly never fired; the credit belongs to point-to-point dispatch. CAS is the deterministic guarantee **for when contention actually happens** |
+| Same record, conclusion 8's backlog figures<br>"peak backlog 36,526, fully drained 119 s after injection" | Correctly measured, but **with no worker configuration attached** | Those are the 1 container × 4 children values; with 8 children they are **7,902 and 0 s** | ✅ The original figures are unchanged. What is added is the citation condition: **a backlog figure must be quoted together with the worker configuration** |
+| Same record, conclusion 8<br>"the worker slows during a burst because the API steals CPU" | **Inferred from a correlation** — the rate recovers the moment injection stops | The same variable manipulated in reverse: going from 4 to 8 children drops API intake from 499 to 366 (~ −30%) | ✅ Holds, and is upgraded from an observation to a manipulation of the same variable |
+| Same record, conclusion 8.3<br>"deploy or scale the worker separately and the contention disappears" | An inference | Test C measured 304 / 515 / 789 records/s under zero API load, confirming the contention is an artefact of sharing one machine | ✅ Holds |
+| [ingestion-capacity](./2026-09-02-ingestion-capacity-and-bottlenecks.md) conclusion 4<br>"the ceiling is the worker, not the API" | An observation, with **no measurement of whether that ceiling can be bought up** | The ratio: 4× children → 2.60×, sub-linear but still climbing at 16; bounded by single-host CPU rather than database concurrency | ✅ Holds, and **the ceiling is purchasable** |
+| Same record, conclusion 8's extrapolation table<br>"Worker horizontal scaling / Yes / basis: CAS" | That table **states outright that none of it was verified** | The first of its three axes to be measured | ✅ Holds (sub-linearly). ⭐ **The basis column changes**: the mechanism is point-to-point dispatch, with CAS as the backstop under contention |
 
 ⚠️ **How `raw_pending_watch` should be read depends on the worker configuration.** It measures how long the oldest record has been waiting, not how many are waiting, so it will not misfire; but the *order of magnitude* of the backlog differs by 4.6× between 4 and 8 children.
 
 ## Related
 
-- [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — this record replaces its conclusion 8 backlog figures and corrects its CAS attribution
-- [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — this record supplies the ratio its conclusion 4 lacked
+- [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — this record supplies the worker configuration its conclusion 8 backlog figures were missing, and turns its CAS scaling claim from a design argument into a measurement (with one attribution corrected)
+- [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — this record supplies the ratio its conclusion 4 lacked, and measures the worker axis of its conclusion 8 extrapolation table
 - [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md) — single-worker recovery; the multi-worker version is still unverified
 - [design/queue](../design/queue.md) · [ADR-0004](../adr/0004-cas-claim-rowcount.md)

@@ -251,6 +251,8 @@ t=280s  積壓     1   已處理 58,138
 
 ⚠️ 但「線性成長」同時意味著**持續超載時積壓不會自行收斂**。這正是 `raw_pending_watch` 存在的理由：它量的是「已落到 Raw 但沒有任何 worker 取走」的筆數，而本次測試給了那道門檻一個實測的參照基準——健康時積壓穩定在個位數，超載時以每秒數十筆線性爬升。
 
+⭐ **後續補充（同日稍晚，非推翻）**：本節的 313 / 270 兩個數字已被 [sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) 取代，但「天花板在 worker」這個結論本身成立，而 [worker-scale-out](./2026-09-02-worker-scale-out.md) 補上了本節缺的那一半——**那個天花板能不能買**。零 API 負載下 4／8／16 個 worker 子行程的消化速率為 304／515／789 筆/秒（次線性，每次加倍 1.69×、1.53×，曲線在 16 仍未平），瓶頸為單機 CPU 超額訂閱而非資料庫併發。**天花板在 worker，而那個天花板是可以用子行程買的。** 同時，本節的積壓數字（5,453、55 秒）與該文的一樣，只在 worker 組態被一起引用時才有意義。
+
 ### 五、Python 是成本，不是天花板
 
 八成的時間花在 Python 層（框架 + ORM）。換成編譯語言可省下的是這 7.26 ms 的大部分——**但 0.79 ms 的資料庫時間省不掉，那是 PostgreSQL 在做事**。粗略地說，使用 Python + SQLAlchemy 的代價是數倍的 CPU。
@@ -307,7 +309,7 @@ t=280s  積壓     1   已處理 58,138
 |---|---|---|
 | **移走壓測客戶端** | — | 不是擴展，是消除量測污染。方向確定向上，幅度未知 |
 | **API 水平擴展** | 可 | API 行程無狀態（恢復掃描已移至 Beat）。測試 3 在 1→4 觀測到接近線性；8 反轉是**核心數不足**而非架構限制，換更多核心後該反轉點會右移 |
-| **Worker 水平擴展** | 可 | `try_claim_raw` 的 CAS（`rowcount == 1`）保證同一 `raw_id` 只會被一個 worker 取走，加開 worker 容器不需任何協調 |
+| **Worker 水平擴展** | ⭐ **可——已實測（次線性）** | ⚠️ **本欄原寫「`try_claim_raw` 的 CAS（`rowcount == 1`）保證同一 `raw_id` 只會被一個 worker 取走」，該歸屬已修正。** [worker-scale-out](./2026-09-02-worker-scale-out.md) 實測 4→16 子行程得 2.60×：真正讓加開 worker 不需協調的是**每筆一則指名 `raw_id` 的點對點派工**，CAS 是重複派工發生時的兜底（測試 F：15,000／15,000）。**本表三軸中唯一已被實測的一軸** |
 
 **下一個瓶頸幾乎確定會轉移到 PostgreSQL。** 每筆訂單在資料庫上是約四次寫入：
 
@@ -317,6 +319,8 @@ t=280s  積壓     1   已處理 58,138
 4. `UPDATE raw SET status='processed'`（worker）
 
 270 筆/秒 ≈ 每秒約 1,080 次寫入。單一 PostgreSQL primary 在專用硬體（NVMe、足夠 shared_buffers）上處理簡單寫入的常見量級是每秒數千至上萬次——**換算成訂單，量級落在每秒數百到一兩千筆**。
+
+⭐ **一個實測參照點（仍不足以驗證上段推估）**：[worker-scale-out](./2026-09-02-worker-scale-out.md) 在 16 個 worker 子行程下量到 789 筆/秒 ≈ 每秒約 3,156 次寫入，而 PostgreSQL 未顯示任何**併發**瓶頸的跡象（連線數與子行程數精確線性、零鎖等待、零寫入衝突、66 萬筆零錯誤）——當時的限制是單機 CPU。**也就是說本段推估的區間在 789 筆/秒這一點上尚未被觸及**；但那仍是同一台機器、同一份約 1.7 萬筆的基底資料，不能當成上段推估被驗證。
 
 ⚠️ **這個區間有多不可靠，必須講清楚：**
 
@@ -336,6 +340,8 @@ t=280s  積壓     1   已處理 58,138
 ⚠️ **先說本文自己**：結論二與三已於同日被 [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) 推翻——
 那份記錄的是「把本文指出的 `async def` + 阻塞 DB 這個缺陷修掉之後」的量測。結論一、四、五、六仍然成立。
 
+**另外兩處是被補上而非被推翻**：結論四的「天花板在 worker」與結論八推估表的 worker 軸，已由 [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) 補上實測——前者補上倍率（4× 子行程 → 2.60×），後者是該表三軸中第一個離開「未經驗證」狀態的一軸（並修正了其依據欄的歸屬）。
+
 **[2026-08-03](./2026-08-03-load-test-ingestion.md) 的測試 2 已被推翻。** 該次記錄 C=500 時有 5 筆 HTTP 500，歸因於連線池耗盡；本次以相同參數複跑，1000 筆全過、連線池峰值 12。
 
 **推翻它的不是量測誤差，是一次架構重構。** 當時 `POST /orders` 使用 FastAPI `BackgroundTasks`，而 `process_raw_event` 是同步函式——Starlette 會將其投入預設 40 條的 anyio threadpool。也就是最多 40 個「完整的 Raw→ODS 清洗與寫入」同時執行，**且共用 API 那個僅 15 條的連線池**；`db.close()` 亦在 `finally`，`refresh` 開啟的交易全程掛著。
@@ -347,6 +353,7 @@ t=280s  積壓     1   已處理 58,138
 ## 相關
 
 - [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — 推翻本文結論二與三
+- [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) — 為本文結論四補上倍率，並實測結論八推估表的 worker 軸
 - [2026-08-03-load-test-ingestion](./2026-08-03-load-test-ingestion.md) — 本文推翻其測試 2
 - [design/queue](../design/queue.md) — CAS claim 與重新投遞的交互作用
 - [ADR-0004](../adr/0004-cas-claim-rowcount.md) · [ADR-0005](../adr/0005-first-write-wins-idempotency.md)

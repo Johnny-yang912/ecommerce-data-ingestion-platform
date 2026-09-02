@@ -254,6 +254,8 @@ Test 5 observed the overload behaviour directly: with 313 in against 270 out, th
 
 ⚠️ But "grows linearly" also means **a sustained overload will not converge on its own.** That is exactly why `raw_pending_watch` exists: it measures rows that landed in Raw but were never picked up by any worker, and this test gives that threshold an empirical reference — single digits when healthy, climbing linearly by tens per second under overload.
 
+⭐ **Later addition (same day; filled in, not overturned)**: the 313 / 270 figures above are superseded by [sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md), but "the ceiling is the worker" still holds — and [worker-scale-out](./2026-09-02-worker-scale-out.md) supplies the half this section was missing: **whether that ceiling can be bought up.** Under zero API load, 4 / 8 / 16 worker children drain at 304 / 515 / 789 records/s (sub-linear — 1.69× then 1.53× per doubling — and still climbing at 16), bounded by single-host CPU oversubscription rather than database concurrency. **The ceiling is the worker, and that ceiling is purchasable with children.** Equally, the backlog figures here (5,453, 55 s) mean something only when quoted together with the worker configuration that produced them.
+
 ### 5. Python is a cost, not a ceiling
 
 Eighty percent of the time is spent in Python (framework + ORM). A compiled language would reclaim most of that 7.26 ms — **but not the 0.79 ms of database time, which is PostgreSQL doing work.** Roughly speaking, Python + SQLAlchemy costs several times the CPU.
@@ -310,7 +312,7 @@ Three axes can be reasoned about separately:
 |---|---|---|
 | **Moving the load generator off-box** | — | Not scaling, but removing measurement contamination. Direction is certainly up; magnitude unknown |
 | **API horizontal scaling** | Yes | API processes are stateless (recovery scanning moved to Beat). Test 3 observed near-linear scaling from 1→4; the regression at 8 is **insufficient cores**, not an architectural limit, and that inflection moves right with more cores |
-| **Worker horizontal scaling** | Yes | `try_claim_raw`'s CAS (`rowcount == 1`) guarantees a given `raw_id` is claimed by exactly one worker, so adding worker containers requires no coordination |
+| **Worker horizontal scaling** | ⭐ **Yes — now measured (sub-linear)** | ⚠️ **This cell originally read "`try_claim_raw`'s CAS (`rowcount == 1`) guarantees a given `raw_id` is claimed by exactly one worker"; that attribution has been corrected.** [worker-scale-out](./2026-09-02-worker-scale-out.md) measured 4→16 children at 2.60×. What actually makes added workers coordination-free is **point-to-point dispatch — one message naming one `raw_id`** — with CAS as the backstop when duplicate dispatch does occur (test F: 15,000/15,000). **The only one of these three axes that has now been measured** |
 
 **The next bottleneck will almost certainly move to PostgreSQL.** Each order is roughly four writes:
 
@@ -320,6 +322,8 @@ Three axes can be reasoned about separately:
 4. `UPDATE raw SET status='processed'` (worker)
 
 270 orders/s ≈ 1,080 writes/s. A single PostgreSQL primary on dedicated hardware (NVMe, adequate shared_buffers) typically handles simple writes in the thousands-to-tens-of-thousands per second range — **which translates to somewhere in the hundreds to low thousands of orders per second.**
+
+⭐ **One measured reference point (still not enough to verify the extrapolation above)**: [worker-scale-out](./2026-09-02-worker-scale-out.md) measured 789 records/s with 16 worker children ≈ 3,156 writes/s, with PostgreSQL showing no sign of a **concurrency** bottleneck (connections scaling exactly with children, zero lock waits, zero write conflicts, zero errors across 660,000 records) — the binding constraint there was single-host CPU. **So the range extrapolated above is still untouched at 789 orders/s.** But that was the same machine and the same ~17,000-row baseline, so it does not verify the extrapolation.
 
 ⚠️ **How unreliable that range is, stated explicitly:**
 
@@ -338,6 +342,8 @@ Three axes can be reasoned about separately:
 
 ⚠️ **First, about this document itself**: conclusions 2 and 3 were overturned later the same day by [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — that record measures the system after the `async def` + blocking-DB defect identified here was fixed. Conclusions 1, 4, 5 and 6 still hold.
 
+**Two further parts were filled in rather than overturned**: conclusion 4's "the ceiling is the worker" and the worker axis of conclusion 8's extrapolation table were both measured by [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) — the former gained a ratio (4× children → 2.60×), and the latter became the first of that table's three axes to leave the "unverified" column (with its basis attribution corrected).
+
 **[2026-08-03](./2026-08-03-load-test-ingestion.md) Test 2 is overturned.** That record documented 5 HTTP 500s at C=500, attributed to pool exhaustion; re-run here with identical parameters, all 1000 requests succeeded with a peak of 12 connections.
 
 **What overturned it is not measurement error but an architectural refactor.** At the time, `POST /orders` used FastAPI `BackgroundTasks`, and `process_raw_event` was synchronous — Starlette dispatches such functions into an anyio threadpool of 40 by default. That meant up to 40 full "Raw→ODS clean and write" operations running concurrently, **all sharing the API's 15-connection pool**; `db.close()` was in `finally`, so the transaction opened by `refresh` stayed held throughout.
@@ -349,6 +355,7 @@ After `8485f64` (2026-08-10, dispatch moved to Celery), the API process does one
 ## Related
 
 - [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — overturns conclusions 2 and 3 of this document
+- [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) — supplies the ratio missing from conclusion 4, and measures the worker axis of conclusion 8's extrapolation table
 - [2026-08-03-load-test-ingestion](./2026-08-03-load-test-ingestion.md) — this document overturns its Test 2
 - [design/queue](../design/queue.md) — how CAS claim and redelivery interact
 - [ADR-0004](../adr/0004-cas-claim-rowcount.md) · [ADR-0005](../adr/0005-first-write-wins-idempotency.md)

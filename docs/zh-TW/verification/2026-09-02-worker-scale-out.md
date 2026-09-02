@@ -211,21 +211,30 @@ C8（1 容器 × concurrency 8）與 W2（2 容器 × 4）落在同一個噪音�
 - **沒有做故障注入。** 雙 worker 下「一個 worker 中途被 SIGKILL」的恢復行為未測——[2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md) 只跑過單 worker。
 - **限流全程關閉。** 線上是 `60/minute`。
 
-## 這推翻了什麼
+## 這補上了什麼
 
-⭐ **取代 [sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) 結論八的積壓數字，並修正其結論一句話的歸屬。**
+⭐ **本文沒有推翻任何既有結論。** 它補的是三種缺口，每一種對應一種不同的「原本不夠硬」：
 
-| 被取代 / 修正 | 原本 | 現在 |
-|---|---|---|
-| 結論八的積壓數字 | 「積壓峰值 36,526、注入後 119 秒消化完」 | **那是 4 子行程的值。** 8 子行程下是 **7,902 與 0 秒**——積壓數字必須連同 worker 組態一起引用 |
-| 結論八第 3 點 | 「`try_claim_raw` 的 CAS 保證 worker 可無協調水平擴展」（設計論證） | 兩件事：**正常路徑上爭用根本不發生**（功勞在點對點派工）；**爭用真的發生時 CAS 確定性擋下**（測試 F，15,000/15,000） |
-| [ingestion-capacity](./2026-09-02-ingestion-capacity-and-bottlenecks.md) 結論四 | 「天花板在 worker 不在 API」（觀察） | 成立，且**倍率已知**：4× 子行程 → 2.60×，次線性，瓶頸在單機 CPU |
+- **設計論證 → 實測**：主張寫在 ADR 裡，但從來沒有跑過一個以上的 worker。
+- **相關性 → 操作同一變因**：原本是「注入一停就回升」的觀察，本文反向操作 worker 數，得到對稱的結果。
+- **未限定的數字 → 補上前提**：原數字沒有錯，錯的是引用時沒有帶 worker 組態。
+
+唯一稱得上「修正」的只有一處，而且修的是**理由不是結論**：水平擴展安全這件事成立，但功勞歸屬要換人。
+
+| 對象 | 原本的性質 | 本文補上什麼 | 該主張是否仍成立 |
+|---|---|---|---|
+| [sync-handlers](./2026-09-02-sync-handlers-before-after.md) 結論八第 3 點<br>「`try_claim_raw` 的 CAS 保證 worker 可無協調水平擴展」 | 設計論證（[ADR-0004](../adr/0004-cas-claim-rowcount.md)），**此前從未跑過一個以上的 worker** | 測試 A–E：最多 4 容器 × 16 子行程、66 萬筆零重複零遺失；測試 F：刻意注入 4 倍重複派工，claim 失敗 15,000／處理完成 5,000 | ✅ 成立。⭐ **但理由要換**：正常路徑上 CAS 極可能一次都沒被觸發，功勞在點對點派工；CAS 是**爭用真的發生時**的確定性保證 |
+| 同上，結論八的積壓數字<br>「峰值 36,526、注入後 119 秒消化完」 | 量測正確，但**沒有標註 worker 組態** | 那是 1 容器 × 4 子行程的值；8 子行程下是 **7,902 與 0 秒** | ✅ 原值不變。補的是引用條件：**積壓數字必須連同 worker 組態一起引用** |
+| 同上，結論八<br>「worker 在突發期間變慢，是 API 搶走 CPU」 | **相關性推論**——證據是注入一停就回升 | 反向操作同一變因：worker 由 4 加到 8 子行程，API 收單由 499 降到 366（約 −30%） | ✅ 成立，且由觀察升級為對同一變因的操作 |
+| 同上，結論八第 3 點<br>「worker 若獨立部署或水平擴展，這個互搶就不存在」 | 推論 | 測試 C 在零 API 負載下量到 304／515／789 筆/秒，確認互搶是同機共用 CPU 的產物 | ✅ 成立 |
+| [ingestion-capacity](./2026-09-02-ingestion-capacity-and-bottlenecks.md) 結論四<br>「天花板在 worker 不在 API」 | 觀察，**沒有量過那個天花板能不能買** | 倍率已知：4× 子行程 → 2.60×，次線性但曲線在 16 仍未平；瓶頸為單機 CPU 而非資料庫併發 | ✅ 成立，且**天花板是可以買的** |
+| 同上，結論八推估表<br>「Worker 水平擴展｜可｜依據：CAS」 | 該表**自己標明全部未經驗證** | 三軸中第一個被實測的一軸 | ✅ 成立（次線性）。⭐ **依據欄要改**：主要機制是點對點派工，CAS 是爭用兜底 |
 
 ⚠️ **`raw_pending_watch` 的判讀基準隨 worker 組態而變。** 它量的是「最舊那筆躺多久」而非筆數，所以不會誤報；但積壓的**數量級**在 4 與 8 子行程之間差了 4.6 倍。
 
 ## 相關
 
-- [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — 本文取代其結論八的積壓數字、修正其 CAS 主張的歸屬
-- [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — 本文為其結論四補上倍率
+- [2026-09-02-sync-handlers-before-after](./2026-09-02-sync-handlers-before-after.md) — 本文為其結論八的積壓數字補上 worker 組態這個缺失的前提，並把其 CAS 水平擴展主張由設計論證變成實測（含一處歸屬修正）
+- [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — 本文為其結論四補上倍率，並實測其結論八推估表三軸中的 worker 軸
 - [2026-08-10-celery-sigkill-recovery](./2026-08-10-celery-sigkill-recovery.md) — 單 worker 的恢復行為；多 worker 版本尚未驗證
 - [design/queue](../design/queue.md) · [ADR-0004](../adr/0004-cas-claim-rowcount.md)

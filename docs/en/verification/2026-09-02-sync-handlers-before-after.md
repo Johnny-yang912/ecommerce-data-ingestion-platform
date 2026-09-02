@@ -262,10 +262,15 @@ The worker did not change — `process.py` was not touched. **The API simply tak
 Three things that follow:
 
 1. **How to read `raw_pending_watch`.** It measures how long the oldest row has waited, not how many rows there are, so it will not false-positive; but **the backlog figures you see will be an order of magnitude larger than the 5,453 in the earlier record** — do not read 36,526 as an anomaly.
+   ⭐ **Later addition**: 36,526 is the **1 container × concurrency 4** value. [worker-scale-out](./2026-09-02-worker-scale-out.md) ran the same load with 8 children and measured a peak backlog of 7,902, fully drained 0 seconds after injection — **this figure must be quoted together with the worker configuration.**
 2. **This strengthens rather than overturns [ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) conclusion 4** (the ceiling is the worker, not the API) — the gap widened, so the conclusion holds more strongly. But **the 313 / 270 figures in its conclusions 4 and 6 are superseded by this document.**
+   ⭐ **Later addition**: [worker-scale-out](./2026-09-02-worker-scale-out.md) supplies the ratio that ceiling was missing — 4× the children buys 2.60× (1.69× then 1.53× per doubling), sub-linear but still climbing at 16 children, bounded by single-host CPU rather than database concurrency. **The ceiling is the worker, and that ceiling is purchasable.**
 3. **This worsening is an artefact of sharing one machine.** Deploy or scale the worker separately and the contention disappears — and `try_claim_raw`'s CAS guarantees workers scale horizontally without coordination.
+   ⭐ **Later addition (a design argument when written, now measured)**: [worker-scale-out](./2026-09-02-worker-scale-out.md) verified three things — (a) the contention really is an artefact of co-residency: under zero API load, 4 / 8 / 16 children drain at 304 / 515 / 789 records/s; (b) "the API steals the worker's CPU" is upgraded from a correlation to a manipulation of the same variable: doubling the workers costs the API ~30% of its intake; (c) **horizontal scaling is safe, but the attribution needed correcting** — on the normal path contention never happens (the credit belongs to point-to-point dispatch, one message naming one `raw_id`), and CAS is the deterministic guarantee for when it does (test F: 15,000/15,000).
 
 **Updated citable capacity statement (must be quoted together with its environment):**
+
+(⚠️ The 186 / 299 / 36,526 / 119 s below are all **1 container × concurrency 4** values; for other worker configurations see [worker-scale-out](./2026-09-02-worker-scale-out.md).)
 
 > Measured on a single development machine (16 cores; DB / Redis / worker / load generator co-located; rate limiting disabled): the ingestion API accepts ~488 orders/second. The Celery worker's drain rate depends on how hard the API is working — roughly 186/second during a burst, roughly 299/second when the API is idle. Beyond drain capacity the surplus is absorbed by the queue: a 60,000-request burst peaked at a backlog of 36,526 with zero errors and was fully consumed 119 seconds after load stopped, with every row landing in ODS.
 
@@ -278,6 +283,8 @@ Three things that follow:
 - **Rate limiting was disabled throughout.** Production is `60/minute`.
 
 ## What this overturned
+
+⚠️ **First, about this document itself**: none of its conclusions have been overturned, but two parts of conclusion 8 were filled in later by [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) — the backlog figures gained the worker configuration they were missing, and the CAS scaling claim gained a measurement plus one corrected attribution (the claim holds, but on the normal path the credit belongs to point-to-point dispatch). **That is filling in, not overturning.**
 
 ⭐ **Overturns conclusions 2 and 3 of [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md), written earlier the same day.**
 
@@ -293,5 +300,6 @@ Three things that follow:
 ## Related
 
 - [2026-09-02-ingestion-capacity-and-bottlenecks](./2026-09-02-ingestion-capacity-and-bottlenecks.md) — this document overturns its conclusions 2 and 3
+- [2026-09-02-worker-scale-out](./2026-09-02-worker-scale-out.md) — supplies the worker configuration missing from this document's conclusion 8, and turns its CAS scaling claim from a design argument into a measurement
 - [2026-08-03-load-test-ingestion](./2026-08-03-load-test-ingestion.md) — the cause of its Test 2 (`BackgroundTasks` dispatching synchronous processing into a 40-thread pool) is the mirror image of this mechanism: that time it was **too many threads for too small a pool**, this time **too few threads to use the pool at all**
 - [design/queue](../design/queue.md) · [ADR-0004](../adr/0004-cas-claim-rowcount.md)

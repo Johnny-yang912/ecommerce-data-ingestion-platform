@@ -344,8 +344,10 @@ Every way an upstream can misbehave, and which mechanism absorbs it. **This is t
 | 11 | Sentinel / fake nulls | `format_clean` normalisation (strings); range check (numbers) | string sentinels → NULL; numeric sentinels flagged `has_clean_error` |
 | 12 | Over-long string vs column cap | `has_clean_error` (`FIELD_TOO_LONG`) + a generous DB wall + fast-fail | moderately long → flagged and lands; egregious → terminal `error`, no poison pill |
 | 13 | NUL byte | stripped before write + warning | stripped and landed; see [ADR-0006](../adr/0006-nul-byte-fast-fail.md) for the decoded-`\u0000` case |
-| 14 | NaN / Infinity | `has_clean_error` (`NON_FINITE_NUMBER`) | flagged and lands; quarantined downstream — **does not poison aggregates** |
+| 14 | NaN / Infinity | **depends on the declared type of the target field**: float → `has_clean_error` (`NON_FINITE_NUMBER`); int → hard type error (see row 4) | float: flagged and lands, quarantined downstream — **does not poison aggregates**; int (e.g. `items[].quantity`): 422 + `ingress_rejected`, **does not land** |
 | 15 | Future date / clock skew | `has_clean_error` (`ORDER_DATE_IN_FUTURE`); extraction uses `>=` | future date flagged; clock rollback mitigated by `>=` in incremental extraction |
+
+⚠️ **The split in row 14 is easy to miss.** The same `Infinity` in the same `items` payload lands and is flagged when it hits `unit_price` (float), but is rejected at ingress when it hits `quantity` (int). **The same upstream defect resolves to two different quadrants depending on which field it lands on** — not a deliberate distinction, but a by-product of the type declarations ([ADR-0054](../adr/0054-type-declaration-governance.md)). Changing it means changing the declaration, not the rules.
 
 **Three rows worth reading together** — they are the ones no rule can catch:
 

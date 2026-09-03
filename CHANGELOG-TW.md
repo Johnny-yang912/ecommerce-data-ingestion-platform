@@ -38,6 +38,8 @@
 
 - **端點從 `async def` 改為 `def`：同步 DB 呼叫不再佔住 event loop。** 三個端點（`/orders`、`/process_raw`、`/raw`）的 handler 內是阻塞的 psycopg2 呼叫，而連線持有窗口內沒有任何 `await`——單一個卡住的查詢會凍結**整個 uvicorn 行程**，不只那一筆請求。**把 PostgreSQL 停住 8 秒實測：一個完全不碰資料庫的 `/health` 被卡了 8.2 秒（改動後 40ms）**——凍結時長等於資料庫卡住的時長，上限由 `statement_timeout`（30 秒）決定。一般負載下 `/health` p99 亦由 167ms 降至 34ms；吞吐 +42%，worker 數不再於 8 反轉（207 → 485 RPS）。⚠️ 代價：API 收得更快而 worker 在突發期間因 CPU 競爭而更慢，同一波 60,000 筆突發的積壓峰值由 5,453 升至 36,526——仍為零錯誤、119 秒完全回收。**修的是故障放大，效能是副作用。** → [實測](./docs/zh-TW/verification/2026-09-02-sync-handlers-before-after.md)
 
+- **驗證錯誤的回應本身炸掉，把 422 變成 500。** Pydantic 的錯誤報告會夾帶肇事值（`input`），而 `JSONResponse` 以 `allow_nan=False` 序列化——`items[].quantity` 收到 `NaN`／`Infinity` 時**判定是對的（422），但那份 422 在 render 階段就拋 `ValueError`**，而例外在例外處理器內部無處可去 → 裸的 500。根因是入口的 parser 比出口的 serializer 寬鬆（`json.loads` 預設收 `NaN`），與 [ADR-0006](./docs/zh-TW/adr/0006-nul-byte-fast-fail.md) 同族，只是出口從 PostgreSQL 的 TEXT 換成 JSON。**代價不在那一筆**：500 的語意是「我的錯，你再試」，上游會對一個永遠不可能成功的 payload 重送——與 `_enqueue` 刻意不回 500 是同一個論證。2026-09-03 全天四批 seeding 實測：4 次非有限注入有 2 次落在 `quantity`（int），各讓一筆訂單以 500 消失且完全不落地；落在 `unit_price`（float）的另外 2 次照常落地並標記 `NON_FINITE_NUMBER`。**修的是實作追上 [ADR-0054](./docs/zh-TW/adr/0054-type-declaration-governance.md) 早已寫明的規則**（硬型別錯誤 → 422 + `ingress_rejected`），不是新契約。
+
 ### 決定不做
 
 - **Tier 1 的業務／DQ 指標**——模擬上游的髒資料率在一天內恆定，所以分鐘級錯誤率說不出倉庫沒說過的事。→ [PORTFOLIO_SCOPE](./docs/zh-TW/PORTFOLIO_SCOPE.md)

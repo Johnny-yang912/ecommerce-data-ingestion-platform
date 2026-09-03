@@ -344,8 +344,10 @@ B 幫不上忙：**它的輸入就是那些被汙染的值。** 就算它看得�
 | 11 | sentinel／假的 null | `format_clean` 正規化（字串）；範圍檢查（數字） | 字串 sentinel → NULL；數值 sentinel 標記 `has_clean_error` |
 | 12 | 過長字串 vs 欄位上限 | `has_clean_error`（`FIELD_TOO_LONG`）+ 寬鬆的 DB 牆 + 快速失敗 | 中等長度 → 標記後落地；誇張長度 → 終端 `error`，不再有毒藥丸 |
 | 13 | NUL byte | 寫入前剝除 + 警告 | 剝除後落地；已解碼的 `\u0000` 案例見 [ADR-0006](../adr/0006-nul-byte-fast-fail.md) |
-| 14 | NaN／Infinity | `has_clean_error`（`NON_FINITE_NUMBER`） | 標記後落地；下游隔離——**不會毒害聚合** |
+| 14 | NaN／Infinity | **取決於目標欄位的宣告型別**：float → `has_clean_error`（`NON_FINITE_NUMBER`）；int → 硬型別錯誤（見第 4 列） | float：標記後落地，下游隔離——**不會毒害聚合**；int（如 `items[].quantity`）：422 + `ingress_rejected`，**不落地** |
 | 15 | 未來日期／時鐘偏移 | `has_clean_error`（`ORDER_DATE_IN_FUTURE`）；抽取用 `>=` | 未來日期被標記；時鐘倒退由增量抽取的 `>=` 緩解 |
+
+⚠️ **第 14 列的分岔很容易被忽略。** 同一包 `items` 裡的同一個 `Infinity`，打到 `unit_price`（float）會落地並被標記，打到 `quantity`（int）則在入口就被拒。**同一個上游缺陷，因為打到哪個欄位而落到兩個不同的象限**——這不是刻意設計的區分，是型別宣告的副產物（[ADR-0054](../adr/0054-type-declaration-governance.md)）。要改變它就是改宣告，不是改規則。
 
 **三列值得放在一起讀**——它們是規則抓不到的那幾個：
 

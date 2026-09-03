@@ -12,6 +12,8 @@ Point 1 Retry 測試：POST /orders Raw 寫入 retry 機制（遷移自 test_ret
   - 斷言失敗時 pytest 自動展示 diff，不需要 print
 """
 
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from sqlalchemy.exc import OperationalError
@@ -115,6 +117,50 @@ class TestIngressRejectedHandler:
 
         assert response.status_code == 422
         assert any(c[0][0] == "ingress_rejected" for c in mock_warning.call_args_list)
+
+    # ⚠️ 上面那個測試【抓不到】非有限值的問題，因為它餵的錯誤字典沒有 `input` 鍵——
+    #    沒有 input 就沒有 json.dumps 炸得掉的東西。而 render 是在 JSONResponse 的
+    #    建構子裡跑的，舊版在 `return` 那一行就拋 ValueError 了，assert 根本走不到。
+    #    2026-09-03 實測：seed 每天約有 1/3 的非有限注入會打到 items[].quantity，
+    #    每次都讓一筆訂單以 500 消失、且完全不落地。以下兩個測試守住這條路徑。
+
+    async def test_non_finite_input_still_renders_422(self, mock_request):
+        """錯誤報告的 `input` 帶非有限值時，422 必須真的送得出去（欄位層）。"""
+        exc = RequestValidationError([
+            {"loc": ("body", "items", 0, "quantity"),
+             "msg": "Input should be a finite number",
+             "type": "finite_number",
+             "input": float("nan")},
+        ])
+
+        with patch.object(main.logger, "warning"):
+            response = await main._on_validation_error(mock_request, exc)
+
+        assert response.status_code == 422
+        detail = json.loads(response.body)["detail"]
+        assert detail[0]["input"] == "nan"
+        assert detail[0]["loc"] == ["body", "items", 0, "quantity"]
+        assert detail[0]["type"] == "finite_number"
+
+    async def test_non_finite_nested_in_input_still_renders_422(self, mock_request):
+        """模型層錯誤的 `input` 是整包 dict，壞值藏在裡面——守住 _json_safe 的遞迴。
+
+        少了這個測試，之後有人把 _json_safe 簡化成「只看頂層」不會讓任何測試變紅。
+        """
+        exc = RequestValidationError([
+            {"loc": ("body", "items", 0),
+             "msg": "Input should be a valid dictionary",
+             "type": "model_attributes_type",
+             "input": {"quantity": float("inf"), "unit_price": 3.0,
+                       "tags": [float("-inf"), "ok"]}},
+        ])
+
+        with patch.object(main.logger, "warning"):
+            response = await main._on_validation_error(mock_request, exc)
+
+        assert response.status_code == 422
+        got = json.loads(response.body)["detail"][0]["input"]
+        assert got == {"quantity": "inf", "unit_price": 3.0, "tags": ["-inf", "ok"]}
 
 
 class TestHealth:

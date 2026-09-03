@@ -1,7 +1,9 @@
+import math
 import uuid
 from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -152,17 +154,67 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
+def _json_safe(value):
+    """把非有限浮點數換成其字面字串，其餘原樣遞迴通過。
+
+    為什麼需要這一步 ⭐
+    ─────────────────────────────────────────────────────────────────────────
+    Pydantic 的錯誤報告會把【肇事值本身】放進 `input`。而 JSON（RFC 8259）沒有
+    inf/nan 的表示法，starlette 的 `JSONResponse.render` 又刻意用
+    `json.dumps(..., allow_nan=False)` 保持相容。不淨化的話，422 會在
+    「render 那份錯誤報告」這一步自己拋 `ValueError: Out of range float values
+    are not JSON compliant`——而 render 是在 `Response.__init__` 裡跑的，所以那個
+    422 的 response 物件連建都沒建完。
+
+    例外從【例外處理器內部】往上拋就沒地方去了（處理器已經是最後一道），
+    ServerErrorMiddleware 原樣 re-raise → 裸的 **HTTP 500**。
+    判斷是對的（422），送不出去而已。
+
+    為什麼不能放著不管：500 的語意是「我的錯，你再試」，422 才是「你別再送了」。
+    上游照 500 的語意重試，就是對一個永遠不可能成功的 payload 無限重送——
+    這與 `_enqueue` docstring 裡「回 500 會讓上游重送 → 同一個 order_id 灌出一批
+    Raw」是同一個論證，只是方向相反（那邊是事實已成立不該回 500，這邊是請求
+    該被拒但不該用 500 拒）。
+
+    根因是【入口的 parser 比出口的 serializer 寬鬆】，而且是同一個 stdlib 模組的
+    兩端：`json.loads` 預設接受 `NaN`/`Infinity`（對 RFC 的非標準擴充），
+    `json.dumps(allow_nan=False)` 卻吐不出來。與 NUL byte 那條同族——那邊的
+    出口是 PostgreSQL 的 TEXT，這邊的出口是 JSON。
+
+    ⚠️ 必須遞迴：欄位層錯誤的 `input` 是純量（`items[0].quantity` = nan），但
+    模型層錯誤的 `input` 是整包 dict、壞值藏在裡面。只淨化頂層擋不住後者。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)  # 'inf' / '-inf' / 'nan'
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 @app.exception_handler(RequestValidationError)
 async def _on_validation_error(request: Request, exc: RequestValidationError):
     # 攝入硬閘門（order_id 必填 / 型別不可強轉）擋下的請求不會落地 Raw，
     # 在此記一筆訊號，讓「上游開始送壞資料」也進得了可觀測性，而非只在 access log 浮現。
+    # 這裡刻意只取 loc/msg/type、不取 `input`——所以這一行從來沒炸過，
+    # 炸的一直是下面那個「把 input 一起送回去給客戶端」的回應。
     logger.warning(
         "ingress_rejected",
         path=request.url.path,
         method=request.method,
         errors=[{"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")} for e in exc.errors()],
     )
-    return await request_validation_exception_handler(request, exc)
+    # 不再轉交 fastapi.exception_handlers.request_validation_exception_handler：
+    # 它的全文等價於下面這兩行，唯一差別就是少了 _json_safe。回應格式刻意保持
+    # 與 FastAPI 預設一致（{"detail": [...]}），既有客戶端與測試不受影響。
+    #
+    # jsonable_encoder 在前、_json_safe 在後：前者把 date/bytes 之類轉成 JSON
+    # 原生型別，後者收拾前者原樣放行的浮點數。順序反過來淨化會白做。
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
 
 
 @app.get("/health")

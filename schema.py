@@ -187,7 +187,7 @@ class ODSOrder(BaseModel):
 class OrderAccepted(BaseModel):
     raw_id: int = Field(description="Poll `GET /raw/{raw_id}` with this id for the outcome.")
     status: str = Field(
-        description="Always `pending` — the record is stored, not yet processed.",
+        description="Always `pending`: stored, and queued for processing.",
         examples=["pending"],
     )
 

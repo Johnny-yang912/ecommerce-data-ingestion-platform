@@ -29,17 +29,19 @@ Every endpoint except `GET /health` requires an `X-API-Key` header. A missing or
 invalid key returns `401`. The key identifies the calling client, and that identity is
 stored with every record it submits.
 
-## The response you get is not the result
+## What a 200 means
 
-`POST /orders` returns `200` with `status: "pending"` as soon as the Raw record is
-committed. **This is not a statement that the order was processed** — processing happens
-afterwards, on a worker. Two consequences for a client:
+`POST /orders` returns `200` with `status: "pending"` once the order has been committed
+to durable storage. From that point:
 
-- Do not treat `200` as success of the pipeline. It means *accepted and durable*.
-- To learn the outcome, poll `GET /raw/{raw_id}` with the `raw_id` you were returned.
+- **Do not retry.** The order is stored and will be processed.
+- **You need not keep the payload.** It is retained verbatim, exactly as sent.
+- This holds even when the queue is down: the record is already committed and a recovery
+  scan picks it up. Queue health is never the client's problem.
 
-A `200` is returned even when the queue is unavailable, because the record is already
-committed and a recovery scan will pick it up. Queue health is never the client's problem.
+A `200` does not report the **outcome** of processing, which happens afterwards on a
+worker and ends in `processed`, `error` or `duplicate`. Poll `GET /raw/{raw_id}` when you
+need to know which — acceptance does not depend on it.
 
 ### Raw status values
 
@@ -69,7 +71,7 @@ and should not treat the absence of one as confirmation that the order was new.
 
 | Code | Meaning | What the client should do |
 |---|---|---|
-| `200` | Accepted and durable | Not a processing result — poll `GET /raw/{raw_id}` |
+| `200` | Stored; will be processed | Nothing. Poll `GET /raw/{raw_id}` only if you need the outcome |
 | `400` | Replay refused for this record's current status | Do not retry |
 | `401` | API key missing or invalid | Do not retry; check `X-API-Key` |
 | `404` | No record with this `raw_id` | Do not retry |
@@ -118,8 +120,8 @@ _NOT_FOUND = {
 ORDERS_RESPONSES = {
     200: {
         "description": (
-            "Accepted and durably stored. Not a statement that the order was processed — "
-            "poll `GET /raw/{raw_id}` for the outcome."
+            "Stored durably and will be processed; do not retry. The processing "
+            "outcome is not included — poll `GET /raw/{raw_id}` if you need it."
         )
     },
     401: _UNAUTHORIZED,

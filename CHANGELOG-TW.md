@@ -2,9 +2,59 @@
 
 [English](./CHANGELOG.md) | **繁體中文**
 
-這個系統如何走到今天。Phase 是發布單位；每個 Phase 之內，每一條是一行加上一個指向決策或量測的連結。
+這個系統如何走到今天。**兩條時間線**：Phase 是發布單位，記架構的演進；「缺陷與修正」記跑起來之後現實給的回饋。每一條都帶一個指向決策或量測的連結。
 
 **收錄範圍**：行為、契約與架構的變更。重構與文件不列，除非它改變了一個決策。
+
+---
+
+## 缺陷與修正
+
+**跑起來之後才出現的缺陷。** 設計當下看起來沒問題，某天在實跑、壓測或例行跑批中炸開——與 Phase 平行的一條時間線。因為新增功能而必須跟著改的，記在各 Phase 自己的「修正」底下。
+
+每條記：**何時、在什麼情境下被發現、根因、改了什麼。** 經過與量測在連結裡。
+
+---
+
+### 驗證錯誤的回應本身炸掉，把 422 變成 500
+
+`2026-09-03 發現 · 09-04 修復` · **`seed_demo` 實跑**
+
+Pydantic 的錯誤報告夾帶肇事值（`input`），而 `JSONResponse` 以 `allow_nan=False` 序列化——`items[].quantity` 收到 `NaN`／`Infinity` 時**判定是對的（422），但那份 422 在 render 階段就拋 `ValueError`**，而例外在例外處理器內部無處可去 → 裸的 500。根因是入口的 parser 比出口的 serializer 寬鬆（`json.loads` 預設收 `NaN`）。分界是欄位的宣告型別：當天四次非有限注入，落在 `quantity`（int）的兩次各讓一筆訂單以 500 消失且完全不落地，落在 `unit_price`（float）的兩次照常落地並標記 `NON_FINITE_NUMBER`。**代價不在那一筆**——500 的語意是「我的錯，你再試」，上游會對一個永遠不可能成功的 payload 重送。
+
+**改動**：序列化前遞迴淨化非有限浮點數，回應形狀不變。這是**實作追上 [ADR-0054](./docs/zh-TW/adr/0054-type-declaration-governance.md) 早已寫明的規則**（硬型別錯誤 → 422 + `ingress_rejected`），不是新契約。與 [ADR-0006](./docs/zh-TW/adr/0006-nul-byte-fast-fail.md) 同族，只是出口從 PostgreSQL 的 TEXT 換成 JSON。
+
+### 端點從 `async def` 改為 `def`：同步 DB 呼叫不再佔住 event loop
+
+`2026-09-02` · **壓測**——容量與瓶頸定位過程中先由程式碼推論，再以前後對照實測
+
+三個端點（`/orders`、`/process_raw`、`/raw`）的 handler 內是阻塞的 psycopg2 呼叫，而連線持有窗口內沒有任何 `await`——單一個卡住的查詢會凍結**整個 uvicorn 行程**，不只那一筆請求。**把 PostgreSQL 停住 8 秒實測：一個完全不碰資料庫的 `/health` 被卡了 8.2 秒**（改動後 40ms）——凍結時長等於資料庫卡住的時長，上限由 `statement_timeout`（30 秒）決定。
+
+**改動**：三個端點改為 `def`，由 Starlette 移入 anyio 執行緒池。一般負載下 `/health` p99 由 167ms 降至 34ms；吞吐 +42%，worker 數不再於 8 反轉（207 → 485 RPS）。⚠️ 代價：API 收得更快而 worker 在突發期間因 CPU 競爭而更慢，同一波 60,000 筆突發的積壓峰值由 5,453 升至 36,526——仍為零錯誤、119 秒完全回收。**修的是故障放大，效能是副作用。** → [實測](./docs/zh-TW/verification/2026-09-02-sync-handlers-before-after.md)
+
+### 增量窗口的左邊界沒有對齊分區邊界——同一個缺陷存在於三支模型
+
+`2026-08-29 20:38 發生 · 08-30 10:20 發現 · 當日分兩階段修復` · **BI 觀察**——Looker 上營收曲線變矮，缺口抹在約 45 個 `order_date` 上，看起來像雜訊而不像故障
+
+**沒有任何告警**：DAG 綠、93 個 dbt 測試全綠、上游 staging 完好無損。`insert_overwrite` 的原子單位是整個分區，而左界帶著跑批當下的時刻——一次比排程早兩小時的手動跑批，讓**半天的資料原子覆寫了整天**，`stg_orders` 與 `stg_quality_events` 的 `2026-08-26` 分區各從 **800 列被砍成 250 列**，缺口傳播至 Gold 與品質報表。
+
+**改動**：三支模型（另含 `rpt_quality_events_daily`）全部對齊日界，各補定點回填 var，並加上兩支逐分區對帳測試。⚠️ **修復分兩階段**：第一階段只涵蓋 `stg_orders` 便宣告結案，當晚才由 BI 落差發現另外兩支——範圍是照「哪張表壞了」劃的，而缺陷是「寫法」層級的。→ [ADR-0055](./docs/zh-TW/adr/0055-partition-aligned-incremental-window.md) · [事故](./docs/zh-TW/incidents/2026-08-30-stg-partition-truncation.md)
+
+### 金額從 `FLOAT64` 移到 `NUMERIC`
+
+`2026-08-04` · **例行跑批**——`assert_fct_orders_rollup_matches_items` 自己變紅，而它並不是為此而設計的
+
+浮點數的 `SUM()` 不具結合律，上捲與測試的重新聚合走了不同的執行計畫，39 列差約 **1 ULP**（絕對 9.095e-13）。它潛伏那麼久，是因為在那之前 60 天窗口內的每一筆訂單都**恰好只有一個品項**——單值的 `SUM()` 沒有累加，因此沒有順序效應。
+
+**改動**：品項金額改為 `NUMERIC(38, 9)`，`quantity` 維持 `INT64`（它是個計數）。**修的是型別，不是容差**——容差會藏起真正的缺陷，而且「容差設多少、資料長大後要不要重調」是一個會回頭找你的問題。→ [ADR-0047](./docs/zh-TW/adr/0047-measures-roll-up-to-header.md) · [design/transformation](./docs/zh-TW/design/transformation.md)
+
+### NUL byte 毒藥丸
+
+`2026-06-16` · ⚠️ **發現情境未留下記錄**
+
+同一個值在管線的不同階段有不同的表示法，而防護與危害住在不同的表示空間裡：HTTP body 裡的一個 `\u0000` escape 是**六個合法的 ASCII 字元**，而入口防護剝的是真正的 `0x00` 位元組——那裡一個都沒有，防護什麼都沒剝掉。`json.loads` 才把它解碼成真正的 NUL。psycopg2 在**參數轉換階段**拋一個 **bare `ValueError`**，不是 DBAPI 錯誤，所以不會以 `DataError` 抵達——它落進通用的 `except Exception`，**被當成暫時性錯誤重試**。而它是確定性的：記錄停在 `processing`，恢復掃描每隔一個間隔就重派一次，永遠如此。
+
+**改動**：commit 迴圈的 `except DataError` 之後加上 `except ValueError` 分支，rollback 並快速失敗到終端 `error`。**這次失效其實不是關於 NUL byte 的——它是關於「一個確定性錯誤被歸類成暫時性錯誤」。** → [ADR-0006](./docs/zh-TW/adr/0006-nul-byte-fast-fail.md)
 
 ---
 
@@ -31,14 +81,7 @@
 ### 修正
 
 - **逾時改以 `processing_started_at` 判定，而非 `received_at`。** 積壓時舊基準會收回正在被處理的記錄，於是同一個 `raw_id` 在兩個 worker 上跑——重現出來，2,000 筆積壓中發生 2 次。**CAS 並沒有失效**：它擋不住第三方把狀態退回去。→ [ADR-0015](./docs/zh-TW/adr/0015-staleness-from-processing-started-at.md) · [實測](./docs/zh-TW/verification/2026-08-10-staleness-basis-self-collision.md)
-- **NUL byte 毒藥丸。** 線上的一個 `\u0000` escape 是六個合法 ASCII 字元，所以入口防護什麼都沒剝掉；`json.loads` 把它解碼成真正的 NUL，而產生的 `ValueError` 被當成暫時性錯誤重試——永遠。→ [ADR-0006](./docs/zh-TW/adr/0006-nul-byte-fast-fail.md)
 - **不得有 DB 交易跨越派工。** `db.refresh()` 曾經如此；60 併發下實測，32 個池槽位中有 23 個卡在 `idle in transaction`。
-- **金額從 `FLOAT64` 移到 `NUMERIC`**，在一個上捲測試對 39 列差 **1 ULP** 變紅之後——浮點數的 `SUM()` 不具結合律。**修的是型別，不是容差。** → [design/transformation](./docs/zh-TW/design/transformation.md)
-- **增量窗口的左邊界沒有對齊分區邊界——同一個缺陷存在於三支模型。** `insert_overwrite` 的原子單位是整個分區，而左界帶著跑批當下的時刻——一次比排程早兩小時的手動跑批，讓**半天的資料原子覆寫了整天**，`stg_orders` 與 `stg_quality_events` 的 `2026-08-26` 分區各從 **800 列被砍成 250 列**。DAG 綠、dbt test 綠、上游 staging 完好無損。三支模型（另含 `rpt_quality_events_daily`）全部對齊日界，各補定點回填 var，並加上兩支逐分區對帳測試。**修復分兩階段**：第一階段只涵蓋 `stg_orders` 便宣告結案，當晚才由 BI 落差發現另外兩支——範圍是照「哪張表壞了」劃的，而缺陷是「寫法」層級的。→ [ADR-0055](./docs/zh-TW/adr/0055-partition-aligned-incremental-window.md) · [事故](./docs/zh-TW/incidents/2026-08-30-stg-partition-truncation.md)
-
-- **端點從 `async def` 改為 `def`：同步 DB 呼叫不再佔住 event loop。** 三個端點（`/orders`、`/process_raw`、`/raw`）的 handler 內是阻塞的 psycopg2 呼叫，而連線持有窗口內沒有任何 `await`——單一個卡住的查詢會凍結**整個 uvicorn 行程**，不只那一筆請求。**把 PostgreSQL 停住 8 秒實測：一個完全不碰資料庫的 `/health` 被卡了 8.2 秒（改動後 40ms）**——凍結時長等於資料庫卡住的時長，上限由 `statement_timeout`（30 秒）決定。一般負載下 `/health` p99 亦由 167ms 降至 34ms；吞吐 +42%，worker 數不再於 8 反轉（207 → 485 RPS）。⚠️ 代價：API 收得更快而 worker 在突發期間因 CPU 競爭而更慢，同一波 60,000 筆突發的積壓峰值由 5,453 升至 36,526——仍為零錯誤、119 秒完全回收。**修的是故障放大，效能是副作用。** → [實測](./docs/zh-TW/verification/2026-09-02-sync-handlers-before-after.md)
-
-- **驗證錯誤的回應本身炸掉，把 422 變成 500。** Pydantic 的錯誤報告會夾帶肇事值（`input`），而 `JSONResponse` 以 `allow_nan=False` 序列化——`items[].quantity` 收到 `NaN`／`Infinity` 時**判定是對的（422），但那份 422 在 render 階段就拋 `ValueError`**，而例外在例外處理器內部無處可去 → 裸的 500。根因是入口的 parser 比出口的 serializer 寬鬆（`json.loads` 預設收 `NaN`），與 [ADR-0006](./docs/zh-TW/adr/0006-nul-byte-fast-fail.md) 同族，只是出口從 PostgreSQL 的 TEXT 換成 JSON。**代價不在那一筆**：500 的語意是「我的錯，你再試」，上游會對一個永遠不可能成功的 payload 重送——與 `_enqueue` 刻意不回 500 是同一個論證。2026-09-03 全天四批 seeding 實測：4 次非有限注入有 2 次落在 `quantity`（int），各讓一筆訂單以 500 消失且完全不落地；落在 `unit_price`（float）的另外 2 次照常落地並標記 `NON_FINITE_NUMBER`。**修的是實作追上 [ADR-0054](./docs/zh-TW/adr/0054-type-declaration-governance.md) 早已寫明的規則**（硬型別錯誤 → 422 + `ingress_rejected`），不是新契約。
 
 ### 決定不做
 
@@ -101,5 +144,6 @@
 ## 慣例
 
 - Phase 是發布單位。沒有語意化版本——這不是一個被散布的套件。
+- **一條修正放哪裡，看它是怎麼冒出來的**：做某個 Phase 的工作時、被那個 Phase 的新東西撞出來的，記在該 Phase 的「修正」底下；系統跑了一段時間後才在實跑、壓測或跑批中炸開的，記在「缺陷與修正」。
 - **推翻了一個已寫下結論**的條目，會連向推翻它的那份驗證記錄。這樣的條目有六個。→ [verification/](./docs/zh-TW/verification/)
 - 「決定不做」是一等公民類別。每一條都帶著重新檢視它的 trigger。→ [PORTFOLIO_SCOPE](./docs/zh-TW/PORTFOLIO_SCOPE.md)

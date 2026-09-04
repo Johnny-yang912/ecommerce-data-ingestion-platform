@@ -2,9 +2,59 @@
 
 **English** | [繁體中文](./CHANGELOG-TW.md)
 
-How this system got here. Phases are the release unit; within each, entries are one line plus a link to the decision or the measurement.
+How this system got here. **Two timelines**: Phases are the release unit and record how the architecture evolved; "Defects & Fixes" records what reality sent back once it was running. Every entry carries a link to the decision or the measurement.
 
 **What is in scope**: changes to behaviour, contracts and architecture. Refactors and documentation are not listed unless they changed a decision.
+
+---
+
+## Defects & Fixes
+
+**Defects that only appeared once the system was running.** They looked sound when designed, then broke one day during a real run, a load test or a routine build — a timeline running parallel to the Phases. Fixes forced by a new feature are recorded under that Phase's own "Fixed".
+
+Each entry records: **when, in what setting it surfaced, the root cause, and what changed.** The account and the measurements live in the links.
+
+---
+
+### The validation-error response itself crashed, turning a 422 into a 500
+
+`Found 2026-09-03 · fixed 09-04` · **`seed_demo` real run**
+
+Pydantic puts the offending value into the error report's `input`, and `JSONResponse` serialises with `allow_nan=False` — so when `items[].quantity` received `NaN`/`Infinity`, **the verdict was correct (422) but that 422 died during render**, and an exception raised inside an exception handler has nowhere left to go → a bare 500. The root cause is that the parser at ingress is more permissive than the serialiser at egress (`json.loads` accepts `NaN` by default). The dividing line is the field's declared type: of four non-finite injections that day, the two that landed on `quantity` (int) each made an order vanish with a 500 without landing at all, while the two on `unit_price` (float) landed as usual and were flagged `NON_FINITE_NUMBER`. **The cost is not that one order** — a 500 means "my fault, try again", so an upstream retries a payload that can never succeed.
+
+**Changed**: non-finite floats are sanitised recursively before serialisation; the response shape is unchanged. This brings the implementation in line with [ADR-0054](./docs/en/adr/0054-type-declaration-governance.md), which already specified hard type error → 422 + `ingress_rejected` — not a new contract. Same family as [ADR-0006](./docs/en/adr/0006-nul-byte-fast-fail.md), with JSON as the egress instead of PostgreSQL's TEXT.
+
+### Endpoints changed from `async def` to `def`: synchronous DB calls no longer hold the event loop
+
+`2026-09-02` · **load test** — inferred from the code during capacity and bottleneck work, then measured before/after
+
+All three handlers (`/orders`, `/process_raw`, `/raw`) made blocking psycopg2 calls with no `await` anywhere in the connection-holding window, so a single stuck query froze **an entire uvicorn process**, not just that request. **Measured by pausing PostgreSQL for 8 seconds: a `/health` request — which touches no database at all — was held for 8.2s** (40ms after the change) — the freeze lasts as long as the database is stuck, bounded by `statement_timeout` (30s).
+
+**Changed**: all three endpoints became `def`, moved by Starlette into the anyio thread pool. Under ordinary load `/health` p99 went from 167ms to 34ms; throughput +42%, and the worker curve no longer inverts at 8 (207 → 485 RPS). ⚠️ The cost: the API accepts faster while the worker drains slower during a burst (CPU contention on one machine), so the same 60,000-request burst peaked at a backlog of 36,526 instead of 5,453 — still zero errors, fully recovered in 119s. **The fix is for failure amplification; the performance change is a side effect.** → [measured](./docs/en/verification/2026-09-02-sync-handlers-before-after.md)
+
+### The incremental window's left boundary was not aligned to the partition boundary — the same defect existed in three models
+
+`Occurred 2026-08-29 20:38 · found 08-30 10:20 · repaired the same day in two phases` · **BI observation** — the revenue curve on Looker got shorter, the gap smeared across ~45 `order_date`s, looking like noise rather than a failure
+
+**Nothing alerted**: the DAG was green, all 93 dbt tests were green, upstream staging was untouched. `insert_overwrite`'s atomic unit is a whole partition, and the left boundary carried the run's wall-clock time — one manual run two hours ahead of schedule let **half a day atomically overwrite a whole day**, cutting the `2026-08-26` partition of both `stg_orders` and `stg_quality_events` from **800 rows to 250**, with the gap propagating into Gold and the quality reports.
+
+**Changed**: all three models (the third being `rpt_quality_events_daily`) now align to the day edge, each gained targeted-backfill vars, and two per-partition reconciliation tests landed. ⚠️ **The repair took two phases**: the first covered only `stg_orders` and was declared complete; the other two surfaced that evening from a BI discrepancy — the scope had been drawn from "which table broke" when the defect lives at the level of the idiom. → [ADR-0055](./docs/en/adr/0055-partition-aligned-incremental-window.md) · [incident](./docs/en/incidents/2026-08-30-stg-partition-truncation.md)
+
+### Money moved from `FLOAT64` to `NUMERIC`
+
+`2026-08-04` · **routine build** — `assert_fct_orders_rollup_matches_items` went red on its own, and it was not designed to catch this
+
+`SUM()` over floats is not associative, and `fct_orders`' rollup and the test's re-aggregation take different execution plans, so 39 rows differed by about **1 ULP** (9.095e-13 absolute). It stayed latent so long because until then every order inside the 60-day window carried **exactly one item** — a single-value `SUM()` has no accumulation and therefore no ordering effect.
+
+**Changed**: item amounts cast to `NUMERIC(38, 9)`; `quantity` stays `INT64` (it is a count). **The fix was the type, not a tolerance** — a tolerance hides the real defect, and "what tolerance, and does it need retuning as the data grows" is a question that comes back. → [ADR-0047](./docs/en/adr/0047-measures-roll-up-to-header.md) · [design/transformation](./docs/en/design/transformation.md)
+
+### NUL-byte poison pill
+
+`2026-06-16` · ⚠️ **no record of how it surfaced**
+
+The same value has different representations at different stages of the pipeline, and the guard and the hazard lived in different representation spaces: a `\u0000` escape in an HTTP body is **six legal ASCII characters**, while the ingress guard strips real `0x00` bytes — of which there were none, so it stripped nothing. `json.loads` then decoded it into a real NUL. psycopg2 raises a **bare `ValueError`** during **parameter adaptation** — not a DBAPI error, so it never arrives as `DataError` — and it fell into the generic `except Exception`, **where it was retried as if transient**. It is deterministic: the record stayed in `processing` and the recovery scan re-dispatched it every interval, forever.
+
+**Changed**: an `except ValueError` branch after `except DataError` in the commit loop, rolling back and fast-failing to a terminal `error`. **This failure was never really about NUL bytes — it was about a deterministic error classified as transient.** → [ADR-0006](./docs/en/adr/0006-nul-byte-fast-fail.md)
 
 ---
 
@@ -31,14 +81,7 @@ How this system got here. Phases are the release unit; within each, entries are 
 ### Fixed
 
 - **Staleness judged by `processing_started_at`, not `received_at`.** Under backlog the old basis reclaimed records that were actively being processed, so one `raw_id` ran on two workers — reproduced, 2 occurrences across a 2,000-record backlog. **CAS did not fail**: it cannot stop a third party reverting the state. → [ADR-0015](./docs/en/adr/0015-staleness-from-processing-started-at.md) · [measured](./docs/en/verification/2026-08-10-staleness-basis-self-collision.md)
-- **NUL-byte poison pill.** A `\u0000` escape on the wire is six legal ASCII characters, so the ingress guard stripped nothing; `json.loads` decoded it into a real NUL, and the resulting `ValueError` was retried as if transient — forever. → [ADR-0006](./docs/en/adr/0006-nul-byte-fast-fail.md)
 - **No DB transaction may span the dispatch.** `db.refresh()` did; measured at 60 concurrent, 23 of 32 pool slots stuck `idle in transaction`.
-- **Money moved from `FLOAT64` to `NUMERIC`** after a rollup test went red on 39 rows differing by **1 ULP** — `SUM()` over floats is not associative. The fix was the type, not a tolerance. → [design/transformation](./docs/en/design/transformation.md)
-- **The incremental window's left boundary was not aligned to the partition boundary — the same defect existed in three models.** `insert_overwrite`'s atomic unit is a whole partition, and the left boundary carried the run's wall-clock time — one manual run two hours ahead of schedule let **half a day atomically overwrite a whole day**, cutting the `2026-08-26` partition of both `stg_orders` and `stg_quality_events` from **800 rows to 250**. The DAG was green, dbt tests were green, and upstream staging was untouched. All three models (the third being `rpt_quality_events_daily`) now align to the day edge, each gained targeted-backfill vars, and two per-partition reconciliation tests landed. **The repair took two phases**: the first covered only `stg_orders` and was declared complete; the other two surfaced that evening from a BI discrepancy — the scope had been drawn from "which table broke" when the defect lives at the level of the idiom. → [ADR-0055](./docs/en/adr/0055-partition-aligned-incremental-window.md) · [incident](./docs/en/incidents/2026-08-30-stg-partition-truncation.md)
-
-- **Endpoints changed from `async def` to `def`: synchronous DB calls no longer hold the event loop.** All three handlers (`/orders`, `/process_raw`, `/raw`) made blocking psycopg2 calls with no `await` anywhere in the connection-holding window, so a single stuck query froze **an entire uvicorn process**, not just that request. **Measured by pausing PostgreSQL for 8 seconds: a `/health` request — which touches no database at all — was held for 8.2s (40ms after the change)** — the freeze lasts as long as the database is stuck, bounded by `statement_timeout` (30s). Under ordinary load `/health` p99 also went from 167ms to 34ms; throughput +42%, and the worker curve no longer inverts at 8 (207 → 485 RPS). ⚠️ The cost: the API accepts faster while the worker drains slower during a burst (CPU contention on one machine), so the same 60,000-request burst peaked at a backlog of 36,526 instead of 5,453 — still zero errors, fully recovered in 119s. **The fix is for failure amplification; the performance change is a side effect.** → [measured](./docs/en/verification/2026-09-02-sync-handlers-before-after.md)
-
-- **The validation-error response itself crashed, turning a 422 into a 500.** Pydantic puts the offending value into the error report's `input`, and `JSONResponse` serialises with `allow_nan=False` — so when `items[].quantity` received `NaN`/`Infinity`, **the verdict was correct (422) but that 422 died during render**, and an exception raised inside an exception handler has nowhere left to go → a bare 500. The root cause is that the parser at ingress is more permissive than the serialiser at egress (`json.loads` accepts `NaN` by default) — the same family as [ADR-0006](./docs/en/adr/0006-nul-byte-fast-fail.md), with JSON as the egress instead of PostgreSQL's TEXT. **The cost is not that one order**: a 500 means "my fault, try again", so an upstream retries a payload that can never succeed — the same argument `_enqueue` makes for never returning 500 on broker failure. Measured across a full day of seeding on 2026-09-03: of 4 non-finite injections, 2 landed on `quantity` (int) and each made an order vanish with a 500 without landing at all; the other 2 hit `unit_price` (float) and were flagged `NON_FINITE_NUMBER` as usual. **The fix brings the implementation in line with [ADR-0054](./docs/en/adr/0054-type-declaration-governance.md)**, which already specified hard type error → 422 + `ingress_rejected` — not a new contract.
 
 ### Decided against
 
@@ -101,5 +144,6 @@ How this system got here. Phases are the release unit; within each, entries are 
 ## Conventions
 
 - Phases are the release unit. There are no semantic versions — this is not a distributed package.
+- **Where a fix goes depends on how it surfaced**: hit while doing a Phase's work and caused by that Phase's own additions, it belongs under that Phase's "Fixed"; surfaced only after the system had been running for a while — in a real run, a load test or a build — it belongs in "Defects & Fixes".
 - An entry that **overturned a written conclusion** links to the verification record that overturned it. Six of those exist. → [verification/](./docs/en/verification/)
 - "Decided against" is a first-class category. Each entry carries a trigger for revisiting it. → [PORTFOLIO_SCOPE](./docs/en/PORTFOLIO_SCOPE.md)

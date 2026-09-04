@@ -115,7 +115,11 @@ pytest
 
 ## API
 
-所有端點都需要 `X-API-Key` header；缺失或無效回 `401`。
+**完整規格：[API Reference](https://johnny-yang912.github.io/ecommerce-data-ingestion-platform/)** · 來源檔 [`openapi.json`](./openapi.json)（由程式碼產生，[漂移測試](./tests/test_openapi_snapshot.py)守著）
+
+下表是導覽；請求／回應欄位、逐狀態碼的重試指引都在上面那份規格裡。
+
+除 `GET /health` 外，所有端點都需要 `X-API-Key` header；缺失或無效回 `401`。
 
 | Method | Path | 說明 | 限額 |
 |---|---|---|---|
@@ -158,6 +162,7 @@ pytest
 | [runbooks/](./docs/zh-TW/runbooks/)（8 份） | 東西壞掉時該做什麼 | 事故當下 |
 | [verification/](./docs/zh-TW/verification/)（14 份） | 量到了什麼、推翻了什麼 | 當你懷疑某個宣稱時 |
 | [incidents/](./docs/zh-TW/incidents/)（2 份） | 什麼壞了、怎麼診斷出來的 | — |
+| [API Reference](https://johnny-yang912.github.io/ecommerce-data-ingestion-platform/) | 端點、欄位、狀態碼與重試指引 | 要串接它時 |
 | [CHANGELOG](./CHANGELOG-TW.md) | 系統如何走到今天 | — |
 
 ### 建議的閱讀路徑

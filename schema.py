@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, Any
 from datetime import datetime, date
 
@@ -59,7 +59,14 @@ class BehaviorInfo(BaseModel):
 # order_id 為唯一硬閘門：缺 order_id → 422（不落地）；其餘欄位缺失皆可落地，
 # 結構/型別漂移由 detect_schema_drift 標記為 has_schema_drift（非阻斷）。
 class OrderIN(BaseModel):
-    order_id: str
+    order_id: str = Field(
+        description=(
+            "The only required field. Every other field may be omitted and the order "
+            "will still be accepted and stored, flagged for downstream quality "
+            "reporting. A duplicate order_id is not rejected: it is accepted and "
+            "reaches the terminal status `duplicate`."
+        )
+    )
     order_date: Optional[date] = None
     ship_mode: Optional[str] = None
     order_status: Optional[str] = None
@@ -170,6 +177,28 @@ class ODSOrder(BaseModel):
             # items 整包
             items=payload.get("items"),
         )
+
+# --- 回應模型 ---
+#
+# 這兩個模型不參與任何處理邏輯，只存在於「讓 OpenAPI 說得出回應長什麼樣」。
+# 沒有它們的話，/orders 與 /process_raw 的 200 在規格裡是空的 schema {}，
+# 也就是「會回某種 JSON，但不知道長怎樣」。
+
+class OrderAccepted(BaseModel):
+    raw_id: int = Field(description="Poll `GET /raw/{raw_id}` with this id for the outcome.")
+    status: str = Field(
+        description="Always `pending` — the record is stored, not yet processed.",
+        examples=["pending"],
+    )
+
+
+class ProcessRawResult(BaseModel):
+    raw_id: int
+    triggered: bool = Field(
+        description="False when the record was already in a state that needs no replay."
+    )
+    force: bool = Field(description="Echoes the `force` query parameter.")
+
 
 class RawOut(BaseModel):
     id: int

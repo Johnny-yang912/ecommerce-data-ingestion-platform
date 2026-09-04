@@ -1,0 +1,49 @@
+name: API Reference
+
+# 把版控裡的 openapi.json 發佈成一個公開網址。
+#
+# 這支 workflow 刻意【不】重新產生規格：openapi.json 已經在版控裡，而
+# tests/test_openapi_snapshot.py（跑在 CI 裡）保證它與程式碼一致。在這裡重產等於
+# 讓發佈繞過那道守門——一份沒被測試看過的規格就會上線。所以這裡只做複製與部署，
+# 不裝 Python、不裝依賴。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - openapi.json
+      - docs/api-site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:        # 手動重發，用於首次啟用或 Pages 設定變更之後
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時只跑一個部署；排隊中的舊 run 直接取消，最後一次 push 才是要上線的那份。
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp docs/api-site/index.html _site/
+          cp openapi.json _site/
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

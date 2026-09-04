@@ -1,0 +1,949 @@
+{
+  "components": {
+    "schemas": {
+      "AddressInfo": {
+        "properties": {
+          "city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "City"
+          },
+          "country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country"
+          },
+          "postal_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Postal Code"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          }
+        },
+        "title": "AddressInfo",
+        "type": "object"
+      },
+      "BehaviorInfo": {
+        "properties": {
+          "customer_rating": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Rating"
+          },
+          "device_used": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Used"
+          },
+          "is_repeat_customer": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Repeat Customer"
+          }
+        },
+        "title": "BehaviorInfo",
+        "type": "object"
+      },
+      "CustomerInfo": {
+        "properties": {
+          "acquisition_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acquisition Channel"
+          },
+          "age": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age"
+          },
+          "customer_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Id"
+          },
+          "customer_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Name"
+          },
+          "gender": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gender"
+          },
+          "membership_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Membership Tier"
+          },
+          "newsletter_subscribed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Newsletter Subscribed"
+          },
+          "preferred_device": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preferred Device"
+          },
+          "preferred_payment_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preferred Payment Method"
+          },
+          "registration_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registration Date"
+          }
+        },
+        "title": "CustomerInfo",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "OrderAccepted": {
+        "properties": {
+          "raw_id": {
+            "description": "Poll `GET /raw/{raw_id}` with this id for the outcome.",
+            "title": "Raw Id",
+            "type": "integer"
+          },
+          "status": {
+            "description": "Always `pending` — the record is stored, not yet processed.",
+            "examples": [
+              "pending"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "raw_id",
+          "status"
+        ],
+        "title": "OrderAccepted",
+        "type": "object"
+      },
+      "OrderIN": {
+        "properties": {
+          "address": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AddressInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "behavior": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BehaviorInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "customer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CustomerInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "delivery_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Date"
+          },
+          "delivery_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Days"
+          },
+          "items": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OrderItemInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items"
+          },
+          "order_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Date"
+          },
+          "order_id": {
+            "description": "The only required field. Every other field may be omitted and the order will still be accepted and stored, flagged for downstream quality reporting. A duplicate order_id is not rejected: it is accepted and reaches the terminal status `duplicate`.",
+            "title": "Order Id",
+            "type": "string"
+          },
+          "order_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Status"
+          },
+          "payment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaymentInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "returned": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Returned"
+          },
+          "ship_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ship Mode"
+          }
+        },
+        "required": [
+          "order_id"
+        ],
+        "title": "OrderIN",
+        "type": "object"
+      },
+      "OrderItemInfo": {
+        "properties": {
+          "cost_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Price"
+          },
+          "discount_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Pct"
+          },
+          "product": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quantity"
+          },
+          "shipping_fee": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shipping Fee"
+          },
+          "unit_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Price"
+          }
+        },
+        "title": "OrderItemInfo",
+        "type": "object"
+      },
+      "PaymentInfo": {
+        "properties": {
+          "payment_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Method"
+          },
+          "tax_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tax Pct"
+          }
+        },
+        "title": "PaymentInfo",
+        "type": "object"
+      },
+      "ProcessRawResult": {
+        "properties": {
+          "force": {
+            "description": "Echoes the `force` query parameter.",
+            "title": "Force",
+            "type": "boolean"
+          },
+          "raw_id": {
+            "title": "Raw Id",
+            "type": "integer"
+          },
+          "triggered": {
+            "description": "False when the record was already in a state that needs no replay.",
+            "title": "Triggered",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "raw_id",
+          "triggered",
+          "force"
+        ],
+        "title": "ProcessRawResult",
+        "type": "object"
+      },
+      "ProductInfo": {
+        "properties": {
+          "brand": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Brand"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "condition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Condition"
+          },
+          "product_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Id"
+          },
+          "product_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Name"
+          },
+          "sub_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sub Category"
+          }
+        },
+        "title": "ProductInfo",
+        "type": "object"
+      },
+      "RawOut": {
+        "properties": {
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "processed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Processed At"
+          },
+          "raw_payload": {
+            "title": "Raw Payload",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "raw_payload"
+        ],
+        "title": "RawOut",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "in": "header",
+        "name": "X-API-Key",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "description": "Ingests e-commerce orders into a two-stage pipeline: a verbatim **Raw** record first,\nthen a flattened, cleaned **ODS** row written asynchronously by a worker.\n\n## Authentication\n\nEvery endpoint except `GET /health` requires an `X-API-Key` header. A missing or\ninvalid key returns `401`. The key identifies the calling client, and that identity is\nstored with every record it submits.\n\n## The response you get is not the result\n\n`POST /orders` returns `200` with `status: \"pending\"` as soon as the Raw record is\ncommitted. **This is not a statement that the order was processed** — processing happens\nafterwards, on a worker. Two consequences for a client:\n\n- Do not treat `200` as success of the pipeline. It means *accepted and durable*.\n- To learn the outcome, poll `GET /raw/{raw_id}` with the `raw_id` you were returned.\n\nA `200` is returned even when the queue is unavailable, because the record is already\ncommitted and a recovery scan will pick it up. Queue health is never the client's problem.\n\n### Raw status values\n\n| Status | Meaning | Terminal |\n|---|---|---|\n| `pending` | Accepted and stored, not yet claimed | no |\n| `processing` | Claimed by a worker | no |\n| `processed` | Written to ODS | yes |\n| `error` | Processing failed; see `error_message` | yes |\n| `duplicate` | The `order_id` already exists in ODS | yes |\n\n## What is rejected and what is not\n\nOnly `order_id` is required. **Every other field may be missing, and the order will still\nbe accepted and stored** — incomplete records are flagged for downstream quality\nreporting rather than refused. Unknown fields are preserved verbatim.\n\nTwo things are rejected at the door with `422`: a missing `order_id`, and a value whose\ndeclared type cannot be converted (for example `NaN` in the integer field\n`items[].quantity`).\n\n**Duplicate `order_id` submissions are not rejected.** They are accepted with `200` and\nreach the terminal status `duplicate`. A client that resubmits will not receive a `409`,\nand should not treat the absence of one as confirmation that the order was new.\n\n## Status codes and what to do about them\n\n| Code | Meaning | What the client should do |\n|---|---|---|\n| `200` | Accepted and durable | Not a processing result — poll `GET /raw/{raw_id}` |\n| `400` | Replay refused for this record's current status | Do not retry |\n| `401` | API key missing or invalid | Do not retry; check `X-API-Key` |\n| `404` | No record with this `raw_id` | Do not retry |\n| `422` | Payload is invalid | **Do not retry** — the same payload will always fail. Fix it and resend |\n| `429` | Per-client rate limit exceeded | Back off, then retry |\n| `503` | Server busy (connection pool exhausted) | Retry with exponential backoff |\n\nError responses carry a `detail` field. For `422` it is a list of per-field errors; for\nevery other code it is a string.\n\n## Rate limits\n\nLimits are **per authenticated client**, not global — a global ceiling would let one noisy\nupstream deny service to every other one. `GET /health` is unlimited.\n",
+    "title": "Order Ingestion API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "The process is alive. Requires no API key and consumes no rate limit."
+          }
+        },
+        "summary": "Liveness probe"
+      }
+    },
+    "/orders": {
+      "post": {
+        "operationId": "create_order_orders_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderIN"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderAccepted"
+                }
+              }
+            },
+            "description": "Accepted and durably stored. Not a statement that the order was processed — poll `GET /raw/{raw_id}` for the outcome."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Invalid API key"
+                }
+              }
+            },
+            "description": "API key missing or invalid. Do not retry."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Payload is invalid: `order_id` is missing, or a value cannot be converted to its declared type (for example `NaN` in the integer field `items[].quantity`). **Do not retry** — the same payload will always fail. Fix it and resend."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Rate limit exceeded: 60 per 1 minute"
+                }
+              }
+            },
+            "description": "Per-client rate limit exceeded. Back off, then retry."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Server busy, please retry later"
+                }
+              }
+            },
+            "description": "Server busy (connection pool exhausted). Retry with exponential backoff."
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Ingest one order"
+      }
+    },
+    "/process_raw/{raw_id}": {
+      "post": {
+        "operationId": "process_raw_process_raw__raw_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "raw_id",
+            "required": true,
+            "schema": {
+              "title": "Raw Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessRawResult"
+                }
+              }
+            },
+            "description": "Replay dispatched. `triggered` is false when the record was already in a state that needs no replay."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Cannot force replay a processed record"
+                }
+              }
+            },
+            "description": "Replay refused for this record's current status. `force=true` accepts only `error` and `duplicate`; a `processed` record is never replayed. Do not retry."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Invalid API key"
+                }
+              }
+            },
+            "description": "API key missing or invalid. Do not retry."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Raw not found"
+                }
+              }
+            },
+            "description": "No Raw record with this id. Do not retry."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "`raw_id` is not an integer. Do not retry."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Rate limit exceeded: 60 per 1 minute"
+                }
+              }
+            },
+            "description": "Per-client rate limit exceeded. Back off, then retry."
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Replay one Raw record"
+      }
+    },
+    "/raw/{raw_id}": {
+      "get": {
+        "operationId": "get_raw_raw__raw_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "raw_id",
+            "required": true,
+            "schema": {
+              "title": "Raw Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawOut"
+                }
+              }
+            },
+            "description": "The Raw record and its current status."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Invalid API key"
+                }
+              }
+            },
+            "description": "API key missing or invalid. Do not retry."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Raw not found"
+                }
+              }
+            },
+            "description": "No Raw record with this id. Do not retry."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "`raw_id` is not an integer. Do not retry."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Rate limit exceeded: 60 per 1 minute"
+                }
+              }
+            },
+            "description": "Per-client rate limit exceeded. Back off, then retry."
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Read one Raw record and its status"
+      }
+    }
+  }
+}

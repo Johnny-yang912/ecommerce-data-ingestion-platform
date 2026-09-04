@@ -8,7 +8,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from schema import OrderIN, RawOut
+from schema import OrderIN, RawOut, OrderAccepted, ProcessRawResult
 import time
 import structlog
 from structlog.contextvars import clear_contextvars, bind_contextvars
@@ -21,6 +21,16 @@ from logging_config import configure_logging
 from auth import verify_api_key
 from circuit_breaker import CircuitBreaker, CircuitOpen
 from config import settings
+from api_responses import (
+    API_TITLE,
+    API_VERSION,
+    API_DESCRIPTION,
+    ORDERS_RESPONSES,
+    PROCESS_RAW_RESPONSES,
+    RAW_RESPONSES,
+    HEALTH_RESPONSES,
+    build_openapi,
+)
 from telemetry import (
     RETRIES,
     configure_telemetry,
@@ -143,7 +153,16 @@ def _enqueue(raw_id: int) -> bool:
 # tasks.scan_and_dispatch_task。原本它是掛在 lifespan 上的 asyncio 迴圈——那是
 # **行程內狀態**，API 一旦跑多個 uvicorn worker 就會每個行程各跑一份掃描。
 # 移走之後 API 行程不再持有任何背景狀態，啟動時也不做任何恢復工作。
-app = FastAPI()
+# 規格的文字內容住在 api_responses.py——那些字串的讀者是串接方，與本檔的
+# 設計註解讀者不同。openapi.json 由 scripts/export_openapi.py 匯出並進版控，
+# tests/test_openapi_snapshot.py 守著它不漂移。
+app = FastAPI(
+    title=API_TITLE,
+    version=API_VERSION,
+    description=API_DESCRIPTION,
+)
+# 覆寫 422 的描述——理由見 api_responses.build_openapi。
+app.openapi = lambda: build_openapi(app)
 app.add_middleware(RequestContextMiddleware)
 # ⚠️ 必須在 RequestContextMiddleware 之後才掛：Starlette 的 add_middleware 是往外
 # 疊的（後加的在外層），所以這個順序才能讓 OTel 的 span 涵蓋整個請求，
@@ -217,7 +236,11 @@ async def _on_validation_error(request: Request, exc: RequestValidationError):
     )
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    summary="Liveness probe",
+    responses=HEALTH_RESPONSES,
+)
 async def health():
     # liveness：行程活著即回 200。不掛 verify_api_key（healthcheck 不帶 key）、
     # 不掛 limiter（不消耗速率配額）。容器 healthcheck 與未來 LB/K8s 探針用。
@@ -233,7 +256,12 @@ async def get_raw_body(request: Request) -> str:
     return (await request.body()).decode("utf-8")
 
 
-@app.post("/orders")
+@app.post(
+    "/orders",
+    response_model=OrderAccepted,
+    summary="Ingest one order",
+    responses=ORDERS_RESPONSES,
+)
 @limiter.limit("60/minute")
 # ⭐ 這裡是 `def` 而不是 `async def`，那是刻意的，量測依據見
 #    docs/zh-TW/verification/2026-09-02-ingestion-capacity-and-bottlenecks.md。
@@ -323,7 +351,12 @@ def create_order(request: Request, order: OrderIN,
 
 # ⚠️ 刻意不比對 source_client_id（連 force 的守衛也只看狀態、不看擁有者）：
 #    維運端點，持 key 者互為信任。決策與失效條件見 auth.py 檔頭〈信任模型〉。
-@app.post("/process_raw/{raw_id}")
+@app.post(
+    "/process_raw/{raw_id}",
+    response_model=ProcessRawResult,
+    summary="Replay one Raw record",
+    responses=PROCESS_RAW_RESPONSES,
+)
 @limiter.limit("20/minute")
 # `def` 而非 `async def`，理由與 create_order 相同（見該處的長註解）。
 # ⚠️ 三個端點裡這個其實最容易踩到：force=True 會對 raw 下 UPDATE，而 worker 的
@@ -363,7 +396,12 @@ def process_raw(request: Request, raw_id: int, force: bool = False,
 
 # ⚠️ 刻意不比對 source_client_id：任何有效 key 都讀得到任何一筆 Raw，包含逐字
 #    保留的原始 payload。維運端點，持 key 者互為信任——見 auth.py 檔頭〈信任模型〉。
-@app.get("/raw/{raw_id}", response_model=RawOut)
+@app.get(
+    "/raw/{raw_id}",
+    response_model=RawOut,
+    summary="Read one Raw record and its status",
+    responses=RAW_RESPONSES,
+)
 @limiter.limit("120/minute")
 # `def` 而非 `async def`，理由與 create_order 相同（見該處的長註解）。
 def get_raw(request: Request, raw_id: int, client_id: str = Depends(verify_api_key)):

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Order Ingestion API — Reference</title>
+    <link rel="icon" href="data:," />
+    <style>
+      body { margin: 0; padding: 0; }
+    </style>
+  </head>
+  <body>
+    <!--
+      ReDoc 而非 Swagger UI，理由具體：Swagger UI 的賣點是「Try it out」能直接送
+      請求，但這個頁面背後沒有活的伺服器（服務只跑在本機），那顆按鈕按下去只會
+      失敗——把一個壞掉的功能擺在首頁比沒有更糟。ReDoc 是純閱讀排版，沒有這個問題。
+
+      spec-url 指向同目錄的 openapi.json，由 .github/workflows/pages.yml 從 repo
+      根目錄複製過來。那份 JSON 是版控裡的檔案，不是這裡即時產生的。
+    -->
+    <redoc spec-url="./openapi.json" hide-download-button></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+  </body>
+</html>

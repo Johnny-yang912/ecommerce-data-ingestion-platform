@@ -509,6 +509,7 @@
       "title": "Order Date"
     },
     "order_id": {
+      "description": "The only required field. Every other field may be omitted and the order will still be accepted and stored, flagged for downstream quality reporting. A duplicate order_id is not rejected: it is accepted and reaches the terminal status `duplicate`.",
       "title": "Order Id",
       "type": "string"
     },

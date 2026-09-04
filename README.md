@@ -115,7 +115,11 @@ Full startup notes and the two host-side traps: **[runbooks/airflow-startup](./d
 
 ## API
 
-All endpoints require an `X-API-Key` header; a missing or invalid key returns `401`.
+**Full specification: [API Reference](https://johnny-yang912.github.io/ecommerce-data-ingestion-platform/)** · source of truth [`openapi.json`](./openapi.json) (generated from the code, guarded by a [drift test](./tests/test_openapi_snapshot.py))
+
+The table below is a map; request/response fields and per-status retry guidance live in the specification.
+
+Every endpoint except `GET /health` requires an `X-API-Key` header; a missing or invalid key returns `401`.
 
 | Method | Path | Description | Limit |
 |---|---|---|---|
@@ -158,6 +162,7 @@ Full matrix and known risks: **[STATUS](./docs/en/STATUS.md)**
 | [runbooks/](./docs/en/runbooks/) (8) | what to do when something breaks | during an incident |
 | [verification/](./docs/en/verification/) (14) | what was measured, and what it overturned | when you doubt a claim |
 | [incidents/](./docs/en/incidents/) (2) | what broke, and how it was diagnosed | — |
+| [API Reference](https://johnny-yang912.github.io/ecommerce-data-ingestion-platform/) | endpoints, fields, status codes and retry guidance | when integrating with it |
 | [CHANGELOG](./CHANGELOG.md) | how the system got here | — |
 
 ### Suggested reading paths

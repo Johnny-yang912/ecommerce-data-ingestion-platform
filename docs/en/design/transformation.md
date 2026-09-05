@@ -156,6 +156,45 @@ The sandbox's 1 TiB/month free tier lasts to roughly **15–20M orders** on a da
 
 ## 4. `dim_`/`fct_` layer
 
+
+```
+        ┌───────────────────────┐          ┌───────────────────────┐
+        │     dim_customer      │          │      dim_product      │
+        │                       │          │                       │
+        │    SCD1 + tiebreak    │          │    SCD1 + tiebreak    │
+        │ no partition, cluster │          │ no partition, cluster │
+        │ + __UNKNOWN__ member  │          │ + __UNKNOWN__ member  │
+        └───────────┬───────────┘          └───────────┬───────────┘
+                    │                                  │
+                    │ customer_id                      │ product_id
+                    │                                  │
+        ┌───────────┴───────────┐          ┌───────────┴───────────┐
+        │      fct_orders       │          │    fct_order_items    │
+        │                       │          │                       │
+        │    1 row = 1 order    │◄────────►│    1 row = 1 item     │
+        │ partition order_date  │ order_id │ partition order_date  │
+        └───────────────────────┘          └───────────────────────┘
+
+
+        ⚠️  Never join the two and aggregate measures from both — the header's order
+            total is inflated by the line count. Measures roll up into the header,
+            asserted by assert_fct_orders_rollup_matches_items.
+
+
+        Deliberately not built, degenerated onto fct_orders columns (ADR-0048):
+
+          dim_date        →  order_date · delivery_date
+                             no fiscal-year or holiday requirement
+
+          dim_geography   →  country · region · state · city · postal_code
+                             no conformed geography master exists
+
+          junk dimension  →  returned · is_repeat_customer · ship_mode ·
+                             payment_method · device_used
+                             saving row storage is not a problem BigQuery has
+```
+
+
 **Dual fact tables**: `fct_orders` (header) and `fct_order_items` (line).
 
 **Measures roll up into the header**, with `assert_fct_orders_rollup_matches_items` asserting per-order equality. Same move as the `int_` layer: spend one test to convert a disciplinary guarantee into a mechanical one, and get single-table queryability back. `is distinct from`, not `=`, is mandatory — `NULL = NULL` is NULL, so `=` would silently filter out the rows most likely to be wrong.

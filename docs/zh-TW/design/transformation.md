@@ -146,6 +146,44 @@ Sandbox 每月 1 TiB 的免費額度，在日批次下大約撐到 **1500–2000
 
 ## 4. `dim_`／`fct_` 層
 
+
+```
+        ┌───────────────────────┐          ┌───────────────────────┐
+        │     dim_customer      │          │      dim_product      │
+        │                       │          │                       │
+        │   SCD1 + 明確決勝鍵   │          │   SCD1 + 明確決勝鍵   │
+        │   不分區 / cluster    │          │   不分區 / cluster    │
+        │  含 __UNKNOWN__ 成員  │          │  含 __UNKNOWN__ 成員  │
+        └───────────┬───────────┘          └───────────┬───────────┘
+                    │                                  │
+                    │ customer_id                      │ product_id
+                    │                                  │
+        ┌───────────┴───────────┐          ┌───────────┴───────────┐
+        │      fct_orders       │          │    fct_order_items    │
+        │                       │          │                       │
+        │    一列 = 一筆訂單    │◄────────►│    一列 = 一個品項    │
+        │    分區 order_date    │ order_id │    分區 order_date    │
+        └───────────────────────┘          └───────────────────────┘
+
+
+        ⚠️  兩表【不得】join 後同時聚合兩邊度量——header 的訂單總額會被 line 的列數
+            放大。度量上捲進 header，由 assert_fct_orders_rollup_matches_items 斷言。
+
+
+        刻意不建、退化到 fct_orders 欄位上的維度（ADR-0048）：
+
+          dim_date        →  order_date · delivery_date
+                             目前沒有會計年度或假日的需求
+
+          dim_geography   →  country · region · state · city · postal_code
+                             不存在一份一致的地理主檔
+
+          junk dimension  →  returned · is_repeat_customer · ship_mode ·
+                             payment_method · device_used
+                             省下列儲存不是 BigQuery 會有的問題
+```
+
+
 **雙事實表**：`fct_orders`（表頭）與 `fct_order_items`（明細）。
 
 **度量上捲進表頭**，並由 `assert_fct_orders_rollup_matches_items` 斷言逐訂單相等。與 `int_` 層是同一個手法：花一個測試把紀律保證換成機制保證，並換回單表可查詢性。必須用 `is distinct from` 而非 `=`——`NULL = NULL` 是 NULL，所以 `=` 會靜默濾掉那些最可能出錯的列。

@@ -25,7 +25,7 @@ models:
   #    在 table 全量重建下它是同義反覆（用同一段 SQL 驗自己，恆綠、零資訊），
   #    價值要到切增量那天才兌現（抓漏分區）。
   #    → 【「rpt_sales 改增量」與「加逐格對帳測試」是同一件事的兩半，不得只做前者。】
-  #      這與 README.zh-TW §5.4「改增量的那一刻就是收斂觸發點被觸發的時刻」同構。
+  #      這與 ADR-0046「改增量的那一刻就是收斂觸發點被觸發的時刻」同構。
   # ═══════════════════════════════════════════════════════════════════════════
 
   - name: rpt_quality_events_daily
@@ -92,8 +92,8 @@ models:
       過期後累加的起點就丟了、曲線會系統性低估；本表直讀 int_orders_quarantine
       的當下內容，不受事件保留期影響。
       天生不可增量（狀態快照：一筆被 promote 就要從表裡消失），故 table 全量重建、不分區。
-      ⚠️ 目前沒有金額曝險度量——quarantine 的 items 從未被攤平（README.zh-TW §5.7）。
-      觸發點＝需要 int_order_items_quarantine。刻意不用其他欄位湊一個金額（§6.6）。
+      ⚠️ 目前沒有金額曝險度量——quarantine 的 items 從未被攤平（docs/zh-TW/design/transformation.md §3）。
+      觸發點＝需要 int_order_items_quarantine。刻意不用其他欄位湊一個金額（docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉）。
     columns:
       - name: quarantined_date
         description: >
@@ -104,7 +104,7 @@ models:
       - name: dq_rule_version
         description: >
           攝入當下的規則版本。ODS 為 nullable，故補 unknown member '__UNKNOWN__'——
-          動的是維度值不是度量、可完整反查，無損（同 §6.5 對鍵的論證）。
+          動的是維度值不是度量、可完整反查，無損（同 docs/zh-TW/design/transformation.md §4〈鍵的處理〉 的論證）。
         tests:
           - not_null
       - name: effective_quality_state
@@ -133,7 +133,7 @@ models:
           ✅【可加】：以此 code 為主要碼的訂單數；主要碼一張訂單只有一個，
           故跨 error_code 加總＝該切片訂單總數。用途＝「現在總共卡了幾筆」的 KPI。
           ⚠️ 主要碼＝排序後第一個 code，【只】為確定性與配平，不代表嚴重性排序——
-          嚴重性優先級是業務定義，目前沒有，不憑空造（§6.6）。
+          嚴重性優先級是業務定義，目前沒有，不憑空造（docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉）。
           配平由 assert_rpt_backlog_primary_code_balances 把關。
     tests:
       - dbt_utils.unique_combination_of_columns:
@@ -153,11 +153,11 @@ models:
       上游一律走 Gold（fct_order_items × dim_product × fct_orders），刻意不從 int_ 直接拉——
       除了口徑單一與不重做 Gold 的語意決定之外，最關鍵的是：rpt_ 讀 int_ 會把 int_ 從
       「內部建材」升格成「對外契約」，而「int_ 只被 DAG 內部消費」正是 int_ 不分區的
-      唯一理由（README.zh-TW §5.5）。
+      唯一理由（ADR-0049）。
       從 item 軸出發（category 只在 item 層），故訂單數必須 count(distinct)；
       也因此本表不放任何訂單層度量（會被 line 列數放大）。
       取 fct_orders.returned 不違反雙事實表禁令——只取 header 的維度旗標，不聚合其度量。
-      ⭐ is_returned 進 grain 而非輸出兩組金額：淨營收要不要扣退貨尚無業務定義（§6.6），
+      ⭐ is_returned 進 grain 而非輸出兩組金額：淨營收要不要扣退貨尚無業務定義（docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉），
       進 grain 等於把選擇權完整交給 BI，輸出兩組等於替業務挑了它可能都不要的定義。
       現在 table 全量重建，但已掛 order_date 分區——分區欄位現在加是免費的、事後補要重建表。
     columns:

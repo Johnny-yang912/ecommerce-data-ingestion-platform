@@ -9,7 +9,7 @@
 -- 【BI 上的 backlog 總數直接錯掉】，不報錯、不自癒。
 --
 -- 這與 assert_fct_orders_rollup_matches_items 是同一個手法：用一支測試把
--- 「兩處數字可能不一致」從紀律保證升級成機制保證，換取單表可查詢（README.zh-TW §6.1）。
+-- 「兩處數字可能不一致」從紀律保證升級成機制保證，換取單表可查詢（ADR-0047）。
 --
 -- 不加時間窗：本表是全量重建的狀態快照，上游 int_orders_quarantine 也是全量重建，
 -- 兩者在同一次 run 內產生，沒有 assert_fct_orders_complete_projection 那種

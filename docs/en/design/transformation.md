@@ -211,6 +211,16 @@ Related: `item_count = 0` expresses "an order with no items" as a **value**, and
 
 **Partitioning**: `fct_*` on `order_date` (DAY); `dim_*` none — dimensions are reached by key join, where a partition column prunes nothing.
 
+### Key handling
+
+**Dimension keys are natural keys; no surrogate keys are built.** `customer_id` / `product_id` serve directly as the dimension's primary key and the fact table's FK. BigQuery has no indexes, so a surrogate key buys no join performance — it only adds a layer of indirection and one more key lookup. **It solves problems that do not exist here**: keys that change, integration across sources, narrowing row width.
+
+**An `__UNKNOWN__` member absorbs NULL FKs.** `customer_id` is nullable in the ODS, and a star schema should never let a fact table carry a NULL FK — `INNER JOIN` **silently drops rows**, `LEFT JOIN` shows blanks in BI, and neither is acceptable. So each dimension carries one `__UNKNOWN__` row and the fact tables `coalesce` onto it. The `relationships` tests hold only because of this ([testing §6](./testing.md)).
+
+⚠️ This does **not** violate the NULL rule in [cloud-layer](./cloud-layer.md). That rule forbids lossy collapse of **measures** in a shared layer — after `NULL → 0` you can no longer tell "not collected" from "genuinely zero". What is collapsed here is a **key**, and `__UNKNOWN__` maps cleanly back to "this row has no customer identity". **It is lossless.**
+
+The key value itself comes from `var('unknown_member_key', '__UNKNOWN__')`, shared by the `dim_`, `fct_` and `rpt_` layers — three hard-coded strings would be three independent places to drift.
+
 ### Business rules deliberately left undefined
 
 Three things are undefined in the requirements and are **deliberately not assumed** — same principle as not building speculative models:

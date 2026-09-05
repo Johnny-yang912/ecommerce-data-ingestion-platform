@@ -19,8 +19,8 @@
 --   成本 ∝ 近期資料，是 staging 端 ALLOW_FIELD_ADDITION 的鏡像（docs/zh-TW/design/cloud-layer.md）。
 --   觸發閘門＝下方顯式欄位清單：staging 靠 ALLOW_FIELD_ADDITION 長的欄，未加進 SELECT 前
 --   偵測不到、不會自己 ALTER——只在刻意改清單（進 git、被 review）時才觸發，不吃 drift。
---   刻意不用 sync_all_columns：它會 DROP 欄，牴觸「staging 只做加法、刪欄留 legacy」（§5.2/§5.3）。
---   改型別/改分區/歷史回填仍走 --full-refresh / targeted refresh（見 README §4.7、§6）。
+--   刻意不用 sync_all_columns：它會 DROP 欄，牴觸「staging 只做加法、刪欄留 legacy」（ADR-0025）。
+--   改型別/改分區/歷史回填仍走 --full-refresh / targeted refresh（見 docs/zh-TW/design/transformation.md §2 與 docs/zh-TW/runbooks/schema-change.md）。
 --
 -- ⚠️ 增量過濾的左邊界【必須對齊日界】（timestamp_trunc(..., day)）——這是正確性、不是風格：
 --   insert_overwrite 的原子單位是【整個分區】，而 dbt 只覆寫「查詢結果裡出現過的分區」。
@@ -92,7 +92,7 @@ deduped as (
     -- TODO(Proposal C)：欄位 rebuild_batch_id 落地後，插到 order by 最前：
     --   order by rebuild_batch_id desc nulls last, received_at desc, id desc
     -- late-arriving：Proposal C 修正列落在舊分區，例行增量的回看窗看不到；由修復 runbook
-    --   的 targeted refresh（insert_overwrite 災區分區 / --full-refresh）補上（CLOUD §7.4、DQ C-2 #7）。
+    --   的 targeted refresh（insert_overwrite 災區分區 / --full-refresh）補上（docs/zh-TW/design/cloud-layer.md §7、docs/zh-TW/design/data-quality.md §5〈Proposal C〉）。
     select
         *,
         row_number() over (

@@ -44,7 +44,7 @@ models:
       +materialized: table
     reports:
       # rpt_ 與 marts 平行而非巢狀在其下：dbt 官方慣例會把 rpt_ 放進 marts，
-      # 但 README.zh-TW §3 的分層表已把「報表」列為獨立一層；且兩張品質報表的上游是
+      # 但 docs/zh-TW/design/transformation.md §1 的分層表已把「報表」列為獨立一層；且兩張品質報表的上游是
       # int_/stg_ 而非 marts（quarantine 的列照定義永遠不會出現在 Gold），
       # 塞進 marts 反而語意錯。
       #
@@ -54,7 +54,7 @@ models:
       +materialized: table
 
 vars:
-  # 星狀模型的 unknown member 鍵（決策 G）。事實表不留 NULL FK：INNER JOIN 會靜默
+  # 星狀模型的 unknown member 鍵（見 docs/zh-TW/design/transformation.md §4〈鍵的處理〉）。事實表不留 NULL FK：INNER JOIN 會靜默
   # 掉列、LEFT JOIN 讓 BI 顯示空白。動的是【鍵】不是【度量】，且可完整反查回
   # 「這筆沒有識別」，是無損的——不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律。
   unknown_member_key: '__UNKNOWN__'

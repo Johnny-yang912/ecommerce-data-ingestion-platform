@@ -3,23 +3,23 @@
 -- 沒有獨立的顧客主檔——顧客屬性是隨每筆訂單帶進來的，所以維度必須從 int_orders 反推。
 -- 這帶出兩個決定：
 --
--- 1. SCD1 而非 SCD2（README.zh-TW §6.3 決策 E）：同一個 customer_id 的 membership_tier
+-- 1. SCD1 而非 SCD2（ADR-0048）：同一個 customer_id 的 membership_tier
 --    會隨升等改變，SCD1 會讓歷史訂單被貼上「現在的」等級。補救不是引入 dbt snapshot，
 --    而是【由事實表承載當下快照】——fct_orders.membership_tier_at_order 記錄下單當時的
 --    等級。訂單裡帶的顧客屬性本來就是下單當下的快照，用事實表承載它等於免費拿到
 --    type-2 的效果。於是兩種問題都答得了：
 --      「白金會員【現在】的總消費」→ join dim_customer.membership_tier
 --      「下單【當時】是白金的訂單」→ 直接讀 fct_orders.membership_tier_at_order
---    SCD2 是備妥但未啟用的設計，觸發點＝啟用帳單（見 README.zh-TW §6.3）。
+--    SCD2 是備妥但未啟用的設計，觸發點＝啟用帳單（見 ADR-0048）。
 --
--- 2. unknown member（決策 G）：customer_id 在 ODS 是 nullable。星狀模型不該讓事實表
+-- 2. unknown member（docs/zh-TW/design/transformation.md §4〈鍵的處理〉）：customer_id 在 ODS 是 nullable。星狀模型不該讓事實表
 --    帶 NULL FK——INNER JOIN 會靜默掉列、LEFT JOIN 讓 BI 顯示空白，兩種都不好。
 --    故維度補一筆 '__UNKNOWN__'，事實表 coalesce 到它。
 --    這【不】牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律：鐵律禁止的是在共享層對【度量】
 --    做有損 collapse（NULL→0 之後分不出「沒收集」與「真的是 0」）；這裡動的是【鍵】，
 --    且 '__UNKNOWN__' 可完整反查回「這筆沒有顧客識別」，是無損的。
 --
--- 刻意【不】分區（決策：見 README.zh-TW §6.2）：維度是按鍵 join 進來的，不是按日期
+-- 刻意【不】分區（見 docs/zh-TW/design/transformation.md §4〈分區〉）：維度是按鍵 join 進來的，不是按日期
 --   範圍掃的，分區欄位對 join 沒有裁切作用，只會換來一堆小分區與 metadata 開銷。
 --   改 cluster_by(customer_id)，對齊實際的 access pattern。
 

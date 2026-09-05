@@ -2,8 +2,8 @@
 -- 互斥（不重複）+ 窮盡（不遺漏），每個 raw_id 必須恰好出現一次。
 --
 -- 為什麼這支測試是必要的：兩個模型各自持有一份逐字相同的共用區塊（刻意的複製，
--- 見 README.zh-TW §5.1），互補性靠紀律而非機制保證。這支測試是唯一的自動化安全網，
--- 它守的具體破口有三個（README.zh-TW §5.2 對齊清單）：
+-- 見 ADR-0045），互補性靠紀律而非機制保證。這支測試是唯一的自動化安全網，
+-- 它守的具體破口有三個（docs/zh-TW/design/transformation.md §3〈對齊清單〉）：
 --   #2 漏了 coalesce → 無事件的髒列 is_effectively_clean 為 NULL，
 --      `where flag` 與 `where not flag` 都不成立 → 該列從【兩張表同時消失】
 --   #3 誤把 LEFT JOIN 寫成 INNER → 所有無品質事件的列整批消失

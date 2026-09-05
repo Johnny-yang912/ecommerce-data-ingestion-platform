@@ -4,7 +4,7 @@
 -- ⚠️ 【不得】join 兩表後同時聚合兩邊的度量——header 的訂單總額會被 line 的列數放大
 --    （重複計算）。要 item 明細就查 fct_order_items，要訂單總額就查本表，不要混。
 --
--- 度量分配（決策 A，方案 C）：訂單總額 rollup 進本表，並以
+-- 度量分配（ADR-0047）：訂單總額 rollup 進本表，並以
 --   tests/assert_fct_orders_rollup_matches_items.sql 逐單斷言與 fct_order_items 一致。
 --   理由與 int_ 層「刻意複製 + assert_orders_split_is_partition 買回風險」同構：
 --   用一支測試把「兩處數字可能不一致」從紀律保證升級成機制保證，換來單表可查詢。
@@ -38,7 +38,7 @@
 --   改名要同步動 rollup 測試、rpt_ 層與 Looker 既有報表，換到的只有命名整潔；
 --   歧義改用文件補（見 _marts__models.yml 該欄描述）。
 --
--- 分區（決策：見 README.zh-TW §6.2）：按 order_date(DAY)，因為 Gold 服務分析師，
+-- 分區（見 docs/zh-TW/design/transformation.md §4〈分區〉）：按 order_date(DAY)，因為 Gold 服務分析師，
 --   最常、最貴的查詢是按業務時間過濾（docs/zh-TW/design/cloud-layer.md）。
 --   實測（2026-08，540 筆）：cluster_by 單獨已裁掉 82% 掃描量，分區再往下拿 9pp——
 --   分區的主要價值不在裁切量，而在【成本可預測】（分區裁切由 metadata 在查詢前決定，
@@ -55,7 +55,7 @@
 --   1825 天（5 年）是為了避開單表 4000 分區上限——DAY 粒度約 11 年就撞頂，
 --   而 Gold 與 staging 不同，是要留全歷史的。超過 5 年的需求改 MONTH 粒度（需重建表）。
 --
--- 物化＝table 全量重建，刻意【不】增量：理由同 int_ 層（README.zh-TW §5.4）且更強——
+-- 物化＝table 全量重建，刻意【不】增量：理由同 int_ 層（ADR-0046）且更強——
 --   Gold 的分區軸是 order_date（業務時間），與「資料何時變動」完全脫鉤。一筆 2024 年的
 --   訂單今天被 Proposal B promote，任何按 order_date 的回看窗都永遠看不到它。
 
@@ -102,15 +102,16 @@ select
     o.order_id,                              -- 自然鍵兼退化維度（ODS UNIQUE）
     o.order_date,                            -- 分區欄位
 
-    -- ── 維度 FK（決策 F：natural key 直連，BQ 無 index，surrogate key 不帶收益）──
-    -- coalesce 到 unknown member（決策 G）：事實表不留 NULL FK。
+    -- ── 維度 FK：natural key 直連，BQ 無 index，surrogate key 不帶收益 ───────────
+    -- coalesce 到 unknown member（見 docs/zh-TW/design/transformation.md §4〈鍵的處理〉）：
+    -- 事實表不留 NULL FK。
     coalesce(o.customer_id, '{{ var("unknown_member_key", "__UNKNOWN__") }}') as customer_id,
 
-    -- ── 下單當下的顧客快照（決策 E：由事實表承載 SCD2 的效果）───────────────
+    -- ── 下單當下的顧客快照（ADR-0048：由事實表承載 SCD2 的效果）─────────────
     -- dim_customer.membership_tier 是【現在】的等級；這裡是【下單當時】的。
     o.membership_tier as membership_tier_at_order,
 
-    -- ── 退化維度（決策 C：無獨立主檔者不抽維度表，直接留在事實表）───────────
+    -- ── 退化維度（ADR-0048：無獨立主檔者不抽維度表，直接留在事實表）─────────
     o.order_status,
     o.ship_mode,
     o.payment_method,
@@ -127,7 +128,7 @@ select
     -- ── 訂單層度量（不可從 item 加總得出者）─────────────────────────────────
     -- tax_pct 是【比率】，非可加度量：不要對它做 SUM。
     -- 刻意不算 tax_amount——稅基是 net 還是 net+shipping 尚無業務定義，
-    -- 憑空假設會讓一個錯誤的數字看起來像事實（見 README.zh-TW §6.5 待定義規則）。
+    -- 憑空假設會讓一個錯誤的數字看起來像事實（見 docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉）。
     o.tax_pct,
     o.delivery_days,
     o.customer_rating,

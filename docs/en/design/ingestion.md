@@ -164,7 +164,7 @@ So what it holds up is more than a join: `force=true` replay needs it to know wh
 
 > `raw.order_id` can be NULL — a payload that never parsed has no business identity at all, yet it still has `raw.id`, and it still has to be claimed, processed, and counted. **Business identity is a property of the data; physical identity is a property of the event — and the ingestion layer records events.**
 
-Physical dedup uses physical identity, which is why `stg_orders` partitions its window function on `raw_id` and not on `order_id` ([ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)).
+Physical dedup uses physical identity, which is why `stg_orders` partitions its window function on `raw_id` and not on `order_id` ([Transformation design §2](./transformation.md)).
 
 > ⚠️ **`raw_id`'s uniqueness holds only within a single landing instance.** Two ODS instances both start their sequences at 1, and extracting both into one staging table makes `stg_`'s dedup collapse unrelated orders into "copies" of each other — silently. See [verification/2026-08-raw-id-collision-two-ods](../verification/2026-08-raw-id-collision-two-ods.md).
 

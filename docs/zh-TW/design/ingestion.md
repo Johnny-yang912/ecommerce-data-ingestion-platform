@@ -164,7 +164,7 @@ First-write-wins，執行兩層：預檢以避免白做工，`IntegrityError` �
 
 > `raw.order_id` 可以是 NULL——沒解析成功的 payload 根本沒有業務身分，但它仍然有 `raw.id`，仍然要被搶佔、被處理、被計數。**業務身分是資料的屬性；物理身分是事件的屬性——而攝入層記的是事件。**
 
-**物理去重要用物理身分**，那正是 `stg_orders` 的 window function 以 `raw_id` 而非 `order_id` 分組的原因（[ADR-0044](../adr/0044-copy-partitions-sandbox-dml.md)）。
+**物理去重要用物理身分**，那正是 `stg_orders` 的 window function 以 `raw_id` 而非 `order_id` 分組的原因（[轉換層設計 §2](./transformation.md)）。
 
 > ⚠️ **`raw_id` 的唯一性只在單一落地實例之內成立。** 兩個 ODS 實例的序列都從 1 開始，把兩者抽進同一張 staging 表，`stg_` 的去重就會把毫無關係的訂單摺疊成彼此的「副本」——而且是靜默的。見 [verification/2026-08-raw-id-collision-two-ods](../verification/2026-08-raw-id-collision-two-ods.md)。
 

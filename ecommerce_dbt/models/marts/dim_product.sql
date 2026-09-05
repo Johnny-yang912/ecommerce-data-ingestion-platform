@@ -3,7 +3,7 @@
 -- 與 dim_customer 同構：沒有商品主檔，屬性隨每筆訂單品項帶進來，故從 int_order_items
 -- 反推。決勝鍵取最新（order_date desc, item_index desc）。
 --
--- ⚠️ 這裡有一個【資料本身的】問題，決策 D 選擇「標記而非阻擋」：
+-- ⚠️ 這裡有一個【資料本身的】問題，ADR-0048 選擇「標記而非阻擋」：
 --   同一個 product_id 可能在不同訂單帶著不同的 product_name / category / brand
 --   （2026-08 實測：342 個 product_id 中 163 個衝突，根因是 load_test.py 對 product_id
 --     與其屬性各抽一次獨立亂數；已修正，見該檔 make_product()）。

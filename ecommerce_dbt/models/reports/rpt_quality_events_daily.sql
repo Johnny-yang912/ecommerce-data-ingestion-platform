@@ -31,7 +31,7 @@
 --      在這裡不存在。值域真的擴張時，assert_rpt_quality_events_split 會先紅給你看。
 --
 -- ⚠️ 現況：Proposal B（Airflow 重評估）尚未實作，quality_events 目前只有攝入時的
---   initial_evaluation 事件（docs/zh-TW/design/data-quality.md §「Proposal B 尚未實作」）。
+--   initial_evaluation 事件（docs/zh-TW/design/data-quality.md §5〈Proposal B：事件驅動的再評估〉）。
 --   → promotions / rejections / re_quarantines 目前【恆為 0】。
 --   欄位先留著是對的（事件產生端一上線就有值，不需改 schema），
 --   但 BI 上先不要放一張永遠空白的「回流趨勢」圖。
@@ -83,7 +83,7 @@ with events as (
     {% endif %}
     {% endif %}
     -- 全量路徑（首建 / --full-refresh）不加哨兵：stg_quality_events 本身不設
-    -- require_partition_filter（保險絲被 stg_ 層擋掉了，見 ecommerce_dbt/README.zh-TW §4.6）。
+    -- require_partition_filter（保險絲被 stg_ 層擋掉了，見 docs/zh-TW/design/transformation.md §2、ADR-0021）。
 
 )
 

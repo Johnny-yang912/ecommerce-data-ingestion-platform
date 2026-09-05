@@ -1,7 +1,7 @@
 -- fct_order_items：訂單品項粒度事實表（一列 = 一個訂單的一個品項）
 --
 -- grain = (order_id, item_index)。刻意用 order_id 而非上游 int_order_items 的 raw_id：
---   Gold 面向分析師，README〈raw_id 是物理身分、order_id 是業務身分〉——分析師不需要
+--   Gold 面向分析師，docs/zh-TW/design/ingestion.md〈raw_id 是物理身分；order_id 是業務身分〉——分析師不需要
 --   知道 raw_id 是什麼。兩者在 ODS 皆為 UNIQUE、1:1，改用 order_id 不損失唯一性。
 --   raw_id 仍保留為血緣欄位（供追溯回 ODS/Raw），但【不】是鍵。
 --   上游那支代理鍵已改名為 int_order_item_key 並停在 int_ 層，避免同名不同值。
@@ -11,7 +11,7 @@
 --   不該被迫掃兩張表。BQ 是列式儲存，多帶幾個低基數欄位的成本接近零，
 --   換來的是消費端少一次 join、以及本表能與 fct_orders 用同一組分區裁切。
 --
--- product_name 刻意【重複】保留一份 line 級快照（決策 D 第 2 層）：
+-- product_name 刻意【重複】保留一份 line 級快照（ADR-0048 三層處置的第 2 層）：
 --   dim_product 是 SCD1，衝突時只挑得到一個屬性版本；這裡留的是【那筆訂單當下】
 --   實際收到的商品名，真值不遺失、可與維度對照。與 fct_orders 保留
 --   membership_tier_at_order 是同一個手法：讓事實表承載「當時」，維度承載「現在」。
@@ -42,7 +42,8 @@ select
     i.item_index,
     i.order_date,                                -- 分區欄位（承自訂單）
 
-    -- ── 維度 FK（決策 F/G：natural key + unknown member）─────────────────────
+    -- ── 維度 FK：natural key + unknown member ────────────────────────────────────
+    -- 見 docs/zh-TW/design/transformation.md §4〈鍵的處理〉。
     coalesce(i.product_id, '{{ var("unknown_member_key", "__UNKNOWN__") }}')  as product_id,
     coalesce(o.customer_id, '{{ var("unknown_member_key", "__UNKNOWN__") }}') as customer_id,
 

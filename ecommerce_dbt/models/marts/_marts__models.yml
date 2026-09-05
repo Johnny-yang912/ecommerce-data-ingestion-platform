@@ -22,7 +22,7 @@ models:
       不分區：維度按鍵 join，非按日期掃，分區對 join 無裁切作用。
     columns:
       - name: customer_id
-        description: 顧客自然鍵，兼維度鍵（決策 F：natural key 直連）。含 '__UNKNOWN__' 成員。
+        description: 顧客自然鍵，兼維度鍵（natural key 直連，見 docs/zh-TW/design/transformation.md §4〈鍵的處理〉）。含 '__UNKNOWN__' 成員。
         tests:
           - not_null
           - unique
@@ -66,7 +66,7 @@ models:
           業務日期，分區欄位。可為 NULL（ODS 允許）——NULL 落 BQ 的 __NULL__ 分區，
           該分區算不出過期時間故不受保留政策回收，壽命與其他列不同。
       - name: customer_id
-        description: 顧客維度 FK；NULL 已 coalesce 為 '__UNKNOWN__'（決策 G）。
+        description: 顧客維度 FK；NULL 已 coalesce 為 '__UNKNOWN__'（unknown member，見 docs/zh-TW/design/transformation.md §4〈鍵的處理〉）。
         tests:
           - not_null
           - relationships:
@@ -74,7 +74,7 @@ models:
                 to: ref('dim_customer')
                 field: customer_id
       - name: membership_tier_at_order
-        description: 下單【當時】的會員等級（決策 E：事實表承載 SCD2 效果）。與 dim_customer.membership_tier 可能不同，那是刻意的。
+        description: 下單【當時】的會員等級（ADR-0048：事實表承載 SCD2 效果）。與 dim_customer.membership_tier 可能不同，那是刻意的。
       - name: item_count
         description: 品項數。0＝該訂單沒有任何品項（以值表達，非以缺席表達）。
         tests:

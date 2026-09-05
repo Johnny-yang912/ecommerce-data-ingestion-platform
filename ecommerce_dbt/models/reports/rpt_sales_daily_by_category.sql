@@ -5,7 +5,7 @@
 --   2. 不重做 Gold 已經做過的語意決定（unknown member、item_count=0 的 LEFT JOIN…）；
 --   3. 繞過 fct_ 會讓既有測試失效：assert_fct_orders_rollup_matches_items 保的是
 --      fct_orders 的 rollup，rpt_ 若自己從 int_ 重算，那支測試完全不覆蓋它；
---   4. ⭐ 會推翻 int_ 層的架構前提——README.zh-TW §5.5「int_ 只被 DAG 內部消費
+--   4. ⭐ 會推翻 int_ 層的架構前提——ADR-0049「int_ 只被 DAG 內部消費
 --      （非分析師 ad-hoc）」是 int_ 不分區的【唯一】理由。rpt_ 讀 int_ 等於把 int_
 --      從內部建材升格成對外契約，那個分區決策就得重審，且 int_ 從此改不動。
 --
@@ -20,7 +20,7 @@
 --   不聚合它的任何度量。這個區別要說清楚，否則下一個人會以為註解自相矛盾。
 --
 -- ⭐ is_returned 進 grain，而不是輸出 net_amount / net_amount_excl_returned 兩組度量：
---   README.zh-TW §6.6 明載「淨營收要不要扣退貨尚無業務定義，returned 留在事實表當 flag、
+--   docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉 明載「淨營收要不要扣退貨尚無業務定義，returned 留在事實表當 flag、
 --   【由下游決定】」——rpt_ 就是那個下游。進 grain 等於把選擇權完整交給 BI
 --   （要含就全加、要扣就篩 is_returned = false）；輸出兩組度量等於我們替業務
 --   挑了兩個它可能都不要的定義，把一個未定義的規則偷偷固化成事實。
@@ -28,7 +28,7 @@
 -- ⭐ 不輸出任何比率欄位（AOV、毛利率、退貨率…）：理由同 rpt_quality_events_daily 檔頭——
 --   BI roll up 到週會變成「比率的平均」而非「總和的比率」。分子分母都在這裡，BI 現算即可。
 --
--- 物化＝table 全量重建（理由同 fct_，README.zh-TW §6.2：分區軸是 order_date＝業務時間，
+-- 物化＝table 全量重建（理由同 fct_，docs/zh-TW/design/transformation.md §4：分區軸是 order_date＝業務時間，
 --   與「資料何時變動」完全脫鉤，被 promote 的舊訂單任何回看窗都看不到）。
 --   ⭐ 但【現在就掛 order_date 分區】，即使目前不增量——分區欄位現在加是免費的，
 --   事後補要重建表。切增量的路徑見下方 TODO。
@@ -50,7 +50,7 @@
 --   路徑是「日 incremental + order_date 回看窗 ＋ 排程每週一次 --full-refresh」，
 --   不是自己寫受影響分區 discovery——後者會讓一張【純業務報表】被迫依賴 quality_events
 --   當變更偵測器（為了非語意的理由建立耦合），而且在 Proposal B 大規模回流那天
---   會退化成比全量還貴（README.zh-TW §5.4 第 2 點）。
+--   會退化成比全量還貴（ADR-0046）。
 --   代價是可寫進文件的一句話：追溯性修正在本報表的可見延遲 ≤ 7 天。
 --   ⚠️ 切增量與補逐格對帳測試是同一件事的兩半，不得只做前者（見 _reports__models.yml）。
 
@@ -61,12 +61,12 @@ with items as (
 
         -- dim_product 的 unknown member 屬性一律 NULL（見該檔），故 category 可能為 NULL；
         -- 補 '__UNKNOWN__' 讓 BI 不顯示空白分類。動的是【維度值】不是度量，可完整反查，
-        -- 無損（同 README.zh-TW §6.5 對鍵的論證），不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律。
+        -- 無損（同 docs/zh-TW/design/transformation.md §4〈鍵的處理〉 的論證），不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律。
         coalesce(p.category, '{{ var("unknown_member_key", "__UNKNOWN__") }}') as category,
 
         -- ⚠️ ODS.returned 是 nullable（models.py:42）→ 本欄可能為 NULL，
         --    且刻意【不】coalesce 成 false：NULL＝「退貨狀態未知」，不是「沒退貨」，
-        --    壓成 false 就是 §5.5.5 鐵律禁止的有損單向 collapse。
+        --    壓成 false 就是 docs/zh-TW/design/cloud-layer.md〈NULL 的處理該住在哪一層〉鐵律禁止的有損單向 collapse。
         --    代價是 grain 裡有一個可為 NULL 的欄位，故 yml 對它【不】掛 not_null。
         o.returned as is_returned,
 
@@ -104,7 +104,7 @@ select
     -- 【觸發點】需要跨維度正確彙總 distinct 時，改存 BQ 原生 HLL sketch
     --   （HLL_COUNT.INIT → BYTES，上層用 HLL_COUNT.MERGE 合併，誤差 ~1%）。
     --   現在不做的原因不是麻煩，是 Looker Studio 的計算欄位呼叫不了 HLL_COUNT.MERGE，
-    --   得再包一層 view——那個摩擦點目前不存在（同 §5.3「設計寫下來，觸發點到了才實作」）。
+    --   得再包一層 view——那個摩擦點目前不存在（同 ADR-0045「設計寫下來，觸發點到了才實作」）。
     count(distinct order_id)    as orders,
     -- ⚠️ 額外注意：fct_ 的 customer_id 已 coalesce 到 '__UNKNOWN__'，
     --    所有無識別的顧客會塌成【一個】顧客。這是 unknown member 的必然代價，不是 bug。

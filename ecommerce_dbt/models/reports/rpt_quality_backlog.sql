@@ -11,7 +11,7 @@
 --   本表直接讀 int_orders_quarantine 的當下內容，不受事件保留期影響。
 --
 -- 物化＝table 全量重建，且【天生不可增量】：這是狀態快照，任何一筆舊訂單被 promote
---   就會從本表消失。與 int_orders_quarantine 同構的理由（ecommerce_dbt/README.zh-TW §5.4）：
+--   就會從本表消失。與 int_orders_quarantine 同構的理由（ADR-0046）：
 --   增量失誤在這裡不是延遲、是【永久錯誤】——幽靈列留在 backlog 裡，不報錯、不自癒。
 --   也因此刻意【不】分區：分區的價值在分區級增量替換，而本層永遠不會增量。
 --
@@ -22,9 +22,9 @@
 --
 -- ⚠️ 目前【沒有】金額曝險度量（「被卡住的訂單值多少錢」），這是本報表最有業務說服力
 --   但現在算不出來的東西：int_order_items 的來源是 int_orders（已過濾的乾淨路徑），
---   quarantine 的 items 從來沒有被攤平過（ecommerce_dbt/README.zh-TW §5.7 明載
+--   quarantine 的 items 從來沒有被攤平過（docs/zh-TW/design/transformation.md §3 明載
 --   「要做 item 層 RCA 時另建讀 quarantine 的模型」）。
---   刻意不用其他欄位湊一個金額——那是 §6.6 說的「憑空假設會讓一個錯誤的數字看起來像事實」。
+--   刻意不用其他欄位湊一個金額——那是 docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉 說的「憑空假設會讓一個錯誤的數字看起來像事實」。
 --   【觸發點】：需要 int_order_items_quarantine，啟用時機＝品質報表需要業務曝險金額。
 
 {{
@@ -40,27 +40,28 @@ with quarantined as (
         order_id,
 
         -- quarantined_at 在上游已正確取【事件時間】而非跑批時間
-        -- （ecommerce_dbt/README.zh-TW §5.6：coalesce(quality_state_at, received_at)），
+        -- （docs/zh-TW/design/transformation.md §3：coalesce(quality_state_at, received_at)），
         -- 所以這個日期在全量重建下是穩定的，可以拿來做老化分析。
         date(quarantined_at) as quarantined_date,
 
         -- ODS.dq_rule_version 是 nullable（models.py:88）→ 補 unknown member。
         -- 動的是【維度值】不是度量，且可完整反查回「這筆沒有版本標記」，是無損的，
-        -- 不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律（同 §6.5 對鍵的論證）。
+        -- 不牴觸 docs/zh-TW/design/cloud-layer.md 的 NULL 鐵律（同 docs/zh-TW/design/transformation.md §4〈鍵的處理〉 的論證）。
         -- 不補的話：NULL 在 grain 裡會讓 BI 顯示空白，且下游對帳測試的等值 join 會靜默漏掉。
         coalesce(dq_rule_version, '{{ var("unknown_member_key", "__UNKNOWN__") }}') as dq_rule_version,
 
         effective_quality_state,
 
         -- ⚠️ 陣列去重不可省：同一個 code 可能在一張訂單裡重複出現
-        --    （例如多個 item 各觸發一次 non_finite_number，見 README.zh-TW §5.3
-        --      「不可用 array_length(codes) = 1 判斷」那條）。
+        --    （例如多個 item 各觸發一次 non_finite_number），所以【不可】用
+        --      array_length(codes) = 1 判斷。相關設計見
+        --      docs/zh-TW/design/data-quality.md〈情境專用模型〉。
         --    不去重會讓 orders_with_code 把一張訂單算成多張。
         array(select distinct c from unnest(error_codes) as c) as error_codes,
 
         -- 主要碼＝排序後的第一個 code。
         -- ⚠️ 這【只是】為了確定性與加總配平，【不】代表嚴重性排序——
-        --    嚴重性優先級是業務定義，目前沒有，不憑空造（同 §6.6 的紀律）。
+        --    嚴重性優先級是業務定義，目前沒有，不憑空造（同 docs/zh-TW/design/transformation.md §4〈刻意未定義的業務規則〉 的紀律）。
         --    真的定義出優先級之後，改這一行即可，下游語意不變。
         (select c from unnest(error_codes) as c order by c limit 1) as primary_error_code
 

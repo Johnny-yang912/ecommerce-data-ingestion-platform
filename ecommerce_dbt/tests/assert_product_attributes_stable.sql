@@ -1,6 +1,6 @@
 {{ config(severity = 'warn') }}
 
--- 商品屬性穩定性監控（決策 D 第 3 層）
+-- 商品屬性穩定性監控（ADR-0048 三層處置的第 3 層）
 --
 -- 抓的是：同一個 product_id 在不同訂單品項上帶著不同的 product_name / category /
 -- brand / sub_category / product_condition。發生時 dim_product 的 SCD1 只挑得到一個

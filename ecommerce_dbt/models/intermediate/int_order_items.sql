@@ -94,7 +94,7 @@ typed as (
 select
     *,
 
-    -- 內部代理鍵：raw_id 是物理身分（README〈raw_id 是物理身分、order_id 是業務身分〉），
+    -- 內部代理鍵：raw_id 是物理身分（docs/zh-TW/design/ingestion.md〈raw_id 是物理身分；order_id 是業務身分〉），
     -- 配 item_index 即 item 粒度的唯一鍵。
     -- 刻意帶 int_ 前綴、【不】往 Gold 帶：fct_order_items 的 grain 宣告為
     -- (order_id, item_index)，代理鍵必須與宣告同基底，故在該層另造 order_item_key。

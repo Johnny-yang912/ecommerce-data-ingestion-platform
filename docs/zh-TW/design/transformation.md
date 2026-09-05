@@ -200,6 +200,16 @@ Sandbox 每月 1 TiB 的免費額度，在日批次下大約撐到 **1500–2000
 
 **分區**：`fct_*` 依 `order_date`（DAY）；`dim_*` 不分區——維度是靠鍵 join 觸及的，分區欄位在那裡剪不掉任何東西。
 
+### 鍵的處理
+
+**維度鍵用 natural key，不建 surrogate key。** `customer_id`／`product_id` 直接當維度的主鍵與事實表的 FK。BigQuery 沒有 index，surrogate key 換不到 join 效能，只會多一層間接與一次額外的鍵查找——**它解的是這裡不存在的問題**：維度鍵會變、要跨來源整合、要壓縮列寬。
+
+**`__UNKNOWN__` 成員承接 NULL FK。** `customer_id` 在 ODS 是 nullable，而星型結構不該讓事實表帶著 NULL FK——`INNER JOIN` 會**靜默掉列**，`LEFT JOIN` 讓 BI 顯示空白，兩種都不好。所以兩個維度各補一筆 `__UNKNOWN__`，事實表 `coalesce` 到它。`relationships` 測試也是靠這一點才守得住（[testing §6](./testing.md)）。
+
+⚠️ 這**不**牴觸 [cloud-layer](./cloud-layer.md) 的 NULL 鐵律。鐵律禁止的是在共享層對**度量**做有損 collapse——`NULL → 0` 之後就再也分不出「沒收集到」與「真的是 0」。這裡動的是**鍵**，而 `__UNKNOWN__` 可以完整反查回「這一筆沒有顧客識別」，**是無損的**。
+
+鍵值本身由 `var('unknown_member_key', '__UNKNOWN__')` 提供，`dim_`、`fct_`、`rpt_` 三層共用同一個 var——三處各自寫死字串，就是三處各自漂移的起點。
+
 ### 刻意未定義的業務規則
 
 有三件事在需求中未定義，而且**刻意不做假設**——與「不建投機性模型」是同一條原則：

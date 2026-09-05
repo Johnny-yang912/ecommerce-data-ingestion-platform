@@ -36,12 +36,28 @@ SCD1 stamps historical orders with the *current* attribute — a customer who wa
 fct_orders.membership_tier_at_order   ← the tier at the moment of the order
 ```
 
-**Customer attributes carried on an order are already a point-in-time snapshot.** Letting the fact table carry them gives **the type-2 effect with zero infrastructure**:
+**Customer attributes carried on an order are already a point-in-time snapshot.** Letting the fact table carry them gives **the type-2 effect with zero infrastructure**.
 
-| Question | Read |
-|---|---|
-| Total spend of customers who are *currently* platinum | `dim_customer.membership_tier` |
-| Orders placed *while* platinum | `fct_orders.membership_tier_at_order` |
+Walk one customer through it. Two orders in `int_orders` (the ODS is append-only, so both rows are permanent):
+
+| order_id | customer_id | order_date | membership_tier | net_amount |
+|---|---|---|---|---|
+| O-1001 | A | 2026-05-01 | standard | 1,000 |
+| O-2002 | A | 2026-09-01 | platinum | 3,000 |
+
+After the tiebreak, `dim_customer` holds **a single row for A** (platinum, sourced from O-2002); `fct_orders` keeps **both rows**, each carrying the tier at the moment it was placed. The same customer is simultaneously "is platinum" and "was standard at the time" — that is not a contradiction but two definitions, and **both numbers are correct**:
+
+| Question | Read | A's answer | Who wants it |
+|---|---|---|---|
+| Total spend of customers who are *currently* platinum | `dim_customer.membership_tier` | **4,000** | marketing, segmenting an audience |
+| Orders placed *while* platinum | `fct_orders.membership_tier_at_order` | **3,000** | finance, costing the tier's benefits |
+
+Dropping either side costs more than one column:
+
+- **Without `_at_order`** → the second question is silently answered 4,000. May's standard-tier spend lands on the platinum ledger, and **any "did the upgrade work" analysis fails at the root** — both sides of the comparison become the same numbers. Meanwhile `unique` and `not_null` stay green.
+- **Without `dim_customer`** → the first question has no answer. A carries two tiers in the fact table, so "which tier is A" is decided per query — **reimplementing the tiebreak at the query layer**.
+
+> What this design buys is not data — the data was always in the ODS. It buys **one answer to "what tier is A", stable across runs.**
 
 ## SCD2 is designed and deliberately not enabled
 
@@ -66,6 +82,8 @@ A dbt snapshot is a **stateful** table. Once the 60-day table expiry eats it, **
 **Full Kimball dimension set.** More textbook-conformant, and `dim_date` and `dim_geography` would exist to serve requirements nobody has stated — permanent maintenance for speculative benefit. Same principle as ADR-0027's stance on scenario models.
 
 **SCD2 from the start.** Would answer the temporal question through infrastructure rather than through a column already available — and would break on the sandbox.
+
+**Deriving `valid_from` / `valid_to` with `lead()` over `fct_orders`.** Stateless, DDL-only, and not eaten by expiry, so it escapes the objection to snapshots above — but the interval boundaries it derives are **observation times, not change times** (a customer may have upgraded in July while the system only sees the September order), and `fct_orders` already carries `(customer_id, order_date, membership_tier_at_order)`, so whoever asks can window over it once. **Building a table buys a single definition, not answerability** — which makes the trigger a question being asked repeatedly, and the answer then is an `rpt_`, not a dimension.
 
 **SCD1 with no tiebreak.** Non-deterministic dimension contents between runs, in a way no test would obviously catch.
 

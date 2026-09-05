@@ -106,7 +106,6 @@ The root is a flat module layout — 20 modules, **no import cycles** (the one c
 |---|---|
 | `scripts/seed_demo.py` | Generates BI demo order data through the real ingestion path |
 | `scripts/load_test.py` | Concurrent load test |
-| `scripts/restart_test.sh` | Behavior observation after `SIGKILL` |
 | `scripts/export_openapi.py` | Generates `openapi.json` |
 
 ---

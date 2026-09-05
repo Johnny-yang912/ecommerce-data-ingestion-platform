@@ -139,7 +139,7 @@
 | Gold `order_date` 分區 60 天過期 | 較舊的列會從 Gold 靜默消失 | 已知並已量測；開通計費即可解除 |
 | 「該跑沒跑」未被監控 | 排程器停擺不會產生紅燈——`on_failure_callback` 需要一個真的執行過的 run | **這不是獨立的缺口**：它是 absent 告警與 Airflow→OTel 整合兩項皆暫緩的後果。傳輸接縫已就緒（`_deliver()`，離真實通道只差一個環境變數），缺的是**偵測器**。這是 [2026 年 8 月靜默停擺事故](./incidents/2026-08-silent-scheduling-stalls.md)的殘留盲點 |
 | 資料修復沒有自動稽核紀錄 | 「某個分區曾經被回填過」只存在於事故報告、CHANGELOG 與 git 歷史，三者都倚賴人記得寫 | **偵測不在此缺口內**——掉列由 `assert_stg_orders_matches_staging` 每晚自動比對。人工的只有補完之後的記錄，且已寫成 [dbt-ops runbook](./runbooks/dbt-ops.md) 的一個步驟。由 Airflow run 承擔稽核的做法暫緩，見 [PORTFOLIO_SCOPE #13](./PORTFOLIO_SCOPE.md) |
-| CI 不驗證 DB 層契約 | 綠燈不代表 CAS／去重／遷移已被驗證 | 手動腳本：`scripts/load_test.py`、`scripts/restart_test.sh`、`check_migration_drift.py` |
+| CI 不驗證 DB 層契約 | 綠燈不代表 CAS／去重／遷移已被驗證 | 手動腳本：`scripts/load_test.py`、`check_migration_drift.py`；崩潰恢復見 [verification/2026-08-10-celery-sigkill-recovery](./verification/2026-08-10-celery-sigkill-recovery.md) |
 
 ---
 

@@ -47,7 +47,7 @@ CI verifies **application logic and type contracts**. The **DB-layer contracts a
 |---|---|
 | CAS claim under real concurrency | `scripts/load_test.py --cas-test` |
 | `order_id` deduplication | `scripts/load_test.py --duplicate` |
-| Post-crash recovery | `scripts/restart_test.sh` (SIGKILL) |
+| Post-crash recovery | [verification/2026-08-10-celery-sigkill-recovery](../verification/2026-08-10-celery-sigkill-recovery.md) (`docker compose kill -s SIGKILL worker`) |
 | Alembic ↔ `models.py` drift | `check_migration_drift.py` |
 
 > ⚠️ **Do not read a green check as "everything is fine".** A passing CI run means there is no regression in the **logic layer**. It does **not** mean the dedup / CAS / migration contracts have been verified. When changing that logic, re-corroborate with the manual scripts.
@@ -80,10 +80,9 @@ A handful of tests exist to stop a future change from silently removing a guaran
 | Script | Verifies |
 |---|---|
 | `scripts/load_test.py` | throughput, CAS under real concurrency (`--cas-test`), dedup (`--duplicate`) |
-| `scripts/restart_test.sh` | `SIGKILL` mid-processing, then recovery of `pending` rows |
 | `check_migration_drift.py` | `alembic upgrade head` + `compare_metadata`; non-zero exit on drift |
 
-All three hit a real server and a real PostgreSQL. Their results are recorded in `docs/*/verification/` (stage 4).
+Both hit a real server and a real PostgreSQL. Their results are recorded in `docs/*/verification/` (stage 4).
 
 ---
 

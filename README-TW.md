@@ -105,7 +105,6 @@ dbt dim_*/fct_*  Kimball 星型結構  →  dbt rpt_*  固定粒度預先聚合
 |---|---|
 | `scripts/seed_demo.py` | 產生 BI 展示用的訂單資料，走真實攝入路徑 |
 | `scripts/load_test.py` | 併發壓測 |
-| `scripts/restart_test.sh` | `SIGKILL` 後的行為觀察 |
 | `scripts/export_openapi.py` | 產生 `openapi.json` |
 
 ---

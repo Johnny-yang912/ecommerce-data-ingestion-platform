@@ -47,7 +47,7 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 |---|---|
 | 真實併發下的 CAS 認領 | `scripts/load_test.py --cas-test` |
 | `order_id` 去重 | `scripts/load_test.py --duplicate` |
-| 崩潰後恢復 | `scripts/restart_test.sh`（SIGKILL） |
+| 崩潰後恢復 | [verification/2026-08-10-celery-sigkill-recovery](../verification/2026-08-10-celery-sigkill-recovery.md)（`docker compose kill -s SIGKILL worker`） |
 | Alembic ↔ `models.py` 漂移 | `check_migration_drift.py` |
 
 > ⚠️ **不要把綠色勾勾讀成「一切都好」。** CI 通過代表**邏輯層**沒有回歸。它**不**代表去重／CAS／遷移契約已被驗證。改動那些邏輯時，要用手動腳本重新佐證。
@@ -80,10 +80,9 @@ CI 驗證的是**應用邏輯與型別契約**。**DB 層契約在它的範圍�
 | 腳本 | 驗證 |
 |---|---|
 | `scripts/load_test.py` | 吞吐量、真實併發下的 CAS（`--cas-test`）、去重（`--duplicate`） |
-| `scripts/restart_test.sh` | 處理中途 `SIGKILL`，然後恢復 `pending` 的列 |
 | `check_migration_drift.py` | `alembic upgrade head` + `compare_metadata`；漂移時以非零碼結束 |
 
-三者都打真實 server 與真實 PostgreSQL。它們的結果記錄在 `docs/*/verification/`（第 4 階段）。
+兩者都打真實 server 與真實 PostgreSQL。它們的結果記錄在 `docs/*/verification/`（第 4 階段）。
 
 ---
 

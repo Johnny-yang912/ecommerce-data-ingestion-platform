@@ -33,7 +33,7 @@
 1. **兩個 image 並存**，`start_api` 以 `LT_IMAGE` 切換，其餘參數逐項對齊。
 2. **event loop 探針**：負載進行中持續打 `GET /health`（每 10ms 一次，共 12 秒），量它的延遲分佈。
    ⭐ `/health` 不碰資料庫、不掛認證、不掛限流——**它唯一需要的資源就是 event loop**。因此它的延遲就是「loop 被佔住多久」的直接量測，這是本文的核心證據。
-3. **吞吐**：`load_test.py` 各 1200 筆、併發 50，**三輪交替**（before→after→before→after…）。
+3. **吞吐**：`scripts/load_test.py` 各 1200 筆、併發 50，**三輪交替**（before→after→before→after…）。
 4. 測試 1／2／3 以原文件的方法原樣重跑。
 5. **故障注入**（測試 G）：`docker pause api-db-1` 讓資料庫行程凍結 8 秒。負載必須橫跨停頓窗口，否則量到的是一片安靜——停頓期間沒有請求在飛，就什麼都觀察不到。
 6. **持續負載**（測試 H）：重跑前先 `redis-cli -n 0 flushdb` 清掉 celery 佇列。殘留的訊息會讓上一輪的 `order_id` 再次抵達並走 `duplicate` 短路徑，而那條路徑比完整的 ODS 寫入便宜得多，會把消化速率量高。

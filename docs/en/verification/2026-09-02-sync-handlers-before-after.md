@@ -33,7 +33,7 @@ Code change: three endpoints switched to `def`, new async dependency `get_raw_bo
 1. **Both images kept side by side**; `start_api` selects with `LT_IMAGE`, every other parameter held equal.
 2. **Event-loop probe**: while load is running, poll `GET /health` (every 10ms for 12 seconds) and record its latency distribution.
    ⭐ `/health` touches no database, has no auth, and no rate limit — **the only resource it needs is the event loop**. Its latency is therefore a direct measurement of how long the loop is held, and it is this document's central evidence.
-3. **Throughput**: `load_test.py`, 1200 requests each at concurrency 50, **three alternating rounds** (before→after→before→after…).
+3. **Throughput**: `scripts/load_test.py`, 1200 requests each at concurrency 50, **three alternating rounds** (before→after→before→after…).
 4. Tests 1/2/3 re-run with the original document's method, unchanged.
 5. **Fault injection** (Test G): `docker pause api-db-1` freezes the database process for 8 seconds. The load must span the stall window, otherwise the measurement captures only silence — with no requests in flight during the stall, there is nothing to observe.
 6. **Sustained load** (Test H): `redis-cli -n 0 flushdb` clears the celery queue before the run. Leftover messages make the previous round's `order_id`s arrive again and take the `duplicate` short path, which is far cheaper than a full ODS write and inflates the measured drain rate.

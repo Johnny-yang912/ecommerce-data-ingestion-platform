@@ -1,5 +1,5 @@
 #!/bin/bash
-# restart_test.sh
+# scripts/restart_test.sh
 # 測試 server 重啟後 pending 記錄是否會卡住（無 recovery 機制）
 #
 # 流程：
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_SERVER1="/tmp/uvicorn_before_crash.log"
 LOG_SERVER2="/tmp/uvicorn_after_restart.log"
 LOG_LOAD="/tmp/load_test_restart.log"
@@ -48,7 +48,7 @@ echo "  server 就緒"
 # ── Step 2: 送出 500 筆訂單（背景執行）────────────────────────────────────────
 echo ""
 echo "▶ 送出 500 筆訂單（背景執行中）..."
-python load_test.py --n 500 --concurrency 50 > "$LOG_LOAD" 2>&1 &
+python scripts/load_test.py --n 500 --concurrency 50 > "$LOG_LOAD" 2>&1 &
 LOAD_PID=$!
 
 # ── Step 3: 等 2 秒 ───────────────────────────────────────────────────────────

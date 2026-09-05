@@ -10,7 +10,7 @@ Concurrency behaviour and failure modes of the ingestion path: **does the CAS cl
 
 ## Environment
 
-`load_test.py` against a real server and real PostgreSQL. SQLAlchemy pool defaults: `pool_size=5`, `max_overflow=10` → 15 concurrent connections, `pool_timeout=30s`.
+`scripts/load_test.py` against a real server and real PostgreSQL. SQLAlchemy pool defaults: `pool_size=5`, `max_overflow=10` → 15 concurrent connections, `pool_timeout=30s`.
 
 ## Observed
 

@@ -81,7 +81,7 @@ with DAG(
     BashOperator(
         task_id="seed_dirty_batch",
         bash_command=(
-            f"{PY_ANALYTICS} {PROJECT_DIR}/seed_demo.py"
+            f"{PY_ANALYTICS} {PROJECT_DIR}/scripts/seed_demo.py"
             ' --url "$SEED_API_URL"'
             " --n {{ params.n }}"
             " --dirty-rate {{ params.dirty_rate }}"

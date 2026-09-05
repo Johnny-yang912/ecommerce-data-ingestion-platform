@@ -217,7 +217,7 @@ models:
           本 counter 是它唯一會現形的地方——2026-08-11 實測 dev 有 399/6919 個品項屬此類
           （5.8%），而同期的 items_missing_amount 為 0，對它們的偵測率仍是 0%。
           （舊記錄 207/631 量測於 2026-08-11 資料集重建前，口徑不可直接比較。）
-          資料來源可重現：seed_demo.py 的 --missing-cost-rate（per item 抽樣，
+          資料來源可重現：scripts/seed_demo.py 的 --missing-cost-rate（per item 抽樣，
           故產得出「同一張訂單部分品項缺成本」這種讓 SUM 靜默少算的切片）。
       - name: items_missing_shipping
         description: >

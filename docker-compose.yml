@@ -10,7 +10,7 @@ x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
   OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev
   # 取樣率。現在是 seed_demo 每天 800 筆，全量送遠低於免費額度（50GB traces）。
-  # ⚠️ 跑 load_test.py 之前務必先調低 ARG——那支腳本的量級與日常流量差好幾個數量級，
+  # ⚠️ 跑 scripts/load_test.py 之前務必先調低 ARG——那支腳本的量級與日常流量差好幾個數量級，
   #    一次壓測就可能吃掉可觀的額度，而超額不會有錯誤訊息。
   OTEL_TRACES_SAMPLER: parentbased_traceidratio
   OTEL_TRACES_SAMPLER_ARG: "1.0"

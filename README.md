@@ -57,6 +57,60 @@ Full walkthrough: **[ARCHITECTURE](./docs/en/ARCHITECTURE.md)**
 
 ---
 
+## Source map
+
+The root is a flat module layout — 20 modules, **no import cycles** (the one cycle,
+`celery_app` ↔ `tasks`, is deliberately broken by a lazy import; see the header of
+`celery_app.py`). They fall into five responsibilities:
+
+**Entry points**
+
+| File | Responsibility |
+|---|---|
+| `main.py` | FastAPI app: the `POST /orders` ingestion endpoint, rate limiting, dispatch circuit breaker |
+| `celery_app.py` | Celery app and Beat schedule — the target of `celery -A celery_app` |
+| `tasks.py` | Task definitions. Task names are **explicit**, not derived from the module path |
+
+**Processing pipeline**
+
+| File | Responsibility |
+|---|---|
+| `process.py` | The Raw → ODS core: CAS claim, flattening, cleaning, idempotent write, recovery scan |
+| `clean.py` | Format normalization and business-rule validation; home of `DQ_RULE_VERSION` |
+| `schema.py` | Pydantic models — one definition shared by the API contract and ODS flattening |
+| `models.py` | SQLAlchemy ORM: `Raw` / `ODS` / `QualityEvent` |
+
+**Shared core** (parenthesized: how many modules depend on it)
+
+| File | Responsibility |
+|---|---|
+| `config.py` (12) | The single entry point for environment values |
+| `database.py` (9) | Engine and `SessionLocal` |
+| `telemetry.py` (4) | OTel instrumentation and metric definitions |
+| `circuit_breaker.py` · `logging_config.py` · `auth.py` · `api_responses.py` | Circuit breaker, logging, API-key verification, response models |
+| `recovery_policy.py` | Timeout constants. It exists separately to cut a dependency chain — a read-only probe needs the thresholds and should not be bound to the whole dependency tree of `process.py` ([2026-08 incident](./docs/en/incidents/2026-08-silent-scheduling-stalls.md)) |
+
+**Analytics and cloud** (run under the analytics venv, invoked by Airflow)
+
+| File | Responsibility |
+|---|---|
+| `extract_ods_to_bq.py` | Batch extraction, ODS → BigQuery staging |
+| `reevaluate_quality.py` | Proposal B: event-driven re-evaluation after a rule-version change |
+| `bq.py` | BigQuery client factory |
+| `check_raw_pending.py` | Read-only probe: is `pending` stuck? |
+| `check_migration_drift.py` | Drift check between ORM declarations and Alembic migrations |
+
+**Operational scripts** — `scripts/`
+
+| File | Responsibility |
+|---|---|
+| `scripts/seed_demo.py` | Generates BI demo order data through the real ingestion path |
+| `scripts/load_test.py` | Concurrent load test |
+| `scripts/restart_test.sh` | Behavior observation after `SIGKILL` |
+| `scripts/export_openapi.py` | Generates `openapi.json` |
+
+---
+
 ## Tech stack
 
 | Layer | Technology |

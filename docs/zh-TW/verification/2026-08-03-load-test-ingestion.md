@@ -10,7 +10,7 @@
 
 ## 環境
 
-`load_test.py` 打真實 server 與真實 PostgreSQL。SQLAlchemy 池預設：`pool_size=5`、`max_overflow=10` → 15 個併發連線，`pool_timeout=30s`。
+`scripts/load_test.py` 打真實 server 與真實 PostgreSQL。SQLAlchemy 池預設：`pool_size=5`、`max_overflow=10` → 15 個併發連線，`pool_timeout=30s`。
 
 ## 觀測
 

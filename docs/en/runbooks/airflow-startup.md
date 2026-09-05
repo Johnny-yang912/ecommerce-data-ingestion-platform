@@ -51,7 +51,7 @@ Containers talk over `db:5432` and never traverse this mapping — **it exists o
 
 ### An exported `DB_URL` silently beats `.env`
 
-Host-side tooling (`seed_demo.py --verify`, `psql`) must connect to `localhost:5433/orders`. `.env` already points there — but **`load_dotenv` defaults to `override=False`, so an environment variable in your shell wins.**
+Host-side tooling (`scripts/seed_demo.py --verify`, `psql`) must connect to `localhost:5433/orders`. `.env` already points there — but **`load_dotenv` defaults to `override=False`, so an environment variable in your shell wins.**
 
 If an older `DB_URL` is exported, the script quietly connects somewhere else and reports on the wrong database.
 

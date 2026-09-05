@@ -30,7 +30,7 @@
    下游的可見症狀是 ODS 不再成長，但**根因在派工**——本探針量的正是根因那一端，
    這也是它比「盯著 ODS 有沒有變多」更早、更明確的原因。
 
-   `seed_demo.py --require-landed-pct` 擋的是同一件事，但它**活在資料產生器裡**
+   `scripts/seed_demo.py --require-landed-pct` 擋的是同一件事，但它**活在資料產生器裡**
    ——真實系統的上游是別人的，不會有那個保護。本 DAG 是把它搬到平台側。
    量測與門檻推導見 `check_raw_pending.py` 檔頭。
 

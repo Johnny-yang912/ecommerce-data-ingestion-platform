@@ -217,8 +217,13 @@ class TestAnalyticsInterpreter:
         # 見 config.py）。這裡給一個語法合法的假值：create_engine 不連線，
         # 所以測 import 不需要真的有 DB——也不該有，那會讓這層變成整合測試。
         env.setdefault("DB_URL", "postgresql://smoke:smoke@localhost:5432/smoke")
+        # 腳本可能住在子目錄（scripts/）。Python 執行 `python <dir>/x.py` 時放進
+        # sys.path[0] 的是【腳本自己的目錄】，不是專案根——用相對路徑重現同一件事。
+        # 兩種直譯器來源的工作目錄都是專案根（本機 cwd=ROOT、容器 -w /opt/project），
+        # 所以相對路徑在兩邊都成立。
+        parent = Path(script).parent.as_posix()
         result = subprocess.run(
-            [*interpreter, "-c", f"import {module}"],
+            [*interpreter, "-c", f"import sys; sys.path.insert(0, {parent!r}); import {module}"],
             cwd=ROOT, env=env, capture_output=True, text=True, timeout=120,
         )
         assert result.returncode == 0, (

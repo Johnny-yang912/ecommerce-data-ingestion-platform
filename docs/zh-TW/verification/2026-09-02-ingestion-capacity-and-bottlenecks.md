@@ -32,7 +32,7 @@
 
 1. **隔離**：`docker compose stop api beat worker otel-collector` 加上整組 Airflow overlay，只保留 `db` / `redis`，消除鄰居噪音與連線競爭。
 2. **受測服務**：以 `docker run` 起 `api-api:latest`（8001 埠）與 `api-worker:latest`，全部參數由 `-e` 注入。每換一組參數就 `docker rm -f` 重起——環境變數的改變必須 recreate，`restart` 不會重讀。
-3. **負載**：吞吐量用既有的 `load_test.py`。另加兩支輔助腳本繞開〈測試 0〉的兩個量測陷阱：一支序列化探針（無訊號量、無 `gather`）、一支多行程注入器（`order_id` 平移避免撞號）。兩者都沿用 `load_test.make_payload`，資料形狀完全一致。
+3. **負載**：吞吐量用既有的 `scripts/load_test.py`。另加兩支輔助腳本繞開〈測試 0〉的兩個量測陷阱：一支序列化探針（無訊號量、無 `gather`）、一支多行程注入器（`order_id` 平移避免撞號）。兩者都沿用 `load_test.make_payload`，資料形狀完全一致。
 4. **Trace**：`OTEL_EXPORTER_OTLP_ENDPOINT` 指向本機 Jaeger 容器而非 compose 的 collector，全程不出網。span 由 Jaeger HTTP API 取出後，只計 server span 的**直接子 span**（避免與孫層重複計算），殘差 = server span − 直接子 span 總和。
 5. **Profile**：py-spy sidecar 容器以 `--pid=container:api-lt --cap-add SYS_PTRACE` 共享 PID namespace，`record -f raw --full-filenames` 錄 30 秒 on-CPU 樣本（不開 `--idle`，因為阻塞等待已由 span 量過）。
 6. **積壓觀測**：每 1–2 秒查一次 `raw` 的 `pending + processing` 與 `processed` 筆數；連線數則每 0.1 秒取樣 `pg_stat_activity`。
@@ -44,22 +44,22 @@
 
 **必須先講，因為它作廢了本次前兩組數字，也作廢了先前對延遲的認知。**
 
-#### 陷阱 1：`load_test.py` 報的不是延遲，是排隊
+#### 陷阱 1：`scripts/load_test.py` 報的不是延遲，是排隊
 
-`load_test.py:126` 的 `t0 = time.perf_counter()` 在 `async with sem` **之外**。`asyncio.gather` 一次建立全部 N 個 coroutine，每一筆的碼表都在 t≈0 起跑，然後才去排訊號量。它報的是**訊號量排隊 + 真實往返**。
+`scripts/load_test.py:126` 的 `t0 = time.perf_counter()` 在 `async with sem` **之外**。`asyncio.gather` 一次建立全部 N 個 coroutine，每一筆的碼表都在 t≈0 起跑，然後才去排訊號量。它報的是**訊號量排隊 + 真實往返**。
 
 決定性證據：C=1、n=200 時 p50 = 0.909s，而總耗時 1.76s——**p50 恰為總時長的一半**，那是「N 人依序排隊，中位數那人等了一半」的數學特徵，與伺服器無關。
 
 | 量法 | p50 |
 |---|---|
-| `load_test.py`，C=1，n=200 | **909 ms** |
+| `scripts/load_test.py`，C=1，n=200 | **909 ms** |
 | 序列化探針（無訊號量、無 gather），n=3500 | **8.34 ms** |
 
 差了 109 倍。
 
 #### 陷阱 2：單一客戶端行程在 ~150 RPS 就飽和
 
-`load_test.py` 每筆都要 `random.Random(i)` 重新播種、生一份巢狀 payload、編碼 JSON。單行程吃滿一顆核心。
+`scripts/load_test.py` 每筆都要 `random.Random(i)` 重新播種、生一份巢狀 payload、編碼 JSON。單行程吃滿一顆核心。
 
 | 客戶端配置 | 總 RPS |
 |---|---|

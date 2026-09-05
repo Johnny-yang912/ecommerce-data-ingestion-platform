@@ -68,7 +68,7 @@ x-airflow-common: &airflow-common
     BQ_PROJECT: ${BQ_PROJECT}
     BQ_DBT_DATASET: ${BQ_DBT_DATASET:-dbt_dev}
     # ── seeding（Phase 5+：持續攝入）─────────────────────────────────────────
-    # seed_demo.py 走真實的 POST /orders，所以 Airflow 需要一把 API 金鑰。
+    # scripts/seed_demo.py 走真實的 POST /orders，所以 Airflow 需要一把 API 金鑰。
     # 建議在 API_KEYS 另開一組 seeding 專用身分（例如 demo_seed_key:demo-seeder）：
     # 限流是 per client_id，demo 流量才不會吃掉上游真實流量的配額；附帶讓
     # ODS.source_client_id 能區分「demo 資料」與「真實上游」——這在 freshness

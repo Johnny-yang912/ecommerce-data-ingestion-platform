@@ -75,7 +75,7 @@ A dbt snapshot is a **stateful** table. Once the 60-day table expiry eats it, **
 
 **Wide fact tables**, which is the correct trade in a columnar store — unread columns cost nothing at query time.
 
-**`dim_product` attribute conflicts are flagged, not blocked** (ADR-0044's sibling decision): the same `product_id` can arrive with different names or categories on different orders. Measured 2026-08, **163 of 342** `product_id`s conflicted — root cause being that `load_test.py` drew `product_id` and its attributes from two independent random draws, since fixed. Flagging rather than blocking meant the generator bug was **visible in the data** rather than hidden behind a failed build.
+**`dim_product` attribute conflicts are flagged, not blocked** (ADR-0044's sibling decision): the same `product_id` can arrive with different names or categories on different orders. Measured 2026-08, **163 of 342** `product_id`s conflicted — root cause being that `scripts/load_test.py` drew `product_id` and its attributes from two independent random draws, since fixed. Flagging rather than blocking meant the generator bug was **visible in the data** rather than hidden behind a failed build.
 
 ## Alternatives considered
 

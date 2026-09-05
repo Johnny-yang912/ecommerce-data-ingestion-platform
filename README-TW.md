@@ -57,6 +57,59 @@ dbt dim_*/fct_*  Kimball 星型結構  →  dbt rpt_*  固定粒度預先聚合
 
 ---
 
+## 原始碼地圖
+
+根目錄是平坦的模組佈局——20 個模組、**無循環依賴**（唯一的環 `celery_app` ↔ `tasks`
+由 lazy import 刻意斷開，見 `celery_app.py` 檔頭）。它們分屬五個職責：
+
+**入口**
+
+| 檔案 | 職責 |
+|---|---|
+| `main.py` | FastAPI 應用：`POST /orders` 攝入端點、限流、分派斷路器 |
+| `celery_app.py` | Celery 應用與 Beat 排程——`celery -A celery_app` 的目標 |
+| `tasks.py` | 任務定義。任務名**顯式指定**，不隨模組路徑推導 |
+
+**處理管線**
+
+| 檔案 | 職責 |
+|---|---|
+| `process.py` | Raw → ODS 的核心：CAS 認領、攤平、清洗、冪等寫入、恢復掃描 |
+| `clean.py` | 格式正規化與業務規則驗證；`DQ_RULE_VERSION` 的所在 |
+| `schema.py` | Pydantic 模型——API 契約與 ODS 攤平共用同一份定義 |
+| `models.py` | SQLAlchemy ORM：`Raw` / `ODS` / `QualityEvent` |
+
+**共用核心**（括號內為依賴它的模組數）
+
+| 檔案 | 職責 |
+|---|---|
+| `config.py` (12) | 環境值的唯一入口 |
+| `database.py` (9) | Engine 與 `SessionLocal` |
+| `telemetry.py` (4) | OTel 儀表與指標定義 |
+| `circuit_breaker.py` · `logging_config.py` · `auth.py` · `api_responses.py` | 斷路器、日誌、API Key 驗證、回應模型 |
+| `recovery_policy.py` | 逾時常數。單獨存在是為了切斷依賴鏈——唯讀探針要讀門檻，不該因此被綁上 `process.py` 的整棵依賴樹（[2026-08 事故](./docs/zh-TW/incidents/2026-08-silent-scheduling-stalls.md)） |
+
+**分析與雲端**（走 analytics venv，由 Airflow 呼叫）
+
+| 檔案 | 職責 |
+|---|---|
+| `extract_ods_to_bq.py` | ODS → BigQuery staging 的批次抽取 |
+| `reevaluate_quality.py` | Proposal B：規則版本變更後的事件驅動再評估 |
+| `bq.py` | BigQuery client 工廠 |
+| `check_raw_pending.py` | 唯讀探針：`pending` 是否卡住 |
+| `check_migration_drift.py` | ORM 宣告與 Alembic 遷移的漂移檢查 |
+
+**維運腳本** — `scripts/`
+
+| 檔案 | 職責 |
+|---|---|
+| `scripts/seed_demo.py` | 產生 BI 展示用的訂單資料，走真實攝入路徑 |
+| `scripts/load_test.py` | 併發壓測 |
+| `scripts/restart_test.sh` | `SIGKILL` 後的行為觀察 |
+| `scripts/export_openapi.py` | 產生 `openapi.json` |
+
+---
+
 ## 技術棧
 
 | 層 | 技術 |

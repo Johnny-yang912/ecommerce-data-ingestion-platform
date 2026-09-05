@@ -1,6 +1,6 @@
 """
 負載測試：1000 筆不同訂單同時打 POST /orders
-用法：python load_test.py [--url URL] [--n N] [--concurrency C]
+用法：python scripts/load_test.py [--url URL] [--n N] [--concurrency C]
 """
 import asyncio
 import random

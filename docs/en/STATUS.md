@@ -139,7 +139,7 @@ The distinction that matters: **⛔ is "should not", ⏸ is "should but cannot",
 | Gold `order_date` partitions expire at 60 days | Older rows silently disappear from Gold | Known and measured; a billing upgrade removes it |
 | "Should have run, didn't" is uninstrumented | A stopped scheduler produces no red — `on_failure_callback` needs a run that actually happened | **Not an independent gap**: it is the consequence of absent alerting and the Airflow→OTel integration both being deferred. The delivery seam is ready (`_deliver()`, one env var from a real channel); what is missing is the *detector*. Residual blind spot from the [August 2026 stall incidents](./incidents/2026-08-silent-scheduling-stalls.md) |
 | Data repairs leave no automatic audit record | "This partition was once backfilled" exists only in incident reports, the CHANGELOG and git history — all three rely on a person remembering to write it | **Detection is not part of this gap** — row loss is compared nightly by `assert_stg_orders_matches_staging`. What is manual is only recording the repair afterwards, and that is written up as a step in the [dbt-ops runbook](./runbooks/dbt-ops.md). Letting Airflow runs carry the audit trail is deferred, see [PORTFOLIO_SCOPE #13](./PORTFOLIO_SCOPE.md) |
-| CI does not exercise DB-layer contracts | A green check does not mean CAS/dedup/migration are verified | Manual scripts: `load_test.py`, `restart_test.sh`, `check_migration_drift.py` |
+| CI does not exercise DB-layer contracts | A green check does not mean CAS/dedup/migration are verified | Manual scripts: `scripts/load_test.py`, `scripts/restart_test.sh`, `check_migration_drift.py` |
 
 ---
 

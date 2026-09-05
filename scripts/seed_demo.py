@@ -1,11 +1,11 @@
-"""seed_demo.py — 產生 BI 展示用的訂單資料，走真實攝入路徑。
+"""scripts/seed_demo.py — 產生 BI 展示用的訂單資料，走真實攝入路徑。
 
-與 load_test.py 的關係
+與 scripts/load_test.py 的關係
 ──────────────────────
 兩支腳本【目的不同、刻意不共用】：
 
-    load_test.py   壓吞吐：高併發、短時間、只關心 latency 與 status code 分佈
-    seed_demo.py   造資料：低速率、可重現、關心【落地後的資料長什麼樣】
+    scripts/load_test.py   壓吞吐：高併發、短時間、只關心 latency 與 status code 分佈
+    scripts/seed_demo.py   造資料：低速率、可重現、關心【落地後的資料長什麼樣】
 
 不 import load_test 的產生器，是因為兩者的取樣需求已經分岔——本檔要控制
 分類權重、日期分佈、以及刻意注入的髒資料比例，這些都是壓測不需要的。
@@ -103,7 +103,7 @@ def make_product(pid_num: int) -> dict:
     """商品屬性一律【由 product_id 決定】，不吃訂單的 rng。
 
     同一個 product_id 在不同訂單必須帶相同的 name/category/brand，否則
-    dim_product 無法以 product_id 為 grain（load_test.py 早期就踩過這個坑：
+    dim_product 無法以 product_id 為 grain（scripts/load_test.py 早期就踩過這個坑：
     342 個 product_id 裡 163 個屬性衝突）。用 product_id 當 seed 另開一個
     Random，就結構性地保證了這件事。
     """

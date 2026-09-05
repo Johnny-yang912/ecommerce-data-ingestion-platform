@@ -76,7 +76,7 @@
    ⚠️ 但要分清楚【攝入路徑】與【分析路徑】——兩者的驗證程度差很多：
 
      攝入路徑（API → Redis → worker → ODS）：**爆量行為已經量過**，而且是本專案
-     最紮實的一段實測。load_test.py 打 1000 筆 @ 併發 50；docs/zh-TW/design/queue.md 記錄了多行程
+     最紮實的一段實測。scripts/load_test.py 打 1000 筆 @ 併發 50；docs/zh-TW/design/queue.md 記錄了多行程
      限流（100 筆連送：共用計數器 60 通過 vs 行程記憶體 91 通過）、broker 停機下的
      降級延遲與熔斷（200 併發）、以及有界恢復掃描（6 萬筆積壓單輪清完、發佈
      2,140 msg/s；12 萬筆超過單輪上限時游標續傳兩輪，duplicate 0 筆）。
@@ -111,8 +111,8 @@
        屆時 freshness 應該恢復成有阻斷權的 gate。
 
 ⑨ rps 0.8 是為了【避開】限流，不是為了測試它
-   壓測是 load_test.py 與 docs/zh-TW/design/queue.md 的職責，兩支腳本刻意不共用（理由見
-   seed_demo.py 檔頭）。本 DAG 綠不綠與系統的吞吐能力無關——**要看效能結論
+   壓測是 scripts/load_test.py 與 docs/zh-TW/design/queue.md 的職責，兩支腳本刻意不共用（理由見
+   scripts/seed_demo.py 檔頭）。本 DAG 綠不綠與系統的吞吐能力無關——**要看效能結論
    請看那邊，不要從這條 DAG 每天成功推論任何事。**
 ────────────────────────────────────────────────────────────────────────────
 """
@@ -224,7 +224,7 @@ with DAG(
         #    seed_demo 的 load_dotenv(".env") 找不到檔案而純吃容器環境變數。
         #    cd 過去會讀到 bind mount 進來的主機 .env，那裡的 DB_URL 在容器內是錯的。
         bash_command=(
-            f"{PY_ANALYTICS} {PROJECT_DIR}/seed_demo.py"
+            f"{PY_ANALYTICS} {PROJECT_DIR}/scripts/seed_demo.py"
             ' --url "$SEED_API_URL"'
             # ⚠️ 這一段刻意【不用 f-string】：f-string 裡的 }} 會被跳脫成單一個 }，
             #    於是 Jinja 的結束標記 }} 被吃掉一半，模板變成語法錯誤——而且同樣

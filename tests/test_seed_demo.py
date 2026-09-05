@@ -45,7 +45,7 @@ class TestStripOptionalCostsIsNotDirtyData:
 
         這是整個設計的前提——它是「上游給的資料本來就不完整」，不是違規。
         這條紅了代表 clean.py 新增了 cost_price / shipping_fee 的規則，
-        屆時必須重新決定這個注入器該留在哪一層（見 seed_demo.py 該節註解）。
+        屆時必須重新決定這個注入器該留在哪一層（見 scripts/seed_demo.py 該節註解）。
         """
         rng = random.Random(3)
         payload = make_order(rng, "T-0001", 45)

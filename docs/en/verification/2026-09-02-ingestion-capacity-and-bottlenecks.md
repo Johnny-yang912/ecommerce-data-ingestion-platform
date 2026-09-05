@@ -32,7 +32,7 @@ For `POST /orders → Raw → ODS`: **where the time goes, where the ceiling is,
 
 1. **Isolation**: `docker compose stop api beat worker otel-collector` plus the whole Airflow overlay, keeping only `db` / `redis`, to remove neighbour noise and connection contention.
 2. **Services under test**: `api-api:latest` (port 8001) and `api-worker:latest` started via `docker run`, all parameters injected with `-e`. Each parameter change means `docker rm -f` and a fresh start — environment changes require recreation; `restart` does not re-read them.
-3. **Load**: throughput used the existing `load_test.py`. Two helper scripts were added to work around the two measurement traps in *Test 0*: a sequential probe (no semaphore, no `gather`) and a multi-process injector (`order_id` offset to avoid collisions). Both reuse `load_test.make_payload`, so the data shape is identical.
+3. **Load**: throughput used the existing `scripts/load_test.py`. Two helper scripts were added to work around the two measurement traps in *Test 0*: a sequential probe (no semaphore, no `gather`) and a multi-process injector (`order_id` offset to avoid collisions). Both reuse `load_test.make_payload`, so the data shape is identical.
 4. **Traces**: `OTEL_EXPORTER_OTLP_ENDPOINT` pointed at a local Jaeger container rather than the compose collector — nothing left the machine. Spans were pulled from Jaeger's HTTP API; only **direct children** of the server span are counted (to avoid double-counting grandchildren), and the residual = server span − sum of direct children.
 5. **Profiling**: a py-spy sidecar with `--pid=container:api-lt --cap-add SYS_PTRACE` shares the PID namespace; `record -f raw --full-filenames` captured 30 seconds of on-CPU samples (without `--idle`, since blocking waits are already measured by the spans).
 6. **Backlog sampling**: `raw` counts for `pending + processing` and `processed` every 1–2 seconds; `pg_stat_activity` sampled every 0.1 seconds for connection counts.
@@ -44,22 +44,22 @@ For `POST /orders → Raw → ODS`: **where the time goes, where the ceiling is,
 
 **This has to come first, because it invalidated the first two rounds of this exercise — and the prior understanding of latency.**
 
-#### Trap 1: `load_test.py` does not report latency, it reports queueing
+#### Trap 1: `scripts/load_test.py` does not report latency, it reports queueing
 
-`load_test.py:126` sets `t0 = time.perf_counter()` **outside** `async with sem`. `asyncio.gather` creates all N coroutines at once, so every request's stopwatch starts at t≈0 and only then queues on the semaphore. What it reports is **semaphore queueing + the real round trip**.
+`scripts/load_test.py:126` sets `t0 = time.perf_counter()` **outside** `async with sem`. `asyncio.gather` creates all N coroutines at once, so every request's stopwatch starts at t≈0 and only then queues on the semaphore. What it reports is **semaphore queueing + the real round trip**.
 
 Decisive evidence: at C=1, n=200, p50 = 0.909s while total elapsed was 1.76s — **p50 is exactly half the total**, the mathematical signature of "N people queueing in order, the median one waited half the time." Nothing to do with the server.
 
 | Measurement | p50 |
 |---|---|
-| `load_test.py`, C=1, n=200 | **909 ms** |
+| `scripts/load_test.py`, C=1, n=200 | **909 ms** |
 | Sequential probe (no semaphore, no gather), n=3500 | **8.34 ms** |
 
 A factor of 109.
 
 #### Trap 2: a single client process saturates at ~150 RPS
 
-`load_test.py` re-seeds `random.Random(i)`, builds a nested payload and encodes JSON for every request. One process saturates one core.
+`scripts/load_test.py` re-seeds `random.Random(i)`, builds a nested payload and encodes JSON for every request. One process saturates one core.
 
 | Client configuration | Total RPS |
 |---|---|

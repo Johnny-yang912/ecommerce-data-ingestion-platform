@@ -51,7 +51,7 @@ docker compose -f docker-compose.yml -f docker-compose.airflow.yml up -d --build
 
 ### 已 export 的 `DB_URL` 會靜默壓過 `.env`
 
-主機側工具（`seed_demo.py --verify`、`psql`）必須連 `localhost:5433/orders`。`.env` 已經指在那裡——但 **`load_dotenv` 預設 `override=False`，所以你 shell 裡的環境變數會贏。**
+主機側工具（`scripts/seed_demo.py --verify`、`psql`）必須連 `localhost:5433/orders`。`.env` 已經指在那裡——但 **`load_dotenv` 預設 `override=False`，所以你 shell 裡的環境變數會贏。**
 
 若有舊的 `DB_URL` 被 export，腳本會安靜地連到別的地方，並對錯的資料庫回報結果。
 

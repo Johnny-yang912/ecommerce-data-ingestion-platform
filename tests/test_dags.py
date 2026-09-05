@@ -368,12 +368,12 @@ class TestSeedingIsIsolatedFromTheAnalyticsPipeline:
         """⭐ 資料產生器壞掉與分析管線壞掉需要不同處置，混在一條 DAG 裡會讓
         「主 DAG 紅」失去單一意義。與 freshness 被拆出去是同一條原則。"""
         for task in dagbag.dags["orders_analytics_daily"].tasks:
-            assert "seed_demo.py" not in getattr(task, "bash_command", "")
+            assert "scripts/seed_demo.py" not in getattr(task, "bash_command", "")
 
     def test_only_seeding_dags_post_orders(self, dagbag):
         owners = {
             dag_id for dag_id, dag in dagbag.dags.items()
-            for t in dag.tasks if "seed_demo.py" in getattr(t, "bash_command", "")
+            for t in dag.tasks if "scripts/seed_demo.py" in getattr(t, "bash_command", "")
         }
         assert owners == {"seed_demo_daily", "seed_demo_gate_demo"}
 

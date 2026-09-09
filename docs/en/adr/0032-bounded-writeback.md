@@ -56,7 +56,7 @@ Re-evaluation cannot help: its input *is* the corrupted values. Bounded writebac
 
 **A separate mutable "current state" table alongside ODS.** Keeps ODS immutable and reintroduces the same problem one table over: two places holding a quality verdict, which can disagree. `quality_events` avoids it by being append-only — it holds *transitions*, not *state*.
 
-**Let the warehouse be the sole source of quality truth.** Rejected for the reason in ADR-0030: the sandbox's 60-day partition expiry means the warehouse can lose history PostgreSQL still holds. Idempotency cannot rest on a mirror that expires.
+**Let the warehouse be the sole source of quality truth.** Rejected for the reason in ADR-0030: PostgreSQL is the authority on quality state and the warehouse is only a derived mirror of it, with lag set by scheduling and failure modes rather than by a storage setting. **Idempotency must be decided against the authority, never against a mirror.**
 
 ## Related
 

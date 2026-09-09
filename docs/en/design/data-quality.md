@@ -180,7 +180,7 @@ An event exists only if an ODS row exists. The three "not written" rows are the 
 `reevaluate_quality.py` reads candidates, re-runs the current rules, and appends **only on an actual state change**.
 
 - **Candidates come from BigQuery's `int_` layer** — the same effective-state definition the Row Filter uses, so producer and consumer cannot disagree.
-- **State is decided against PostgreSQL** — idempotency must not rest on a mirror that expires (the sandbox's 60-day limit).
+- **State is decided against PostgreSQL** — PostgreSQL is the authority on quality state; BigQuery is a derived mirror whose lag is unbounded, and **an event it cannot see reads as an event that never happened**.
 - **Dry-run is the default**; commit is an explicit flag.
 
 Two reproducibility guards:

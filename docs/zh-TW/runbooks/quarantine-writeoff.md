@@ -38,7 +38,7 @@ where order_id = '<order_id>';
 
 ### 2. 在 PostgreSQL 確認當前狀態
 
-**狀態以 PostgreSQL 為權威**，不是 BigQuery——倉庫的鏡像 60 天就過期。
+**狀態以 PostgreSQL 為權威**，不是 BigQuery——倉庫只是衍生鏡射，隨時可能還沒看見最新的事件。
 
 ```sql
 select event_type, from_state, to_state, rule_version, event_at, reason

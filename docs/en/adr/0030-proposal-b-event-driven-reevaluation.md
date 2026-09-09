@@ -26,7 +26,13 @@ Four decisions inside that:
 
 **Candidates come from BigQuery's `int_` layer.** The same effective-quality-state definition the Row Filter uses (ADR-0029), so the producer and the consumer cannot disagree about who is quarantined.
 
-**State is decided against PostgreSQL, not BigQuery.** Idempotency must not rest on a mirror that expires — the sandbox's 60-day partition expiry means BigQuery can lose history that PostgreSQL still has. Reading candidates from a mirror is fine; deciding whether an event already exists is not.
+**State is decided against PostgreSQL, not BigQuery.**
+
+**PostgreSQL is the authority on quality state.** `quality_events` is written there, and whether a transition happened is its call alone. BigQuery's `int_` layer is a derived mirror of it, one full pipeline downstream — a mirror can answer "what does the state look like now"; it cannot answer "did this happen".
+
+**And idempotency asks the second question.** Before writing, ask "is this transition already in there?" — only the authority can answer that. The mirror's lag is unbounded: a dbt run that hasn't happened, a batch held back by the Hard Gate, a backfill in flight, rows dropped upstream — any of them leaves it blind to events PostgreSQL already holds, and **an event it cannot see reads as an event that never happened**.
+
+**So why are candidates still read from BigQuery? Because the two questions carry asymmetric cost.** Candidate discovery is a filter: a miss is picked up on the next run. State decision is a write: one extra promotion becomes part of `rpt_quality_events_daily.promotions`, the very number that "why historical metrics are not retroactively rewritten" promises will not move. **Where the next run repairs the mistake on its own, the mirror's uncertainty is affordable; where it does not, it is not.**
 
 **Events are appended only on an actual state change.** "Re-evaluated and still quarantined" writes nothing. This makes the event table **its own idempotency gate**: running the job twice produces the same result as running it once, with no separate dedup key.
 

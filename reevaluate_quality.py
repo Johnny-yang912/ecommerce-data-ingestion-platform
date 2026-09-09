@@ -17,11 +17,12 @@
   `assert_orders_split_is_partition` 管不到（ecommerce_dbt/README.zh-TW §5.3）。
   ② 這是分析型全掃，打在 ODS 上會與 `POST /orders` 的熱路徑搶資源——把它移走正是雲端層存在的理由。
 
-- **狀態判定（有沒有變）讀 PG 的 `quality_events`**：BQ 是**有保留期的鏡射**
-  （sandbox 強制 60 天，見 docs/zh-TW/design/cloud-layer.md）。若拿它判斷「狀態變了沒」，事件過期時
-  會誤判成「沒有事件」→ 對已 promote 的記錄再 append 一次 promotion →
+- **狀態判定（有沒有變）讀 PG 的 `quality_events`**：**PG 是品質狀態的權威**——一筆轉移
+  是否發生過只有它說了算，而 BQ 是它經過一整條管線之後的**衍生鏡射**。鏡射的落後量無界
+  （dbt 未跑、Hard Gate 擋批、backfill 中、上游掉列都算），只要它還沒看見某筆事件，
+  就會被誤判成「沒有事件」→ 對已 promote 的記錄再 append 一次 promotion →
   污染 `rpt_quality_events_daily.promotions`，而那正是〈歷史指標為何不會被追溯性改寫〉
-  要保護的數字，且 append-only 刪不掉。**冪等的保證只能來自寫入目標本身，不能來自它的鏡射。**
+  要保護的數字。**冪等的判定只能對權威做，不能對它的鏡射做。**
 
 這對「BQ 端過濾 vs PG 端判定」的分工，與攝入層的 pre-check + UNIQUE 是同一個手法：
 便宜的快路徑負責把大多數不必處理的先剔掉，權威來源負責正確性兜底。
@@ -111,7 +112,7 @@ def candidate_sql(limit: Optional[int] = None) -> str:
     - `int_orders` + `has_clean_error`：已被 promote 者。**必須納入**，否則規則變嚴時
       `promoted → re_quarantined` 這條邊永遠不可達（DQ 狀態機的邊緣情況）。
     - `effective_quality_state != 'permanently_rejected'`：省流量的快路徑；
-      真正的保證在 decide_target_state()，因為 BQ 可能是過期的鏡射。
+      真正的保證在 decide_target_state()，因為 BQ 是衍生鏡射、可能還沒看見 PG 已有的事件。
     """
     cols = ", ".join(f"`{c}`" for c in (*META_FIELDS, *ODS_FIELDS))
     sql = f"""

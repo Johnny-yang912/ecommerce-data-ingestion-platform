@@ -210,7 +210,7 @@ class TestPlanEvents:
         assert events == [] and stats["unchanged"] == 1
 
     def test_missing_state_promotes_with_null_from_state(self):
-        """事件在 PG 缺席（異常，但 BQ 60 天過期時看得到）→ 仍要記錄轉移，否則流不回 Gold。"""
+        """候選在 BQ 看得到、PG 卻沒有對應事件（首次評估的正常狀態）→ 仍要記錄轉移，否則流不回 Gold。"""
         row = make_row(raw_id=12, age=30, clean_error_message=codes(DQCode.AGE_OUT_OF_RANGE))
         events, _ = rq.plan_events([row], {}, self.EVENT_AT)
         assert events[0]["from_state"] is None

@@ -180,7 +180,7 @@ permanently_rejected            ← 終端；沒有出邊
 `reevaluate_quality.py` 讀取候選、重跑當前規則，並**只在狀態確實改變時** append。
 
 - **候選來自 BigQuery 的 `int_` 層**——與 Row Filter 使用同一個有效狀態定義，所以產生者與消費者不可能有不同意見。
-- **狀態的判定對 PostgreSQL 做**——冪等性不可以建立在一個會過期的鏡像上（sandbox 的 60 天限制）。
+- **狀態的判定對 PostgreSQL 做**——PostgreSQL 是品質狀態的權威；BigQuery 是衍生鏡射，落後量無界，而**看不見的事件會被讀成不存在的事件**。
 - **dry-run 是預設值**；commit 是一個明確的旗標。
 
 兩道可重現性守衛：

@@ -38,7 +38,7 @@ If the failure is a threshold that could reasonably move, use [proposal-b-rollou
 
 ### 2. Confirm the current state in PostgreSQL
 
-**PostgreSQL is authoritative for state**, not BigQuery — the warehouse mirror expires at 60 days.
+**PostgreSQL is authoritative for state**, not BigQuery — the warehouse is only a derived mirror and may not have seen the latest events yet.
 
 ```sql
 select event_type, from_state, to_state, rule_version, event_at, reason

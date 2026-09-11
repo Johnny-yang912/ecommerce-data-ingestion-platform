@@ -1,6 +1,6 @@
 # Changelog
 
-**English** | [繁體中文](./CHANGELOG-TW.md)
+**English** | [繁體中文](./CHANGELOG.md)
 
 How this system got here. **Two timelines**: Phases are the release unit and record how the architecture evolved; "Defects & Fixes" records what reality sent back once it was running. Every entry carries a link to the decision or the measurement.
 

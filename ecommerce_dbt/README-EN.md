@@ -1,6 +1,6 @@
 # ecommerce_dbt — Order Analytics Transformation Layer
 
-**English** | [繁體中文](./README-TW.md)
+**English** | [繁體中文](./README.md)
 
 The dbt project for this pipeline. **This file is the entry point for working in this directory** — the design reasoning lives one level up.
 

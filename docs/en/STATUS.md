@@ -146,5 +146,5 @@ The distinction that matters: **⛔ is "should not", ⏸ is "should but cannot",
 ## Related
 
 - [PORTFOLIO_SCOPE](./PORTFOLIO_SCOPE.md) — every ⏸ item, with what a real system would do instead
-- [CHANGELOG](../../CHANGELOG.md) — how the system got here
+- [CHANGELOG](../../CHANGELOG-EN.md) — how the system got here
 - [Architecture Decision Records](./adr/README.md) — why each decision was made

@@ -2,7 +2,7 @@
 
 **English** | [繁體中文](../../zh-TW/design/transformation.md)
 
-`stg_` → `int_` → `dim_`/`fct_` → `rpt_`. Quickstart and commands: [`ecommerce_dbt/README.md`](../../../ecommerce_dbt/README.md).
+`stg_` → `int_` → `dim_`/`fct_` → `rpt_`. Quickstart and commands: [`ecommerce_dbt/README-EN.md`](../../../ecommerce_dbt/README-EN.md).
 
 ---
 

@@ -2,7 +2,7 @@
 
 ### An ingestion-to-analytics data pipeline, built in the e-commerce order domain
 
-**English** | [繁體中文](./README-TW.md)
+**English** | [繁體中文](./README.md)
 
 [![CI](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml)
 
@@ -216,7 +216,7 @@ Full matrix and known risks: **[STATUS](./docs/en/STATUS.md)**
 | [verification/](./docs/en/verification/) (14) | what was measured, and what it overturned | when you doubt a claim |
 | [incidents/](./docs/en/incidents/) (2) | what broke, and how it was diagnosed | — |
 | [API Reference](https://johnny-yang912.github.io/ecommerce-data-ingestion-platform/) | endpoints, fields, status codes and retry guidance | when integrating with it |
-| [CHANGELOG](./CHANGELOG.md) | how the system got here | — |
+| [CHANGELOG](./CHANGELOG-EN.md) | how the system got here | — |
 
 ### Suggested reading paths
 

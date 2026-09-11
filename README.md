@@ -2,7 +2,7 @@
 
 ### 一條從攝入到分析的資料管線，以電商訂單為場域
 
-[English](./README.md) | **繁體中文**
+[English](./README-EN.md) | **繁體中文**
 
 [![CI](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Johnny-yang912/ecommerce-data-ingestion-platform/actions/workflows/ci.yml)
 
@@ -215,7 +215,7 @@ pytest
 | [verification/](./docs/zh-TW/verification/)（14 份） | 量到了什麼、推翻了什麼 | 當你懷疑某個宣稱時 |
 | [incidents/](./docs/zh-TW/incidents/)（2 份） | 什麼壞了、怎麼診斷出來的 | — |
 | [API Reference](https://johnny-yang912.github.io/ecommerce-data-ingestion-platform/) | 端點、欄位、狀態碼與重試指引 | 要串接它時 |
-| [CHANGELOG](./CHANGELOG-TW.md) | 系統如何走到今天 | — |
+| [CHANGELOG](./CHANGELOG.md) | 系統如何走到今天 | — |
 
 ### 建議的閱讀路徑
 

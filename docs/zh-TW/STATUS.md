@@ -146,5 +146,5 @@
 ## 相關文件
 
 - [PORTFOLIO_SCOPE](./PORTFOLIO_SCOPE.md) — 每一個 ⏸ 項目，以及真實系統會怎麼做
-- [CHANGELOG](../../CHANGELOG-TW.md) — 系統如何走到今天
+- [CHANGELOG](../../CHANGELOG.md) — 系統如何走到今天
 - [架構決策記錄](./adr/README.md) — 每個決策為何如此

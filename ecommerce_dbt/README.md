@@ -1,6 +1,6 @@
 # ecommerce_dbt —— 訂單分析轉換層
 
-[English](./README.md) | **繁體中文**
+[English](./README-EN.md) | **繁體中文**
 
 這條管線的 dbt 專案。**這份檔案是在這個目錄工作時的入口**——設計論述住在上一層。
 

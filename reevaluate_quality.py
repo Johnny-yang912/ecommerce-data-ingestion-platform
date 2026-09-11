@@ -14,7 +14,7 @@
   `has_clean_error` 字面快照，而 `int_orders` / `int_orders_quarantine` 已經算好了——
   直接用它，重評估與 Row Filter 對「誰被隔離」的認定**在定義上不可能分歧**；自己再實作
   一次「每個 raw_id 取最新事件」就是那段共用邏輯的第三份複製，且住在 dbt 外面、
-  `assert_orders_split_is_partition` 管不到（ecommerce_dbt/README.zh-TW §5.3）。
+  `assert_orders_split_is_partition` 管不到（docs/zh-TW/adr/0045-int-effective-state-duplication.md）。
   ② 這是分析型全掃，打在 ODS 上會與 `POST /orders` 的熱路徑搶資源——把它移走正是雲端層存在的理由。
 
 - **狀態判定（有沒有變）讀 PG 的 `quality_events`**：**PG 是品質狀態的權威**——一筆轉移

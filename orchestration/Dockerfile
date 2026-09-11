@@ -25,7 +25,7 @@ RUN python -m venv /home/airflow/venvs/analytics \
     && /home/airflow/venvs/analytics/bin/pip install --no-cache-dir --upgrade pip \
     && /home/airflow/venvs/analytics/bin/pip install --no-cache-dir -r /tmp/reqs/requirements-analytics.txt
 
-# dbt：版本對齊 ecommerce_dbt/README §10（dbt-core 1.11 / dbt-bigquery 1.11）。
+# dbt：版本對齊 ecommerce_dbt/README.md §5 依賴（dbt-core 1.11 / dbt-bigquery 1.11）。
 ARG DBT_VERSION=1.11.*
 RUN python -m venv /home/airflow/venvs/dbt \
     && /home/airflow/venvs/dbt/bin/pip install --no-cache-dir --upgrade pip \

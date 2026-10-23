@@ -13,17 +13,23 @@ celery[redis]==5.6.3
 # redis 明確鎖版：celery[redis] 的 extra 只給範圍（kombu 目前上界 <7），
 # 不鎖的話 build 時間不同會裝到不同版本，違反本檔「一律鎖版」的前提。
 redis==6.4.0
+# certifi 是間接依賴（requests / httpx 帶進來），在這裡明確鎖版是為了訂出安全下限：
+# 2026.7.22 內建的 emSign 根 CA 有中繼 CA 私鑰外洩（GHSA-6q48-6c7w-9gw2），
+# 不鎖的話 pip 會沿用已經滿足範圍的舊版，rebuild 也不會更新。
+certifi==2026.10.19
 
 # --- Phase 5：OpenTelemetry（traces）---
 # 兩組版號刻意不同步，這不是筆誤：core（api/sdk/exporter）走 1.x 穩定線，
-# instrumentation 走 0.xxbN 的 beta 線，對應關係是 1.44.0 ↔ 0.65b0。
+# instrumentation 走 0.xxbN 的 beta 線，對應關係是 1.45.1 ↔ 0.66b1。
 # 升級時兩組必須【一起】換，混搭會在 import 期就炸（instrumentation 依賴 core 的
 # 內部介面，而那些介面在 beta 線之間會變）。
-opentelemetry-sdk==1.44.0
-opentelemetry-exporter-otlp-proto-http==1.44.0
+# 下限是 1.45.1：更早的 opentelemetry-api 解析 tracestate header 沒有上限
+# （CVE-2026-114603），而 FastAPI 埋點在認證之前就會解析它。
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
 # 只裝 http exporter 不裝 grpc：Grafana Cloud 的 gateway 走 HTTP/protobuf，
 # 而 grpc 版會多拉進 grpcio（含 C 擴充，映像大且與 gevent/prefork 容易起衝突）。
-opentelemetry-instrumentation-fastapi==0.65b0
-opentelemetry-instrumentation-celery==0.65b0
-opentelemetry-instrumentation-sqlalchemy==0.65b0
-opentelemetry-instrumentation-redis==0.65b0
+opentelemetry-instrumentation-fastapi==0.66b1
+opentelemetry-instrumentation-celery==0.66b1
+opentelemetry-instrumentation-sqlalchemy==0.66b1
+opentelemetry-instrumentation-redis==0.66b1
